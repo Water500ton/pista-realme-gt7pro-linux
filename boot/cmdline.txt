@@ -1,0 +1,1 @@
+initrd=\boot\initrd.img efi=noruntime earlycon=efifb console=tty0 clk_ignore_unused pd_ignore_unused regulator_ignore_unused cpuidle.off=1 net.ifnames=0 fbcon=font:TER16x32 loglevel=7

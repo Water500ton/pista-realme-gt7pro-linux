@@ -1,0 +1,11 @@
+# Example configuration for Wi-Fi 7 + iSCSI rootfs boot in initramfs.
+# Copy to /etc/pista-iscsi.conf inside your initramfs rootfs and fill in
+# your own network and iSCSI target details. NEVER commit real credentials.
+
+WIFI_SSID="YOUR_WIFI_SSID"
+WIFI_PSK="YOUR_WIFI_PASSWORD"
+
+ISCSI_PORTAL="192.168.1.100"
+ISCSI_PORT="3260"
+ISCSI_TARGET="iqn.2026-01.example.nas:target-pista"
+ISCSI_INITIATOR="iqn.2026-01.pista.gt7pro:initiator"

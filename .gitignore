@@ -1,0 +1,22 @@
+# Build artifacts and upstream tarballs
+build/
+out/
+dist/
+linux-*.tar.*
+linux-*/
+*.img
+*.efi
+*.dtb
+*.ko
+*.o
+*.a
+
+# User credentials and proprietary device firmware (NEVER commit)
+boot/pista-iscsi.conf
+*.conf.local
+firmware/
+*.mbn
+*.bin
+*.elf
+*.fw
+*.mdt

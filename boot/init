@@ -1,0 +1,237 @@
+#!/bin/sh
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
+mkdir -p /dev/pts /dev/shm /run /tmp /etc/dropbear /var/log /mnt/root
+mount -t devpts devpts /dev/pts
+mount -t tmpfs tmpfs /run
+mount -t tmpfs tmpfs /tmp
+mount -t configfs none /sys/kernel/config 2>/dev/null || true
+mount -t debugfs none /sys/kernel/debug 2>/dev/null || true
+
+log() {
+    echo "PISTA: $*" > /dev/kmsg 2>/dev/null || true
+}
+
+hostname pista
+ip link set lo up 2>/dev/null || ifconfig lo 127.0.0.1 up
+
+log "=========================================="
+log "  Realme GT7 Pro (SM8750) iSCSI Bootloader"
+log "=========================================="
+log "Kernel : $(uname -a)"
+log "CPUs   : $(nproc) cores | $(grep -m1 MemTotal /proc/meminfo)"
+
+# 1. Bring up USB 2.0 CDC NCM gadget (172.16.42.1/24)
+UDC=""
+for i in 1 2 3 4 5 6 7 8; do
+    UDC=$(ls /sys/class/udc 2>/dev/null | head -n 1)
+    [ -n "$UDC" ] && break
+    sleep 0.5
+done
+
+IFACE="usb0"
+if [ -n "$UDC" ]; then
+    G=/sys/kernel/config/usb_gadget/g1
+    mkdir -p "$G"
+    echo 0x1d6b > "$G/idVendor"
+    echo 0x0104 > "$G/idProduct"
+    echo 0x0100 > "$G/bcdDevice"
+    echo 0x0200 > "$G/bcdUSB"
+    mkdir -p "$G/strings/0x409"
+    echo "PISTA-SM8750-001" > "$G/strings/0x409/serialnumber"
+    echo "Realme" > "$G/strings/0x409/manufacturer"
+    echo "GT7 Pro Linux (NCM)" > "$G/strings/0x409/product"
+
+    mkdir -p "$G/configs/c.1/strings/0x409"
+    echo "CDC NCM Ethernet" > "$G/configs/c.1/strings/0x409/configuration"
+    echo 250 > "$G/configs/c.1/MaxPower"
+
+    mkdir -p "$G/functions/ncm.usb0"
+    echo "02:50:49:53:54:01" > "$G/functions/ncm.usb0/dev_addr"
+    echo "02:50:49:53:54:02" > "$G/functions/ncm.usb0/host_addr"
+    ln -s "$G/functions/ncm.usb0" "$G/configs/c.1/"
+
+    echo "$UDC" > "$G/UDC" 2>/tmp/udc.err || log "UDC bind err: $(cat /tmp/udc.err)"
+    sleep 0.3
+    IFACE=$(cat "$G/functions/ncm.usb0/ifname" 2>/dev/null || echo usb0)
+    ip addr add 172.16.42.1/24 dev "$IFACE" 2>/dev/null || true
+    ip link set "$IFACE" up 2>/dev/null || true
+    log "USB Net: $IFACE = 172.16.42.1/24 (UDC=$UDC)"
+fi
+
+# Preset DNS and Tsinghua Alpine mirror for rescue/installer shell
+printf "nameserver 223.5.5.5\nnameserver 1.1.1.1\n" > /etc/resolv.conf
+cat > /etc/apk/repositories << 'EOF'
+https://mirrors.tuna.tsinghua.edu.cn/alpine/v3.21/main
+https://mirrors.tuna.tsinghua.edu.cn/alpine/v3.21/community
+EOF
+
+# 2. Bring up WCN7860 Wi-Fi 7
+if [ -x /usr/local/bin/pista-wifi.sh ]; then
+    /usr/local/bin/pista-wifi.sh >/tmp/wifi.log 2>&1
+fi
+
+# 3. Connect Wi-Fi & iSCSI Target unless pista.rescue=1 is on cmdline
+RESCUE=0
+grep -qw 'pista.rescue=1' /proc/cmdline 2>/dev/null && RESCUE=1
+
+ISCSI_DEV=""
+if [ "$RESCUE" -eq 0 ] && [ -f /etc/pista-iscsi.conf ]; then
+    . /etc/pista-iscsi.conf
+
+    # Wait for wlan0
+    for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+        [ -d /sys/class/net/wlan0 ] && break
+        sleep 0.5
+    done
+
+    if [ -d /sys/class/net/wlan0 ]; then
+        ip link set wlan0 up 2>/dev/null || true
+        cat > /run/pista-wpa.conf << EOF
+ctrl_interface=/run/wpa_supplicant
+network={
+    ssid="$WIFI_SSID"
+    psk="$WIFI_PSK"
+}
+EOF
+        chmod 600 /run/pista-wpa.conf
+        log "Wi-Fi  : connecting to $WIFI_SSID ..."
+        # Use '@' argv[0] prefix (systemd Root Storage Daemon convention) so
+        # systemd-shutdown never SIGTERM/SIGKILLs wpa_supplicant before '/' remounts RO!
+        ln -sf /sbin/wpa_supplicant /sbin/@wpa_supplicant
+        @wpa_supplicant -B -i wlan0 -c /run/pista-wpa.conf -P /run/pista-wpa.pid >/run/wpa.log 2>&1
+
+        # Wait up to 12s for DHCP lease on wlan0
+        udhcpc -i wlan0 -s /usr/share/udhcpc/default.script -q -n -t 12 -T 1 >/tmp/udhcpc.log 2>&1
+        WLAN_IP=$(ip -4 -o addr show dev wlan0 2>/dev/null | awk '{print $4}' | head -n 1)
+        if [ -n "$WLAN_IP" ]; then
+            log "Wi-Fi  : wlan0 = $WLAN_IP"
+            # Save resolv.conf to /run so Debian can inspect if needed
+            cp /etc/resolv.conf /run/pista-resolv.conf 2>/dev/null || true
+
+            # Connect iSCSI Target
+            mkdir -p /etc/iscsi /var/lock/iscsi /var/lib/iscsi /run/lock
+            echo "InitiatorName=$ISCSI_INITIATOR" > /etc/iscsi/initiatorname.iscsi
+            log "iSCSI  : connecting $ISCSI_PORTAL:$ISCSI_PORT ($ISCSI_TARGET)"
+
+            if ! iscsistart -i "$ISCSI_INITIATOR" -t "$ISCSI_TARGET" -g 1 -a "$ISCSI_PORTAL" -p "$ISCSI_PORT" >/tmp/iscsi.log 2>&1; then
+                log "iSCSI  : iscsistart fallback to iscsid+iscsiadm"
+                ln -sf /usr/sbin/iscsid /usr/sbin/@iscsid
+                @iscsid >/tmp/iscsid.log 2>&1
+                sleep 0.5
+                iscsiadm -m discovery -t st -p "$ISCSI_PORTAL:$ISCSI_PORT" >>/tmp/iscsi.log 2>&1
+                iscsiadm -m node -T "$ISCSI_TARGET" -p "$ISCSI_PORTAL:$ISCSI_PORT" --login >>/tmp/iscsi.log 2>&1
+            fi
+
+            # Wait up to 10s for the iSCSI SCSI block device (NEVER touches UFS!)
+            for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+                BLK=$(ls /sys/class/iscsi_session/*/device/target*/*/block 2>/dev/null | head -n 1)
+                if [ -n "$BLK" ] && [ -b "/dev/$BLK" ]; then
+                    ISCSI_DEV="/dev/$BLK"
+                    break
+                fi
+                sleep 0.5
+            done
+
+            if [ -n "$ISCSI_DEV" ]; then
+                SIZE_MB=$(( $(cat "/sys/block/$(basename "$ISCSI_DEV")/size" 2>/dev/null || echo 0) / 2048 ))
+                log "iSCSI  : attached $ISCSI_DEV (${SIZE_MB} MiB)"
+                echo "$ISCSI_DEV" > /tmp/iscsi.dev
+
+                # Pick root device (partition 1 if present, else whole disk)
+                ROOT_DEV="$ISCSI_DEV"
+                [ -b "${ISCSI_DEV}1" ] && ROOT_DEV="${ISCSI_DEV}1"
+
+                if mount -t ext4 -o rw,noatime "$ROOT_DEV" /mnt/root 2>/tmp/mount_root.err; then
+                    if [ -x /mnt/root/sbin/init ] || [ -x /mnt/root/lib/systemd/systemd ]; then
+                        INIT_BIN="/sbin/init"
+                        [ -x /mnt/root/lib/systemd/systemd ] && INIT_BIN="/lib/systemd/systemd"
+                        log "iSCSI  : Debian rootfs ready on $ROOT_DEV -> switch_root $INIT_BIN!"
+
+                        # Auto-sync kernel modules to Debian rootfs whenever kernel or display modules change
+                        KVER=$(uname -r)
+                        KSTAMP="$(uname -v):$(sha256sum "/lib/modules/$KVER/kernel/drivers/gpu/drm/panel/panel-realme-ab849.ko" "/lib/modules/$KVER/kernel/drivers/gpu/drm/msm/msm.ko" 2>/dev/null | tr '\n' ';')"
+                        if [ "$(cat "/mnt/root/lib/modules/$KVER/.pista-ver" 2>/dev/null)" != "$KSTAMP" ]; then
+                            log "iSCSI  : syncing /lib/modules/$KVER into Debian rootfs..."
+                            rm -rf "/mnt/root/lib/modules/$KVER"
+                            mkdir -p "/mnt/root/lib/modules"
+                            cp -a "/lib/modules/$KVER" "/mnt/root/lib/modules/"
+                            echo "$KSTAMP" > "/mnt/root/lib/modules/$KVER/.pista-ver"
+                        fi
+
+                        # Switch Debian GPU config to unified native msm (DPU1+DSI0+Adreno 830)
+                        mkdir -p /mnt/root/etc/modprobe.d /mnt/root/etc/modules-load.d
+                        echo "# Unified native msm KMS (DPU1+DSI0) + Adreno 830" > /mnt/root/etc/modprobe.d/pista-gpu.conf
+                        printf "panel-realme-ab849\nmsm\n" > /mnt/root/etc/modules-load.d/pista.conf
+                        # Remove hardcoded KWIN_DRM_DEVICES so KWin auto-picks unified msm (card0 or card1)
+                        sed -i '/^KWIN_DRM_DEVICES=/d' /mnt/root/etc/environment 2>/dev/null || true
+                        sed -i '/^GreeterEnvironment=KWIN_DRM_DEVICES=/d' /mnt/root/etc/sddm.conf.d/10-pista.conf 2>/dev/null || true
+                        if [ -f /mnt/root/home/pista/.config/autostart/pista-scale.desktop ]; then
+                            sed -i 's|kscreen-doctor output.Unknown-1.scale.2.5|kscreen-doctor output.DSI-1.scale.2.5 \|\| kscreen-doctor output.Unknown-1.scale.2.5|g' \
+                                /mnt/root/home/pista/.config/autostart/pista-scale.desktop 2>/dev/null || true
+                        fi
+
+                        # Protect boot Wi-Fi / USB iSCSI link from Debian NM & duplicate wpa_supplicant
+                        mkdir -p /mnt/root/etc/NetworkManager/conf.d /mnt/root/etc/systemd/system
+                        cat > /mnt/root/etc/NetworkManager/conf.d/99-pista-iscsi.conf << 'NMEOF'
+[main]
+dns=none
+
+[keyfile]
+unmanaged-devices=type:wifi;interface-name:wlan*;interface-name:wlp*;interface-name:usb*;interface-name:enx*
+NMEOF
+                        ln -sf /dev/null /mnt/root/etc/systemd/system/wpa_supplicant.service
+                        ln -sf /dev/null /mnt/root/etc/systemd/system/ModemManager.service
+                        ln -sf /dev/null /mnt/root/etc/systemd/system/NetworkManager-wait-online.service
+
+                        # Keep essential virtual filesystems across switch_root
+                        umount /sys/kernel/debug 2>/dev/null || true
+                        umount /sys/kernel/config 2>/dev/null || true
+                        umount -l /tmp 2>/dev/null || true
+                        mount --move /dev /mnt/root/dev
+                        mount --move /proc /mnt/root/proc
+                        mount --move /sys /mnt/root/sys
+                        mount --move /run /mnt/root/run
+                        exec switch_root /mnt/root "$INIT_BIN"
+                    else
+                        log "iSCSI  : $ROOT_DEV mounted (no /sbin/init yet) -> installer SSH mode"
+                        umount /mnt/root 2>/dev/null || true
+                    fi
+                else
+                    log "iSCSI  : $ROOT_DEV unformatted (ready for mkfs.ext4) -> installer SSH mode"
+                fi
+            else
+                log "iSCSI  : FAILED to attach target (see /tmp/iscsi.log)"
+            fi
+        else
+            log "Wi-Fi  : DHCP failed on wlan0 (see /tmp/wpa.log /tmp/udhcpc.log)"
+        fi
+    else
+        log "Wi-Fi  : wlan0 not found (see /tmp/wifi.log)"
+    fi
+fi
+
+# 4. Fallback / First-Time Installer Shell (USB DHCP + Dropbear SSH on usb0 & wlan0)
+if [ -x /usr/sbin/dnsmasq ] && [ -d "/sys/class/net/$IFACE" ]; then
+    /usr/sbin/dnsmasq --user=root --interface="$IFACE" --bind-interfaces \
+        --port=0 --dhcp-authoritative \
+        --dhcp-range=172.16.42.2,172.16.42.20,255.255.255.0,12h \
+        --dhcp-option=3 --dhcp-option=6 \
+        --dhcp-leasefile=/tmp/dnsmasq.leases \
+        --pid-file=/run/dnsmasq.pid 2>/tmp/dnsmasq.err
+fi
+
+if [ ! -f /etc/dropbear/dropbear_ed25519_host_key ]; then
+    /usr/bin/dropbearkey -t ed25519 -f /etc/dropbear/dropbear_ed25519_host_key >/dev/null 2>&1
+fi
+/usr/sbin/dropbear -R -B -E -p 22 -P /run/dropbear.pid >/tmp/dropbear.log 2>&1
+log "RESCUE : SSH ready -> ssh root@172.16.42.1 (empty password)"
+[ -n "$ISCSI_DEV" ] && log "RESCUE : iSCSI disk ready at $ISCSI_DEV"
+log "=========================================="
+
+while true; do
+    sleep 30
+done

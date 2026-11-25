@@ -1,0 +1,2227 @@
+Subject: [PATCH 5/5] wifi: ath12k & pwrseq: add WCN7860 (peach) Wi-Fi 7 support
+
+Enable Qualcomm FastConnect 7900 / WCN7860 (PCI 17cb:110e) Wi-Fi 7 support
+in ath12k and keep wlan-enable GPIO state across probe in pwrseq-qcom-wcn.
+---
+diff --git a/drivers/power/sequencing/pwrseq-qcom-wcn.c b/drivers/power/sequencing/pwrseq-qcom-wcn.c
+--- a/drivers/power/sequencing/pwrseq-qcom-wcn.c
++++ b/drivers/power/sequencing/pwrseq-qcom-wcn.c
+@@ -496,8 +496,15 @@
+ 		return dev_err_probe(dev, PTR_ERR(ctx->bt_gpio),
+ 				     "Failed to get the Bluetooth enable GPIO\n");
+ 
++	/*
++	 * FIXME: This should actually be GPIOD_OUT_LOW, but doing so would
++	 * cause the WLAN power to be toggled, resulting in PCIe link down.
++	 * Since the PCIe controller driver is not handling link down currently,
++	 * the device becomes unusable. So we need to keep this workaround until
++	 * the link down handling is implemented in the controller driver.
++	 */
+ 	ctx->wlan_gpio = devm_gpiod_get_optional(dev, "wlan-enable",
+-						 GPIOD_OUT_LOW);
++						 GPIOD_ASIS);
+ 	if (IS_ERR(ctx->wlan_gpio))
+ 		return dev_err_probe(dev, PTR_ERR(ctx->wlan_gpio),
+ 				     "Failed to get the WLAN enable GPIO\n");
+@@ -508,6 +515,13 @@
+ 		return dev_err_probe(dev, PTR_ERR(ctx->xo_clk_gpio),
+ 				     "Failed to get the XO_CLK GPIO\n");
+ 
++	/*
++	 * Set direction to output but keep the current value in order to not
++	 * disable the WLAN module accidentally if it's already powered on.
++	 */
++	gpiod_direction_output(ctx->wlan_gpio,
++			       gpiod_get_value_cansleep(ctx->wlan_gpio));
++
+ 	ctx->clk = devm_clk_get_optional(dev, NULL);
+ 	if (IS_ERR(ctx->clk))
+ 		return dev_err_probe(dev, PTR_ERR(ctx->clk),
+diff --git a/drivers/net/wireless/ath/ath12k/ahb.c b/drivers/net/wireless/ath/ath12k/ahb.c
+--- a/drivers/net/wireless/ath/ath12k/ahb.c
++++ b/drivers/net/wireless/ath/ath12k/ahb.c
+@@ -191,26 +191,6 @@
+ 	}
+ }
+ 
+-static void ath12k_ahb_free_napi_for_group(struct ath12k_ext_irq_grp *irq_grp)
+-{
+-	netif_napi_del(&irq_grp->napi);
+-	free_netdev(irq_grp->napi_ndev);
+-	irq_grp->napi_ndev = NULL;
+-}
+-
+-static void ath12k_ahb_free_napi(struct ath12k_base *ab, int num_ext_irq_grp)
+-{
+-	int i;
+-
+-	for (i = 0; i < num_ext_irq_grp; i++)
+-		ath12k_ahb_free_napi_for_group(&ab->ext_irq_grp[i]);
+-}
+-
+-static void ath12k_ahb_free_ext_napi(struct ath12k_base *ab)
+-{
+-	ath12k_ahb_free_napi(ab, ATH12K_EXT_IRQ_GRP_NUM_MAX);
+-}
+-
+ static void ath12k_ahb_ext_grp_enable(struct ath12k_ext_irq_grp *irq_grp)
+ {
+ 	int i;
+@@ -614,10 +594,8 @@
+ 		irq_grp->grp_id = i;
+ 
+ 		irq_grp->napi_ndev = alloc_netdev_dummy(0);
+-		if (!irq_grp->napi_ndev) {
+-			ret = -ENOMEM;
+-			goto free_napi_ndev;
+-		}
++		if (!irq_grp->napi_ndev)
++			return -ENOMEM;
+ 
+ 		netif_napi_add(irq_grp->napi_ndev, &irq_grp->napi,
+ 			       ath12k_ahb_ext_grp_napi_poll);
+@@ -669,19 +647,12 @@
+ 					       ath12k_ahb_ext_interrupt_handler,
+ 					       IRQF_TRIGGER_RISING,
+ 					       irq_name[irq_idx], irq_grp);
+-			if (ret) {
++			if (ret)
+ 				ath12k_warn(ab, "failed request_irq for %d\n", irq);
+-				ath12k_ahb_free_napi_for_group(irq_grp);
+-				goto free_napi_ndev;
+-			}
+ 		}
+ 	}
+ 
+ 	return 0;
+-
+-free_napi_ndev:
+-	ath12k_ahb_free_napi(ab, i);
+-	return ret;
+ }
+ 
+ static int ath12k_ahb_config_irq(struct ath12k_base *ab)
+@@ -1258,7 +1229,7 @@
+ 	ret = ab_ahb->device_family_ops->arch_init(ab);
+ 	if (ret) {
+ 		ath12k_err(ab, "AHB arch_init failed %d\n", ret);
+-		goto err_free_ext_napi;
++		goto err_rproc_deconfigure;
+ 	}
+ 
+ 	ret = ath12k_core_init(ab);
+@@ -1271,9 +1242,6 @@
+ 
+ err_deinit_arch:
+ 	ab_ahb->device_family_ops->arch_deinit(ab);
+-
+-err_free_ext_napi:
+-	ath12k_ahb_free_ext_napi(ab);
+ 
+ err_rproc_deconfigure:
+ 	mutex_lock(&ath12k_rproc_info_lock);
+@@ -1317,7 +1285,6 @@
+ 	struct platform_device *pdev = ab->pdev;
+ 	struct ath12k_ahb *ab_ahb = ath12k_ab_to_ahb(ab);
+ 
+-	ath12k_ahb_free_ext_napi(ab);
+ 	ath12k_hal_srng_deinit(ab);
+ 	ath12k_ce_free_pipes(ab);
+ 	ath12k_ahb_resource_deinit(ab);
+diff --git a/drivers/net/wireless/ath/ath12k/core.c b/drivers/net/wireless/ath/ath12k/core.c
+--- a/drivers/net/wireless/ath/ath12k/core.c
++++ b/drivers/net/wireless/ath/ath12k/core.c
+@@ -54,7 +54,6 @@
+ 			.num_pool_tx_desc = 32768,
+ 			.rx_desc_count = 12288,
+ 			.rx_release_ring_size = 16384,
+-			.rxdma_buf_ring_size = 8192,
+ 		},
+ 	},
+ [ATH12K_QMI_MEMORY_MODE_LOW_512_M] = {
+@@ -69,7 +68,6 @@
+ 			.num_pool_tx_desc = 16384,
+ 			.rx_desc_count = 6144,
+ 			.rx_release_ring_size = 8192,
+-			.rxdma_buf_ring_size = 4096,
+ 		},
+ 	},
+ };
+@@ -1516,7 +1514,8 @@
+ 			complete_all(&ar->thermal.wmi_sync);
+ 
+ 			wake_up(&ar->dp.tx_empty_waitq);
+-			ath12k_mac_tx_mgmt_pending_free(ar);
++			idr_for_each(&ar->txmgmt_idr,
++				     ath12k_mac_tx_mgmt_pending_free, ar);
+ 			idr_destroy(&ar->txmgmt_idr);
+ 			wake_up(&ar->txmgmt_empty_waitq);
+ 
+@@ -1667,6 +1666,7 @@
+ 
+ 	if (!(test_bit(ATH12K_FLAG_QMI_FW_READY_COMPLETE, &ab->dev_flags))) {
+ 		ath12k_warn(ab, "ignore reset dev flags 0x%lx\n", ab->dev_flags);
++		ath12k_coredump_collect(ab);
+ 		return;
+ 	}
+ 
+@@ -1775,6 +1775,29 @@
+ 	ath12k_fw_map(ab);
+ 
+ 	return 0;
++}
++
++static int ath12k_core_panic_handler(struct notifier_block *nb,
++				     unsigned long action, void *data)
++{
++	struct ath12k_base *ab = container_of(nb, struct ath12k_base,
++					      panic_nb);
++
++	return ath12k_hif_panic_handler(ab);
++}
++
++static int ath12k_core_panic_notifier_register(struct ath12k_base *ab)
++{
++	ab->panic_nb.notifier_call = ath12k_core_panic_handler;
++
++	return atomic_notifier_chain_register(&panic_notifier_list,
++					      &ab->panic_nb);
++}
++
++static void ath12k_core_panic_notifier_unregister(struct ath12k_base *ab)
++{
++	atomic_notifier_chain_unregister(&panic_notifier_list,
++					 &ab->panic_nb);
+ }
+ 
+ static inline
+@@ -2192,13 +2215,18 @@
+ 	struct ath12k_hw_group *ag;
+ 	int ret;
+ 
++	ret = ath12k_core_panic_notifier_register(ab);
++	if (ret)
++		ath12k_warn(ab, "failed to register panic handler: %d\n", ret);
++
+ 	mutex_lock(&ath12k_hw_group_mutex);
+ 
+ 	ag = ath12k_core_hw_group_assign(ab);
+ 	if (!ag) {
+ 		mutex_unlock(&ath12k_hw_group_mutex);
+ 		ath12k_warn(ab, "unable to get hw group\n");
+-		return -ENODEV;
++		ret = -ENODEV;
++		goto err_unregister_notifier;
+ 	}
+ 
+ 	mutex_unlock(&ath12k_hw_group_mutex);
+@@ -2223,6 +2251,8 @@
+ 
+ err_unassign_hw_group:
+ 	ath12k_core_hw_group_unassign(ab);
++err_unregister_notifier:
++	ath12k_core_panic_notifier_unregister(ab);
+ 
+ 	return ret;
+ }
+@@ -2231,6 +2261,7 @@
+ {
+ 	ath12k_core_hw_group_destroy(ab->ag);
+ 	ath12k_core_hw_group_unassign(ab);
++	ath12k_core_panic_notifier_unregister(ab);
+ }
+ 
+ void ath12k_core_free(struct ath12k_base *ab)
+diff --git a/drivers/net/wireless/ath/ath12k/core.h b/drivers/net/wireless/ath/ath12k/core.h
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -15,6 +15,7 @@
+ #include <linux/ctype.h>
+ #include <linux/firmware.h>
+ #include <linux/of_reserved_mem.h>
++#include <linux/panic_notifier.h>
+ #include <linux/average.h>
+ #include <linux/of.h>
+ #include <linux/rhashtable.h>
+@@ -158,7 +159,11 @@
+ 	ATH12K_HW_IPQ5332_HW10,
+ 	ATH12K_HW_QCC2072_HW10,
+ 	ATH12K_HW_IPQ5424_HW10,
+-};
++	ATH12K_HW_WCN7860_HW20,
++};
++
++/* WCN7860 (peach); its QMI and DMA setup differ from the other chips */
++#define ATH12K_PCI_DEVICE_ID_WCN7860	0x110e
+ 
+ #define ATH12K_IRQ_NUM_MAX 57
+ #define ATH12K_EXT_IRQ_NUM_MAX	16
+@@ -927,6 +932,15 @@
+ 	u32 hw_link_id_base;
+ };
+ 
++struct ath12k_dp_profile_params {
++	u32 tx_comp_ring_size;
++	u32 rxdma_monitor_buf_ring_size;
++	u32 rxdma_monitor_dst_ring_size;
++	u32 num_pool_tx_desc;
++	u32 rx_desc_count;
++	u32 rx_release_ring_size;
++};
++
+ struct ath12k_mem_profile_based_param {
+ 	u32 num_vdevs;
+ 	u32 max_client_single;
+@@ -1128,6 +1142,8 @@
+ 	} acpi;
+ 
+ #endif /* CONFIG_ACPI */
++
++	struct notifier_block panic_nb;
+ 
+ 	struct ath12k_hw_group *ag;
+ 	struct ath12k_wsi_info wsi_info;
+diff --git a/drivers/net/wireless/ath/ath12k/debugfs_htt_stats.c b/drivers/net/wireless/ath/ath12k/debugfs_htt_stats.c
+--- a/drivers/net/wireless/ath/ath12k/debugfs_htt_stats.c
++++ b/drivers/net/wireless/ath/ath12k/debugfs_htt_stats.c
+@@ -6190,7 +6190,7 @@
+ 	const int size = 32;
+ 	int num_args;
+ 
+-	if (count >= size)
++	if (count > size)
+ 		return -EINVAL;
+ 
+ 	char *buf __free(kfree) = kzalloc(size, GFP_KERNEL);
+diff --git a/drivers/net/wireless/ath/ath12k/dp.c b/drivers/net/wireless/ath/ath12k/dp.c
+--- a/drivers/net/wireless/ath/ath12k/dp.c
++++ b/drivers/net/wireless/ath/ath12k/dp.c
+@@ -439,7 +439,6 @@
+ 
+ static int ath12k_dp_srng_common_setup(struct ath12k_base *ab)
+ {
+-	const struct ath12k_dp_profile_params *dp_params = &ab->profile_param->dp_params;
+ 	struct ath12k_dp *dp = ath12k_ab_to_dp(ab);
+ 	const struct ath12k_hal_tcl_to_wbm_rbm_map *map;
+ 	struct hal_srng *srng;
+@@ -470,7 +469,7 @@
+ 
+ 		ret = ath12k_dp_srng_setup(ab, &dp->tx_ring[i].tcl_comp_ring,
+ 					   HAL_WBM2SW_RELEASE, tx_comp_ring_num, 0,
+-					   ath12k_dp_tx_comp_ring_size(dp_params));
++					   DP_TX_COMP_RING_SIZE(ab));
+ 		if (ret) {
+ 			ath12k_warn(ab, "failed to set up tcl_comp ring (%d) :%d\n",
+ 				    tx_comp_ring_num, ret);
+@@ -488,7 +487,7 @@
+ 
+ 	ret = ath12k_dp_srng_setup(ab, &dp->rx_rel_ring, HAL_WBM2SW_RELEASE,
+ 				   HAL_WBM2SW_REL_ERR_RING_NUM, 0,
+-				   ath12k_dp_rx_release_ring_size(dp_params));
++				   DP_RX_RELEASE_RING_SIZE(ab));
+ 	if (ret) {
+ 		ath12k_warn(ab, "failed to set up rx_rel ring :%d\n", ret);
+ 		goto err;
+@@ -967,15 +966,14 @@
+ 
+ static void ath12k_dp_cc_cleanup(struct ath12k_base *ab)
+ {
+-	const struct ath12k_dp_profile_params *dp_params = &ab->profile_param->dp_params;
+-	u32 pool_id, tx_spt_page, tx_spt_pages_per_pool, num_rx_spt_pages;
++	struct ath12k_rx_desc_info *desc_info;
+ 	struct ath12k_tx_desc_info *tx_desc_info, *tmp1;
+ 	struct ath12k_dp *dp = ath12k_ab_to_dp(ab);
+-	struct ath12k_rx_desc_info *desc_info;
+ 	struct ath12k_skb_cb *skb_cb;
+ 	struct sk_buff *skb;
+ 	struct ath12k *ar;
+ 	int i, j;
++	u32 pool_id, tx_spt_page;
+ 
+ 	if (!dp->spt_info)
+ 		return;
+@@ -983,10 +981,8 @@
+ 	/* RX Descriptor cleanup */
+ 	spin_lock_bh(&dp->rx_desc_lock);
+ 
+-	num_rx_spt_pages = ath12k_dp_num_rx_spt_pages(dp_params);
+-
+ 	if (dp->rxbaddr) {
+-		for (i = 0; i < num_rx_spt_pages; i++) {
++		for (i = 0; i < ATH12K_NUM_RX_SPT_PAGES(ab); i++) {
+ 			if (!dp->rxbaddr[i])
+ 				continue;
+ 
+@@ -1002,11 +998,10 @@
+ 				if (!skb)
+ 					continue;
+ 
+-				if (!ATH12K_SKB_RXCB(skb)->unmapped)
+-					dma_unmap_single(ab->dev,
+-							 ATH12K_SKB_RXCB(skb)->paddr,
+-							 skb->len + skb_tailroom(skb),
+-							 DMA_FROM_DEVICE);
++				dma_unmap_single(ab->dev,
++						 ATH12K_SKB_RXCB(skb)->paddr,
++						 skb->len + skb_tailroom(skb),
++						 DMA_FROM_DEVICE);
+ 				dev_kfree_skb_any(skb);
+ 			}
+ 
+@@ -1060,13 +1055,12 @@
+ 	}
+ 
+ 	if (dp->txbaddr) {
+-		tx_spt_pages_per_pool = ath12k_dp_tx_spt_pages_per_pool(dp_params);
+-
+ 		for (pool_id = 0; pool_id < ATH12K_HW_MAX_QUEUES; pool_id++) {
+ 			spin_lock_bh(&dp->tx_desc_lock[pool_id]);
+ 
+-			for (i = 0; i < tx_spt_pages_per_pool; i++) {
+-				tx_spt_page = i + pool_id * tx_spt_pages_per_pool;
++			for (i = 0; i < ATH12K_TX_SPT_PAGES_PER_POOL(ab); i++) {
++				tx_spt_page = i + pool_id *
++					      ATH12K_TX_SPT_PAGES_PER_POOL(ab);
+ 				if (!dp->txbaddr[tx_spt_page])
+ 					continue;
+ 
+@@ -1160,16 +1154,14 @@
+ struct ath12k_rx_desc_info *ath12k_dp_get_rx_desc(struct ath12k_dp *dp,
+ 						  u32 cookie)
+ {
+-	const struct ath12k_dp_profile_params *dp_params;
+ 	struct ath12k_rx_desc_info **desc_addr_ptr;
+ 	u16 start_ppt_idx, end_ppt_idx, ppt_idx, spt_idx;
+ 
+ 	ppt_idx = u32_get_bits(cookie, ATH12K_DP_CC_COOKIE_PPT);
+ 	spt_idx = u32_get_bits(cookie, ATH12K_DP_CC_COOKIE_SPT);
+-	dp_params = &dp->ab->profile_param->dp_params;
+-
+-	start_ppt_idx = dp->rx_ppt_base + ath12k_dp_rx_spt_page_offset(dp_params);
+-	end_ppt_idx = start_ppt_idx + ath12k_dp_num_rx_spt_pages(dp_params);
++
++	start_ppt_idx = dp->rx_ppt_base + ATH12K_RX_SPT_PAGE_OFFSET(dp->ab);
++	end_ppt_idx = start_ppt_idx + ATH12K_NUM_RX_SPT_PAGES(dp->ab);
+ 
+ 	if (ppt_idx < start_ppt_idx ||
+ 	    ppt_idx >= end_ppt_idx ||
+@@ -1186,16 +1178,15 @@
+ struct ath12k_tx_desc_info *ath12k_dp_get_tx_desc(struct ath12k_dp *dp,
+ 						  u32 cookie)
+ {
+-	const struct ath12k_dp_profile_params *dp_params;
+ 	struct ath12k_tx_desc_info **desc_addr_ptr;
+ 	u16 start_ppt_idx, end_ppt_idx, ppt_idx, spt_idx;
+ 
+ 	ppt_idx = u32_get_bits(cookie, ATH12K_DP_CC_COOKIE_PPT);
+ 	spt_idx = u32_get_bits(cookie, ATH12K_DP_CC_COOKIE_SPT);
+-	dp_params = &dp->ab->profile_param->dp_params;
+ 
+ 	start_ppt_idx = ATH12K_TX_SPT_PAGE_OFFSET;
+-	end_ppt_idx = start_ppt_idx + ath12k_dp_num_tx_spt_pages(dp_params);
++	end_ppt_idx = start_ppt_idx +
++		      (ATH12K_TX_SPT_PAGES_PER_POOL(dp->ab) * ATH12K_HW_MAX_QUEUES);
+ 
+ 	if (ppt_idx < start_ppt_idx ||
+ 	    ppt_idx >= end_ppt_idx ||
+@@ -1210,13 +1201,12 @@
+ 
+ static int ath12k_dp_cc_desc_init(struct ath12k_base *ab)
+ {
+-	const struct ath12k_dp_profile_params *dp_params = &ab->profile_param->dp_params;
+-	u32 num_rx_spt_pages = ath12k_dp_num_rx_spt_pages(dp_params);
++	struct ath12k_dp *dp = ath12k_ab_to_dp(ab);
+ 	struct ath12k_rx_desc_info *rx_descs, **rx_desc_addr;
+ 	struct ath12k_tx_desc_info *tx_descs, **tx_desc_addr;
+-	u32 i, j, pool_id, tx_spt_page, tx_spt_pages_per_pool;
+-	u32 ppt_idx, cookie_ppt_idx, rx_spt_page_offset;
+-	struct ath12k_dp *dp = ath12k_ab_to_dp(ab);
++	u32 num_rx_spt_pages = ATH12K_NUM_RX_SPT_PAGES(ab);
++	u32 i, j, pool_id, tx_spt_page;
++	u32 ppt_idx, cookie_ppt_idx;
+ 
+ 	spin_lock_bh(&dp->rx_desc_lock);
+ 
+@@ -1228,9 +1218,9 @@
+ 		return -ENOMEM;
+ 	}
+ 
+-	rx_spt_page_offset = ath12k_dp_rx_spt_page_offset(dp_params);
+-
+-	/* First num_rx_spt_pages of allocated SPT pages are used for RX */
++	/* First ATH12K_NUM_RX_SPT_PAGES(ab) of allocated SPT pages are used for
++	 * RX
++	 */
+ 	for (i = 0; i < num_rx_spt_pages; i++) {
+ 		rx_descs = kzalloc_objs(*rx_descs, ATH12K_MAX_SPT_ENTRIES,
+ 					GFP_ATOMIC);
+@@ -1240,7 +1230,7 @@
+ 			return -ENOMEM;
+ 		}
+ 
+-		ppt_idx = rx_spt_page_offset + i;
++		ppt_idx = ATH12K_RX_SPT_PAGE_OFFSET(ab) + i;
+ 		cookie_ppt_idx = dp->rx_ppt_base + ppt_idx;
+ 		dp->rxbaddr[i] = &rx_descs[0];
+ 
+@@ -1259,17 +1249,14 @@
+ 	spin_unlock_bh(&dp->rx_desc_lock);
+ 
+ 	dp->txbaddr = kzalloc_objs(struct ath12k_tx_desc_info *,
+-				   ath12k_dp_num_tx_spt_pages(dp_params),
+-				   GFP_ATOMIC);
++				   ATH12K_NUM_TX_SPT_PAGES(ab), GFP_ATOMIC);
+ 
+ 	if (!dp->txbaddr)
+ 		return -ENOMEM;
+ 
+-	tx_spt_pages_per_pool = ath12k_dp_tx_spt_pages_per_pool(dp_params);
+-
+ 	for (pool_id = 0; pool_id < ATH12K_HW_MAX_QUEUES; pool_id++) {
+ 		spin_lock_bh(&dp->tx_desc_lock[pool_id]);
+-		for (i = 0; i < tx_spt_pages_per_pool; i++) {
++		for (i = 0; i < ATH12K_TX_SPT_PAGES_PER_POOL(ab); i++) {
+ 			tx_descs = kzalloc_objs(*tx_descs,
+ 						ATH12K_MAX_SPT_ENTRIES,
+ 						GFP_ATOMIC);
+@@ -1280,7 +1267,8 @@
+ 				return -ENOMEM;
+ 			}
+ 
+-			tx_spt_page = i + pool_id * tx_spt_pages_per_pool;
++			tx_spt_page = i + pool_id *
++				      ATH12K_TX_SPT_PAGES_PER_POOL(ab);
+ 			ppt_idx = ATH12K_TX_SPT_PAGE_OFFSET + tx_spt_page;
+ 
+ 			dp->txbaddr[tx_spt_page] = &tx_descs[0];
+@@ -1306,7 +1294,6 @@
+ 			       struct ath12k_dp *dp,
+ 			       enum ath12k_dp_desc_type type)
+ {
+-	const struct ath12k_dp_profile_params *dp_params = &ab->profile_param->dp_params;
+ 	u32 cmem_base;
+ 	int i, start, end;
+ 
+@@ -1315,12 +1302,12 @@
+ 	switch (type) {
+ 	case ATH12K_DP_TX_DESC:
+ 		start = ATH12K_TX_SPT_PAGE_OFFSET;
+-		end = start + ath12k_dp_num_tx_spt_pages(dp_params);
++		end = start + ATH12K_NUM_TX_SPT_PAGES(ab);
+ 		break;
+ 	case ATH12K_DP_RX_DESC:
+ 		cmem_base += ATH12K_PPT_ADDR_OFFSET(dp->rx_ppt_base);
+-		start = ath12k_dp_rx_spt_page_offset(dp_params);
+-		end = start + ath12k_dp_num_rx_spt_pages(dp_params);
++		start = ATH12K_RX_SPT_PAGE_OFFSET(ab);
++		end = start + ATH12K_NUM_RX_SPT_PAGES(ab);
+ 		break;
+ 	default:
+ 		ath12k_err(ab, "invalid descriptor type %d in cmem init\n", type);
+@@ -1350,10 +1337,7 @@
+ 
+ static u32 ath12k_dp_get_num_spt_pages(struct ath12k_base *ab)
+ {
+-	const struct ath12k_dp_profile_params *dp_params = &ab->profile_param->dp_params;
+-
+-	return ath12k_dp_num_rx_spt_pages(dp_params) +
+-	       ath12k_dp_num_tx_spt_pages(dp_params);
++	return ATH12K_NUM_RX_SPT_PAGES(ab) + ATH12K_NUM_TX_SPT_PAGES(ab);
+ }
+ 
+ static int ath12k_dp_cc_init(struct ath12k_base *ab)
+@@ -1381,8 +1365,7 @@
+ 		return -ENOMEM;
+ 	}
+ 
+-	dp->rx_ppt_base = ab->device_id *
+-			  ath12k_dp_num_rx_spt_pages(&ab->profile_param->dp_params);
++	dp->rx_ppt_base = ab->device_id * ATH12K_NUM_RX_SPT_PAGES(ab);
+ 
+ 	for (i = 0; i < dp->num_spt_pages; i++) {
+ 		dp->spt_info[i].vaddr = dma_alloc_coherent(ab->dev,
+@@ -1482,7 +1465,6 @@
+ 
+ static int ath12k_dp_setup(struct ath12k_base *ab)
+ {
+-	const struct ath12k_dp_profile_params *dp_params;
+ 	struct ath12k_dp *dp;
+ 	struct hal_srng *srng = NULL;
+ 	size_t size = 0;
+@@ -1492,7 +1474,6 @@
+ 
+ 	dp = ath12k_ab_to_dp(ab);
+ 	dp->ab = ab;
+-	dp_params = &ab->profile_param->dp_params;
+ 
+ 	INIT_LIST_HEAD(&dp->reo_cmd_list);
+ 	INIT_LIST_HEAD(&dp->reo_cmd_cache_flush_list);
+@@ -1547,7 +1528,7 @@
+ 		goto fail_dp_bank_profiles_cleanup;
+ 
+ 	size = ab->hal.hal_wbm_release_ring_tx_size *
+-	       ath12k_dp_tx_comp_ring_size(dp_params);
++	       DP_TX_COMP_RING_SIZE(ab);
+ 
+ 	ret = ath12k_dp_reoq_lut_setup(ab);
+ 	if (ret) {
+@@ -1559,8 +1540,7 @@
+ 		dp->tx_ring[i].tcl_data_ring_id = i;
+ 
+ 		dp->tx_ring[i].tx_status_head = 0;
+-		dp->tx_ring[i].tx_status_tail =
+-			ath12k_dp_tx_comp_ring_size(dp_params) - 1;
++		dp->tx_ring[i].tx_status_tail = DP_TX_COMP_RING_SIZE(ab) - 1;
+ 		dp->tx_ring[i].tx_status = kmalloc(size, GFP_KERNEL);
+ 		if (!dp->tx_ring[i].tx_status) {
+ 			ret = -ENOMEM;
+diff --git a/drivers/net/wireless/ath/ath12k/dp.h b/drivers/net/wireless/ath/ath12k/dp.h
+--- a/drivers/net/wireless/ath/ath12k/dp.h
++++ b/drivers/net/wireless/ath/ath12k/dp.h
+@@ -23,16 +23,6 @@
+ struct ath12k_dp_rx_tid;
+ struct ath12k_dp_rx_tid_rxq;
+ 
+-struct ath12k_dp_profile_params {
+-	u32 tx_comp_ring_size;
+-	u32 rxdma_monitor_buf_ring_size;
+-	u32 rxdma_monitor_dst_ring_size;
+-	u32 num_pool_tx_desc;
+-	u32 rx_desc_count;
+-	u32 rx_release_ring_size;
+-	u32 rxdma_buf_ring_size;
+-};
+-
+ #define DP_MON_PURGE_TIMEOUT_MS     100
+ #define DP_MON_SERVICE_BUDGET       128
+ 
+@@ -62,7 +52,7 @@
+ 	int bufs_max;
+ };
+ 
+-#define ATH12K_TX_COMPL_NEXT(ring_size, x)	(((x) + 1) % (ring_size))
++#define ATH12K_TX_COMPL_NEXT(ab, x)	(((x) + 1) % DP_TX_COMP_RING_SIZE(ab))
+ 
+ struct dp_tx_ring {
+ 	u8 tcl_data_ring_id;
+@@ -202,18 +192,28 @@
+ 
+ #define DP_WBM_RELEASE_RING_SIZE	64
+ #define DP_TCL_DATA_RING_SIZE		512
++#define DP_TX_COMP_RING_SIZE(ab) \
++	((ab)->profile_param->dp_params.tx_comp_ring_size)
++#define DP_TX_IDR_SIZE(ab)		DP_TX_COMP_RING_SIZE(ab)
+ #define DP_TCL_CMD_RING_SIZE		32
+ #define DP_TCL_STATUS_RING_SIZE		32
+ #define DP_REO_DST_RING_MAX		8
+ #define DP_REO_DST_RING_SIZE		2048
+ #define DP_REO_REINJECT_RING_SIZE	32
++#define DP_RX_RELEASE_RING_SIZE(ab) \
++	((ab)->profile_param->dp_params.rx_release_ring_size)
+ #define DP_REO_EXCEPTION_RING_SIZE	128
+ #define DP_REO_CMD_RING_SIZE		256
+ #define DP_REO_STATUS_RING_SIZE		2048
++#define DP_RXDMA_BUF_RING_SIZE		4096
+ #define DP_RX_MAC_BUF_RING_SIZE		4096
+ #define DP_RXDMA_REFILL_RING_SIZE	2048
+ #define DP_RXDMA_ERR_DST_RING_SIZE	1024
+ #define DP_RXDMA_MON_STATUS_RING_SIZE	1024
++#define DP_RXDMA_MONITOR_BUF_RING_SIZE(ab) \
++	((ab)->profile_param->dp_params.rxdma_monitor_buf_ring_size)
++#define DP_RXDMA_MONITOR_DST_RING_SIZE(ab) \
++	((ab)->profile_param->dp_params.rxdma_monitor_dst_ring_size)
+ #define DP_RXDMA_MONITOR_DESC_RING_SIZE	4096
+ #define DP_TX_MONITOR_BUF_RING_SIZE	4096
+ #define DP_TX_MONITOR_DEST_RING_SIZE	2048
+@@ -247,6 +247,12 @@
+ #define ATH12K_SHADOW_DP_TIMER_INTERVAL 20
+ #define ATH12K_SHADOW_CTRL_TIMER_INTERVAL 10
+ 
++#define ATH12K_NUM_POOL_TX_DESC(ab) \
++	((ab)->profile_param->dp_params.num_pool_tx_desc)
++/* TODO: revisit this count during testing */
++#define ATH12K_RX_DESC_COUNT(ab) \
++	((ab)->profile_param->dp_params.rx_desc_count)
++
+ #define ATH12K_PAGE_SIZE	PAGE_SIZE
+ 
+ /* Total 1024 entries in PPT, i.e 4K/4 considering 4K aligned
+@@ -257,7 +263,21 @@
+ /* Total 512 entries in a SPT, i.e 4K Page/8 */
+ #define ATH12K_MAX_SPT_ENTRIES	512
+ 
++#define ATH12K_NUM_RX_SPT_PAGES(ab)	((ATH12K_RX_DESC_COUNT(ab)) / \
++					  ATH12K_MAX_SPT_ENTRIES)
++
++#define ATH12K_TX_SPT_PAGES_PER_POOL(ab) (ATH12K_NUM_POOL_TX_DESC(ab) / \
++					  ATH12K_MAX_SPT_ENTRIES)
++#define ATH12K_NUM_TX_SPT_PAGES(ab)	(ATH12K_TX_SPT_PAGES_PER_POOL(ab) * \
++					 ATH12K_HW_MAX_QUEUES)
++
+ #define ATH12K_TX_SPT_PAGE_OFFSET 0
++#define ATH12K_RX_SPT_PAGE_OFFSET(ab) ATH12K_NUM_TX_SPT_PAGES(ab)
++
++/* The SPT pages are divided for RX and TX, first block for RX
++ * and remaining for TX
++ */
++#define ATH12K_NUM_TX_SPT_PAGE_START(ab) ATH12K_NUM_RX_SPT_PAGES(ab)
+ 
+ #define ATH12K_DP_RX_DESC_MAGIC	0xBABABABA
+ 
+@@ -660,72 +680,6 @@
+ 	return rcu_dereference(dp->dp_pdevs[pdev_idx]);
+ }
+ 
+-static inline u32
+-ath12k_dp_tx_comp_ring_size(const struct ath12k_dp_profile_params *p)
+-{
+-	return p->tx_comp_ring_size;
+-}
+-
+-static inline u32
+-ath12k_dp_rxdma_monitor_buf_ring_size(const struct ath12k_dp_profile_params *p)
+-{
+-	return p->rxdma_monitor_buf_ring_size;
+-}
+-
+-static inline u32
+-ath12k_dp_rxdma_monitor_dst_ring_size(const struct ath12k_dp_profile_params *p)
+-{
+-	return p->rxdma_monitor_dst_ring_size;
+-}
+-
+-static inline u32
+-ath12k_dp_num_pool_tx_desc(const struct ath12k_dp_profile_params *p)
+-{
+-	return p->num_pool_tx_desc;
+-}
+-
+-static inline u32
+-ath12k_dp_tx_spt_pages_per_pool(const struct ath12k_dp_profile_params *p)
+-{
+-	return ath12k_dp_num_pool_tx_desc(p) / ATH12K_MAX_SPT_ENTRIES;
+-}
+-
+-static inline u32
+-ath12k_dp_num_tx_spt_pages(const struct ath12k_dp_profile_params *p)
+-{
+-	return ath12k_dp_tx_spt_pages_per_pool(p) * ATH12K_HW_MAX_QUEUES;
+-}
+-
+-static inline u32
+-ath12k_dp_rx_spt_page_offset(const struct ath12k_dp_profile_params *p)
+-{
+-	return ath12k_dp_num_tx_spt_pages(p);
+-}
+-
+-static inline u32
+-ath12k_dp_rx_desc_count(const struct ath12k_dp_profile_params *p)
+-{
+-	return p->rx_desc_count;
+-}
+-
+-static inline u32
+-ath12k_dp_num_rx_spt_pages(const struct ath12k_dp_profile_params *p)
+-{
+-	return ath12k_dp_rx_desc_count(p) / ATH12K_MAX_SPT_ENTRIES;
+-}
+-
+-static inline u32
+-ath12k_dp_rx_release_ring_size(const struct ath12k_dp_profile_params *p)
+-{
+-	return p->rx_release_ring_size;
+-}
+-
+-static inline u32
+-ath12k_dp_rxdma_buf_ring_size(const struct ath12k_dp_profile_params *p)
+-{
+-	return p->rxdma_buf_ring_size;
+-}
+-
+ void ath12k_dp_vdev_tx_attach(struct ath12k *ar, struct ath12k_link_vif *arvif);
+ void ath12k_dp_partner_cc_init(struct ath12k_base *ab);
+ int ath12k_dp_pdev_alloc(struct ath12k_base *ab);
+diff --git a/drivers/net/wireless/ath/ath12k/dp_mon.c b/drivers/net/wireless/ath/ath12k/dp_mon.c
+--- a/drivers/net/wireless/ath/ath12k/dp_mon.c
++++ b/drivers/net/wireless/ath/ath12k/dp_mon.c
+@@ -81,23 +81,24 @@
+ }
+ EXPORT_SYMBOL(ath12k_dp_rx_alloc_mon_status_buf);
+ 
+-bool ath12k_dp_mon_comp_ppduid(u32 msdu_ppdu_id, u32 *ppdu_id)
+-{
++u32 ath12k_dp_mon_comp_ppduid(u32 msdu_ppdu_id, u32 *ppdu_id)
++{
++	u32 ret = 0;
++
+ 	if ((*ppdu_id < msdu_ppdu_id) &&
+ 	    ((msdu_ppdu_id - *ppdu_id) < DP_NOT_PPDU_ID_WRAP_AROUND)) {
+ 		/* Hold on mon dest ring, and reap mon status ring. */
+ 		*ppdu_id = msdu_ppdu_id;
+-		return true;
+-	}
+-	if ((*ppdu_id > msdu_ppdu_id) &&
+-	    ((*ppdu_id - msdu_ppdu_id) > DP_NOT_PPDU_ID_WRAP_AROUND)) {
++		ret = msdu_ppdu_id;
++	} else if ((*ppdu_id > msdu_ppdu_id) &&
++		((*ppdu_id - msdu_ppdu_id) > DP_NOT_PPDU_ID_WRAP_AROUND)) {
+ 		/* PPDU ID has exceeded the maximum value and will
+ 		 * restart from 0.
+ 		 */
+ 		*ppdu_id = msdu_ppdu_id;
+-		return true;
+-	}
+-	return false;
++		ret = msdu_ppdu_id;
++	}
++	return ret;
+ }
+ EXPORT_SYMBOL(ath12k_dp_mon_comp_ppduid);
+ 
+diff --git a/drivers/net/wireless/ath/ath12k/dp_mon.h b/drivers/net/wireless/ath/ath12k/dp_mon.h
+--- a/drivers/net/wireless/ath/ath12k/dp_mon.h
++++ b/drivers/net/wireless/ath/ath12k/dp_mon.h
+@@ -100,7 +100,7 @@
+ *ath12k_dp_rx_alloc_mon_status_buf(struct ath12k_base *ab,
+ 				   struct dp_rxdma_mon_ring *rx_ring,
+ 				   int *buf_id);
+-bool ath12k_dp_mon_comp_ppduid(u32 msdu_ppdu_id, u32 *ppdu_id);
++u32 ath12k_dp_mon_comp_ppduid(u32 msdu_ppdu_id, u32 *ppdu_id);
+ int
+ ath12k_dp_mon_parse_status_buf(struct ath12k_pdev_dp *dp_pdev,
+ 			       struct ath12k_mon_data *pmon,
+diff --git a/drivers/net/wireless/ath/ath12k/dp_rx.c b/drivers/net/wireless/ath/ath12k/dp_rx.c
+--- a/drivers/net/wireless/ath/ath12k/dp_rx.c
++++ b/drivers/net/wireless/ath/ath12k/dp_rx.c
+@@ -330,20 +330,16 @@
+ {
+ 	struct ath12k_pdev_dp *dp = &ar->dp;
+ 	struct ath12k_base *ab = ar->ab;
+-	u32 monitor_dst_ring_size;
+-	u32 mac_id = dp->mac_id;
+ 	int i;
+ 	int ret;
+-
+-	monitor_dst_ring_size =
+-		ath12k_dp_rxdma_monitor_dst_ring_size(&ab->profile_param->dp_params);
++	u32 mac_id = dp->mac_id;
+ 
+ 	for (i = 0; i < ab->hw_params->num_rxdma_per_pdev; i++) {
+ 		ret = ath12k_dp_srng_setup(ar->ab,
+ 					   &dp->rxdma_mon_dst_ring[i],
+ 					   HAL_RXDMA_MONITOR_DST,
+ 					   0, mac_id + i,
+-					   monitor_dst_ring_size);
++					   DP_RXDMA_MONITOR_DST_RING_SIZE(ab));
+ 		if (ret) {
+ 			ath12k_warn(ar->ab,
+ 				    "failed to setup HAL_RXDMA_MONITOR_DST\n");
+@@ -1696,8 +1692,6 @@
+ 
+ int ath12k_dp_rx_alloc(struct ath12k_base *ab)
+ {
+-	const struct ath12k_dp_profile_params *dp_params = &ab->profile_param->dp_params;
+-	u32 monitor_buf_ring_size = ath12k_dp_rxdma_monitor_buf_ring_size(dp_params);
+ 	struct ath12k_dp *dp = ath12k_ab_to_dp(ab);
+ 	struct dp_srng *srng;
+ 	int i, ret;
+@@ -1708,7 +1702,7 @@
+ 	ret = ath12k_dp_srng_setup(ab,
+ 				   &dp->rx_refill_buf_ring.refill_buf_ring,
+ 				   HAL_RXDMA_BUF, 0, 0,
+-				   ath12k_dp_rxdma_buf_ring_size(dp_params));
++				   DP_RXDMA_BUF_RING_SIZE);
+ 	if (ret) {
+ 		ath12k_warn(ab, "failed to setup rx_refill_buf_ring\n");
+ 		return ret;
+@@ -1742,7 +1736,7 @@
+ 		ret = ath12k_dp_srng_setup(ab,
+ 					   &dp->rxdma_mon_buf_ring.refill_buf_ring,
+ 					   HAL_RXDMA_MONITOR_BUF, 0, 0,
+-					   monitor_buf_ring_size);
++					   DP_RXDMA_MONITOR_BUF_RING_SIZE(ab));
+ 		if (ret) {
+ 			ath12k_warn(ab, "failed to setup HAL_RXDMA_MONITOR_BUF\n");
+ 			return ret;
+diff --git a/drivers/net/wireless/ath/ath12k/hif.h b/drivers/net/wireless/ath/ath12k/hif.h
+--- a/drivers/net/wireless/ath/ath12k/hif.h
++++ b/drivers/net/wireless/ath/ath12k/hif.h
+@@ -30,6 +30,7 @@
+ 	void (*ce_irq_enable)(struct ath12k_base *ab);
+ 	void (*ce_irq_disable)(struct ath12k_base *ab);
+ 	void (*get_ce_msi_idx)(struct ath12k_base *ab, u32 ce_id, u32 *msi_idx);
++	int (*panic_handler)(struct ath12k_base *ab);
+ 	void (*coredump_download)(struct ath12k_base *ab);
+ };
+ 
+@@ -148,6 +149,14 @@
+ 	ab->hif.ops->power_down(ab, is_suspend);
+ }
+ 
++static inline int ath12k_hif_panic_handler(struct ath12k_base *ab)
++{
++	if (!ab->hif.ops->panic_handler)
++		return NOTIFY_DONE;
++
++	return ab->hif.ops->panic_handler(ab);
++}
++
+ static inline void ath12k_hif_coredump_download(struct ath12k_base *ab)
+ {
+ 	if (ab->hif.ops->coredump_download)
+diff --git a/drivers/net/wireless/ath/ath12k/mac.c b/drivers/net/wireless/ath/ath12k/mac.c
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -1506,13 +1506,6 @@
+ 		return ret;
+ 	}
+ 
+-	/*
+-	 * A previous monitor session may have stopped mid-PPDU, leaving
+-	 * ppdu_continuation set. Clear it so the first status buffer of
+-	 * this session is not merged with stale state from before.
+-	 */
+-	ar->dp.mon_data.mon_ppdu_info.ppdu_continuation = false;
+-
+ 	ar->monitor_started = true;
+ 	ar->num_started_vdevs++;
+ 
+@@ -9194,27 +9187,25 @@
+ 	ath12k_mgmt_over_wmi_tx_drop(ar, msdu);
+ }
+ 
+-void ath12k_mac_tx_mgmt_pending_free(struct ath12k *ar)
+-{
+-	struct sk_buff *msdu;
+-	int buf_id;
+-
+-	idr_for_each_entry(&ar->txmgmt_idr, msdu, buf_id)
++int ath12k_mac_tx_mgmt_pending_free(int buf_id, void *skb, void *ctx)
++{
++	struct ath12k *ar = ctx;
++
++	ath12k_mac_tx_mgmt_free(ar, buf_id);
++
++	return 0;
++}
++
++static int ath12k_mac_vif_txmgmt_idr_remove(int buf_id, void *skb, void *ctx)
++{
++	struct ieee80211_vif *vif = ctx;
++	struct ath12k_skb_cb *skb_cb = ATH12K_SKB_CB(skb);
++	struct ath12k *ar = skb_cb->ar;
++
++	if (skb_cb->vif == vif)
+ 		ath12k_mac_tx_mgmt_free(ar, buf_id);
+-}
+-
+-static void ath12k_mac_vif_txmgmt_cleanup(struct ath12k *ar,
+-					  struct ieee80211_vif *vif)
+-{
+-	struct ath12k_skb_cb *skb_cb;
+-	struct sk_buff *skb;
+-	int buf_id;
+-
+-	idr_for_each_entry(&ar->txmgmt_idr, skb, buf_id) {
+-		skb_cb = ATH12K_SKB_CB(skb);
+-		if (skb_cb->vif == vif)
+-			ath12k_mac_tx_mgmt_free(ar, buf_id);
+-	}
++
++	return 0;
+ }
+ 
+ static int ath12k_mac_mgmt_tx_wmi(struct ath12k *ar, struct ath12k_link_vif *arvif,
+@@ -9741,7 +9732,6 @@
+ 
+ static int ath12k_mac_start(struct ath12k *ar)
+ {
+-	const struct ath12k_dp_profile_params *dp_params;
+ 	struct ath12k_hw *ah = ar->ah;
+ 	struct ath12k_base *ab = ar->ab;
+ 	struct ath12k_pdev *pdev = ar->pdev;
+@@ -9749,8 +9739,6 @@
+ 
+ 	lockdep_assert_held(&ah->hw_mutex);
+ 	lockdep_assert_wiphy(ath12k_ar_to_hw(ar)->wiphy);
+-
+-	dp_params = &ab->profile_param->dp_params;
+ 
+ 	ret = ath12k_wmi_pdev_set_param(ar, WMI_PDEV_PARAM_PMF_QOS,
+ 					1, pdev->pdev_id);
+@@ -9800,7 +9788,7 @@
+ 	if (ab->hw_params->supports_cong_ctrl_max_msdus) {
+ 		ret = ath12k_wmi_pdev_set_param(ar,
+ 						WMI_PDEV_PARAM_SET_CONG_CTRL_MAX_MSDUS,
+-						ath12k_dp_num_pool_tx_desc(dp_params),
++						ATH12K_NUM_POOL_TX_DESC(ab),
+ 						pdev->pdev_id);
+ 		if (ret) {
+ 			ath12k_err(ab,
+@@ -10979,7 +10967,8 @@
+ 	ath12k_peer_cleanup(ar, arvif->vdev_id);
+ 	ath12k_ahvif_put_link_cache(ahvif, arvif->link_id);
+ 
+-	ath12k_mac_vif_txmgmt_cleanup(ar, vif);
++	idr_for_each(&ar->txmgmt_idr,
++		     ath12k_mac_vif_txmgmt_idr_remove, vif);
+ 
+ 	ath12k_mac_vif_unref(ath12k_ab_to_dp(ab), vif);
+ 
+@@ -14736,7 +14725,7 @@
+ 
+ static void ath12k_mac_cleanup_unregister(struct ath12k *ar)
+ {
+-	ath12k_mac_tx_mgmt_pending_free(ar);
++	idr_for_each(&ar->txmgmt_idr, ath12k_mac_tx_mgmt_pending_free, ar);
+ 	idr_destroy(&ar->txmgmt_idr);
+ 
+ 	kfree(ar->mac.sbands[NL80211_BAND_2GHZ].channels);
+diff --git a/drivers/net/wireless/ath/ath12k/mac.h b/drivers/net/wireless/ath/ath12k/mac.h
+--- a/drivers/net/wireless/ath/ath12k/mac.h
++++ b/drivers/net/wireless/ath/ath12k/mac.h
+@@ -173,7 +173,7 @@
+ void ath12k_mac_drain_tx(struct ath12k *ar);
+ void ath12k_mac_peer_cleanup_all(struct ath12k *ar);
+ void ath12k_mac_dp_peer_cleanup(struct ath12k_hw *ah);
+-void ath12k_mac_tx_mgmt_pending_free(struct ath12k *ar);
++int ath12k_mac_tx_mgmt_pending_free(int buf_id, void *skb, void *ctx);
+ enum rate_info_bw ath12k_mac_bw_to_mac80211_bw(enum ath12k_supported_bw bw);
+ enum ath12k_supported_bw ath12k_mac_mac80211_bw_to_ath12k_bw(enum rate_info_bw bw);
+ enum hal_encrypt_type ath12k_dp_tx_get_encrypt_type(u32 cipher);
+diff --git a/drivers/net/wireless/ath/ath12k/mhi.c b/drivers/net/wireless/ath/ath12k/mhi.c
+--- a/drivers/net/wireless/ath/ath12k/mhi.c
++++ b/drivers/net/wireless/ath/ath12k/mhi.c
+@@ -155,6 +155,7 @@
+ 			break;
+ 		}
+ 
++		ath12k_dbg(ab, ATH12K_DBG_BOOT, "firmware entered RDDM\n");
+ 		if (!(test_bit(ATH12K_FLAG_UNREGISTERING, &ab->dev_flags))) {
+ 			set_bit(ATH12K_FLAG_CRASH_FLUSH, &ab->dev_flags);
+ 			set_bit(ATH12K_FLAG_RECOVERY, &ab->dev_flags);
+diff --git a/drivers/net/wireless/ath/ath12k/pci.c b/drivers/net/wireless/ath/ath12k/pci.c
+--- a/drivers/net/wireless/ath/ath12k/pci.c
++++ b/drivers/net/wireless/ath/ath12k/pci.c
+@@ -21,6 +21,7 @@
+ 
+ #define ATH12K_PCI_BAR_NUM		0
+ #define ATH12K_PCI_DMA_MASK		36
++#define ATH12K_PCI_DMA_MASK_WCN7860	28
+ 
+ #define ATH12K_PCI_IRQ_CE0_OFFSET		3
+ 
+@@ -313,38 +314,33 @@
+ 	ath12k_mhi_set_mhictrl_reset(ab);
+ }
+ 
+-static void ath12k_pci_free_ce_irq(struct ath12k_base *ab, int num_ce)
++static void ath12k_pci_free_ext_irq(struct ath12k_base *ab)
++{
++	int i, j;
++
++	for (i = 0; i < ATH12K_EXT_IRQ_GRP_NUM_MAX; i++) {
++		struct ath12k_ext_irq_grp *irq_grp = &ab->ext_irq_grp[i];
++
++		for (j = 0; j < irq_grp->num_irq; j++)
++			free_irq(ab->irq_num[irq_grp->irqs[j]], irq_grp);
++
++		netif_napi_del(&irq_grp->napi);
++		free_netdev(irq_grp->napi_ndev);
++	}
++}
++
++static void ath12k_pci_free_irq(struct ath12k_base *ab)
+ {
+ 	int i, irq_idx;
+ 
+-	for (i = 0; i < num_ce; i++) {
++	for (i = 0; i < ab->hw_params->ce_count; i++) {
+ 		if (ath12k_ce_get_attr_flags(ab, i) & CE_ATTR_DIS_INTR)
+ 			continue;
+-
+ 		irq_idx = ATH12K_PCI_IRQ_CE0_OFFSET + i;
+ 		free_irq(ab->irq_num[irq_idx], &ab->ce.ce_pipe[i]);
+ 	}
+-}
+-
+-static void ath12k_pci_free_ext_irq(struct ath12k_base *ab, int num_ext_irq_grp)
+-{
+-	int i, j;
+-
+-	for (i = 0; i < num_ext_irq_grp; i++) {
+-		struct ath12k_ext_irq_grp *irq_grp = &ab->ext_irq_grp[i];
+-
+-		for (j = 0; j < irq_grp->num_irq; j++)
+-			free_irq(ab->irq_num[irq_grp->irqs[j]], irq_grp);
+-
+-		netif_napi_del(&irq_grp->napi);
+-		free_netdev(irq_grp->napi_ndev);
+-	}
+-}
+-
+-static void ath12k_pci_free_irq(struct ath12k_base *ab)
+-{
+-	ath12k_pci_free_ce_irq(ab, ab->hw_params->ce_count);
+-	ath12k_pci_free_ext_irq(ab, ATH12K_EXT_IRQ_GRP_NUM_MAX);
++
++	ath12k_pci_free_ext_irq(ab);
+ }
+ 
+ static void ath12k_pci_ce_irq_enable(struct ath12k_base *ab, u16 ce_id)
+@@ -600,6 +596,8 @@
+ 
+ 			irq = ath12k_pci_get_msi_irq(ab->dev, vector);
+ 
++			ab->irq_num[irq_idx] = irq;
++
+ 			ath12k_dbg(ab, ATH12K_DBG_PCI,
+ 				   "irq:%d group:%d\n", irq, i);
+ 
+@@ -610,24 +608,22 @@
+ 			if (ret) {
+ 				ath12k_err(ab, "failed request irq %d: %d\n",
+ 					   vector, ret);
+-
+-				for (n = 0; n < j; n++)
+-					free_irq(ab->irq_num[irq_grp->irqs[n]], irq_grp);
+-
+-				netif_napi_del(&ab->ext_irq_grp[i].napi);
+-				free_netdev(ab->ext_irq_grp[i].napi_ndev);
+-				goto fail_allocate;
++				goto fail_request;
+ 			}
+-
+-			ab->irq_num[irq_idx] = irq;
+ 		}
+ 		ath12k_pci_ext_grp_disable(irq_grp);
+ 	}
+ 
+ 	return 0;
+ 
++fail_request:
++	/* i ->napi_ndev was properly allocated. Free it also */
++	i += 1;
+ fail_allocate:
+-	ath12k_pci_free_ext_irq(ab, i);
++	for (n = 0; n < i; n++) {
++		irq_grp = &ab->ext_irq_grp[n];
++		free_netdev(irq_grp->napi_ndev);
++	}
+ 	return ret;
+ }
+ 
+@@ -676,8 +672,6 @@
+ 		if (ret) {
+ 			ath12k_err(ab, "failed to request irq %d: %d\n",
+ 				   irq_idx, ret);
+-
+-			ath12k_pci_free_ce_irq(ab, i);
+ 			return ret;
+ 		}
+ 
+@@ -688,10 +682,8 @@
+ 	}
+ 
+ 	ret = ath12k_pci_ext_irq_config(ab);
+-	if (ret) {
+-		ath12k_pci_free_ce_irq(ab, ab->hw_params->ce_count);
++	if (ret)
+ 		return ret;
+-	}
+ 
+ 	return 0;
+ }
+@@ -869,9 +861,19 @@
+ 		goto disable_device;
+ 	}
+ 
+-	ab_pci->dma_mask = DMA_BIT_MASK(ATH12K_PCI_DMA_MASK);
++	/* WCN7860 firmware fails when its memory is allocated near the
++	 * top of the 32-bit DMA space (0xfe400000 and up); the vendor
++	 * driver keeps it low. Limit both masks to 256 MiB for it.
++	 */
++	if (device_id == ATH12K_PCI_DEVICE_ID_WCN7860)
++		ab_pci->dma_mask = DMA_BIT_MASK(ATH12K_PCI_DMA_MASK_WCN7860);
++	else
++		ab_pci->dma_mask = DMA_BIT_MASK(ATH12K_PCI_DMA_MASK);
+ 	dma_set_mask(&pdev->dev, ab_pci->dma_mask);
+-	dma_set_coherent_mask(&pdev->dev, DMA_BIT_MASK(32));
++	if (device_id == ATH12K_PCI_DEVICE_ID_WCN7860)
++		dma_set_coherent_mask(&pdev->dev, ab_pci->dma_mask);
++	else
++		dma_set_coherent_mask(&pdev->dev, DMA_BIT_MASK(32));
+ 
+ 	pci_set_master(pdev);
+ 
+@@ -1493,6 +1495,13 @@
+ 	ath12k_pci_sw_reset(ab_pci->ab, false);
+ }
+ 
++static int ath12k_pci_panic_handler(struct ath12k_base *ab)
++{
++	ath12k_pci_sw_reset(ab, false);
++
++	return NOTIFY_OK;
++}
++
+ static const struct ath12k_hif_ops ath12k_pci_hif_ops = {
+ 	.start = ath12k_pci_start,
+ 	.stop = ath12k_pci_stop,
+@@ -1510,6 +1519,7 @@
+ 	.ce_irq_enable = ath12k_pci_hif_ce_irq_enable,
+ 	.ce_irq_disable = ath12k_pci_hif_ce_irq_disable,
+ 	.get_ce_msi_idx = ath12k_pci_get_ce_msi_idx,
++	.panic_handler = ath12k_pci_panic_handler,
+ #ifdef CONFIG_ATH12K_COREDUMP
+ 	.coredump_download = ath12k_pci_coredump_download,
+ #endif
+diff --git a/drivers/net/wireless/ath/ath12k/qmi.c b/drivers/net/wireless/ath/ath12k/qmi.c
+--- a/drivers/net/wireless/ath/ath12k/qmi.c
++++ b/drivers/net/wireless/ath/ath12k/qmi.c
+@@ -11,6 +11,7 @@
+ #include "debug.h"
+ #include <linux/of.h>
+ #include <linux/firmware.h>
++#include <linux/dma-mapping.h>
+ #include <linux/of_address.h>
+ #include <linux/ioport.h>
+ #include <linux/of_reserved_mem.h>
+@@ -1660,6 +1661,59 @@
+ 	},
+ };
+ 
++static const struct qmi_elem_info qmi_wlanfw_tme_lite_info_req_msg_v01_ei[] = {
++	{
++		.data_type	= QMI_SIGNED_4_BYTE_ENUM,
++		.elem_len	= 1,
++		.elem_size	= sizeof(enum qmi_wlanfw_tme_lite_file_type_v01),
++		.array_type	= NO_ARRAY,
++		.tlv_type	= 0x01,
++		.offset		= offsetof(struct qmi_wlanfw_tme_lite_info_req_msg_v01,
++					   tme_file),
++	},
++	{
++		.data_type	= QMI_UNSIGNED_8_BYTE,
++		.elem_len	= 1,
++		.elem_size	= sizeof(u64),
++		.array_type	= NO_ARRAY,
++		.tlv_type	= 0x02,
++		.offset		= offsetof(struct qmi_wlanfw_tme_lite_info_req_msg_v01,
++					   addr),
++	},
++	{
++		.data_type	= QMI_UNSIGNED_4_BYTE,
++		.elem_len	= 1,
++		.elem_size	= sizeof(u32),
++		.array_type	= NO_ARRAY,
++		.tlv_type	= 0x03,
++		.offset		= offsetof(struct qmi_wlanfw_tme_lite_info_req_msg_v01,
++					   size),
++	},
++	{
++		.data_type	= QMI_EOTI,
++		.array_type	= NO_ARRAY,
++		.tlv_type	= QMI_COMMON_TLV_TYPE,
++	},
++};
++
++static const struct qmi_elem_info qmi_wlanfw_tme_lite_info_resp_msg_v01_ei[] = {
++	{
++		.data_type	= QMI_STRUCT,
++		.elem_len	= 1,
++		.elem_size	= sizeof(struct qmi_response_type_v01),
++		.array_type	= NO_ARRAY,
++		.tlv_type	= 0x02,
++		.offset		= offsetof(struct qmi_wlanfw_tme_lite_info_resp_msg_v01,
++					   resp),
++		.ei_array	= qmi_response_type_v01_ei,
++	},
++	{
++		.data_type	= QMI_EOTI,
++		.array_type	= NO_ARRAY,
++		.tlv_type	= QMI_COMMON_TLV_TYPE,
++	},
++};
++
+ static const struct qmi_elem_info qmi_wlanfw_aux_uc_info_req_msg_v01_ei[] = {
+ 	{
+ 		.data_type	= QMI_UNSIGNED_8_BYTE,
+@@ -2055,6 +2109,13 @@
+ 		.data_type	= QMI_EOTI,
+ 		.array_type	= NO_ARRAY,
+ 		.tlv_type	= QMI_COMMON_TLV_TYPE,
++	},
++};
++
++static const struct qmi_elem_info qmi_wlanfw_cold_boot_cal_done_ind_msg_v01_ei[] = {
++	{
++		.data_type = QMI_EOTI,
++		.array_type = NO_ARRAY,
+ 	},
+ };
+ 
+@@ -2254,6 +2315,8 @@
+ 	req.bdf_support_valid = 1;
+ 	req.bdf_support = 1;
+ 
++	/* Peach downloads phy_ucode20.elf as its M3. Advertise it.
++	 */
+ 	if (ab->hw_params->fw.m3_loader == ath12k_m3_fw_loader_driver) {
+ 		req.m3_support_valid = 1;
+ 		req.m3_support = 1;
+@@ -3101,6 +3164,7 @@
+ 		else
+ 			type = ATH12K_QMI_BDF_TYPE_BIN;
+ 
++		ath12k_dbg(ab, ATH12K_DBG_QMI, "qmi board data len %zu type %d\n", bd.len, type);
+ 		break;
+ 	case ATH12K_QMI_BDF_TYPE_REGDB:
+ 		ret = ath12k_core_fetch_regdb(ab, &bd);
+@@ -3188,6 +3252,45 @@
+ 	m3_mem->vaddr = NULL;
+ 	m3_mem->total_size = 0;
+ 	m3_mem->size = 0;
++}
++
++static int ath12k_qmi_load_mem_file(struct ath12k_base *ab,
++				    struct m3_mem_region *mem,
++				    const char *filename)
++{
++	const struct firmware *fw;
++	int ret;
++
++	fw = ath12k_core_firmware_request(ab, filename);
++	if (IS_ERR(fw)) {
++		ret = PTR_ERR(fw);
++		ath12k_err(ab, "failed to load %s: %d\n", filename, ret);
++		return ret;
++	}
++
++	if (mem->vaddr && mem->size < fw->size) {
++		dma_free_coherent(ab->dev, mem->size, mem->vaddr, mem->paddr);
++		mem->vaddr = NULL;
++		mem->size = 0;
++	}
++
++	if (!mem->vaddr) {
++		mem->vaddr = dma_alloc_coherent(ab->dev, fw->size, &mem->paddr,
++						GFP_KERNEL);
++		if (!mem->vaddr) {
++			ath12k_err(ab, "failed to allocate %zu bytes for %s\n",
++				   fw->size, filename);
++			release_firmware(fw);
++			return -ENOMEM;
++		}
++	}
++
++	memcpy(mem->vaddr, fw->data, fw->size);
++	mem->size = fw->size;
++	ath12k_dbg(ab, ATH12K_DBG_QMI, "qmi loaded %s size %zu addr %pad\n",
++		   filename, fw->size, &mem->paddr);
++	release_firmware(fw);
++	return 0;
+ }
+ 
+ static int ath12k_qmi_m3_load(struct ath12k_base *ab)
+@@ -3264,7 +3367,11 @@
+ 	int ret = 0;
+ 
+ 	if (ab->hw_params->fw.m3_loader == ath12k_m3_fw_loader_driver) {
+-		ret = ath12k_qmi_m3_load(ab);
++		if (ab->id.device == ATH12K_PCI_DEVICE_ID_WCN7860)
++			ret = ath12k_qmi_load_mem_file(ab, &ab->qmi.m3_mem,
++						       "phy_ucode20.elf");
++		else
++			ret = ath12k_qmi_m3_load(ab);
+ 		if (ret) {
+ 			ath12k_err(ab, "failed to load m3 firmware: %d\n", ret);
+ 			return ret;
+@@ -3430,6 +3537,204 @@
+ 	return ret;
+ }
+ 
++static const struct qmi_elem_info qmi_wlanfw_qdss_cfg_req_msg_v01_ei[] = {
++	{
++		.data_type	= QMI_OPT_FLAG,
++		.elem_len	= 1,
++		.elem_size	= sizeof(u8),
++		.array_type	= NO_ARRAY,
++		.tlv_type	= 0x10,
++		.offset		= offsetof(struct qmi_wlanfw_qdss_trace_config_download_req_msg_v01,
++					   total_size_valid),
++	},
++	{
++		.data_type	= QMI_UNSIGNED_4_BYTE,
++		.elem_len	= 1,
++		.elem_size	= sizeof(u32),
++		.array_type	= NO_ARRAY,
++		.tlv_type	= 0x10,
++		.offset		= offsetof(struct qmi_wlanfw_qdss_trace_config_download_req_msg_v01,
++					   total_size),
++	},
++	{
++		.data_type	= QMI_OPT_FLAG,
++		.elem_len	= 1,
++		.elem_size	= sizeof(u8),
++		.array_type	= NO_ARRAY,
++		.tlv_type	= 0x11,
++		.offset		= offsetof(struct qmi_wlanfw_qdss_trace_config_download_req_msg_v01,
++					   seg_id_valid),
++	},
++	{
++		.data_type	= QMI_UNSIGNED_4_BYTE,
++		.elem_len	= 1,
++		.elem_size	= sizeof(u32),
++		.array_type	= NO_ARRAY,
++		.tlv_type	= 0x11,
++		.offset		= offsetof(struct qmi_wlanfw_qdss_trace_config_download_req_msg_v01,
++					   seg_id),
++	},
++	{
++		.data_type	= QMI_OPT_FLAG,
++		.elem_len	= 1,
++		.elem_size	= sizeof(u8),
++		.array_type	= NO_ARRAY,
++		.tlv_type	= 0x12,
++		.offset		= offsetof(struct qmi_wlanfw_qdss_trace_config_download_req_msg_v01,
++					   data_valid),
++	},
++	{
++		.data_type	= QMI_DATA_LEN,
++		.elem_len	= 1,
++		.elem_size	= sizeof(u16),
++		.array_type	= NO_ARRAY,
++		.tlv_type	= 0x12,
++		.offset		= offsetof(struct qmi_wlanfw_qdss_trace_config_download_req_msg_v01,
++					   data_len),
++	},
++	{
++		.data_type	= QMI_UNSIGNED_1_BYTE,
++		.elem_len	= QMI_WLANFW_MAX_DATA_SIZE_V01,
++		.elem_size	= sizeof(u8),
++		.array_type	= VAR_LEN_ARRAY,
++		.tlv_type	= 0x12,
++		.offset		= offsetof(struct qmi_wlanfw_qdss_trace_config_download_req_msg_v01,
++					   data),
++	},
++	{
++		.data_type	= QMI_OPT_FLAG,
++		.elem_len	= 1,
++		.elem_size	= sizeof(u8),
++		.array_type	= NO_ARRAY,
++		.tlv_type	= 0x13,
++		.offset		= offsetof(struct qmi_wlanfw_qdss_trace_config_download_req_msg_v01,
++					   end_valid),
++	},
++	{
++		.data_type	= QMI_UNSIGNED_1_BYTE,
++		.elem_len	= 1,
++		.elem_size	= sizeof(u8),
++		.array_type	= NO_ARRAY,
++		.tlv_type	= 0x13,
++		.offset		= offsetof(struct qmi_wlanfw_qdss_trace_config_download_req_msg_v01,
++					   end),
++	},
++	{
++		.data_type	= QMI_EOTI,
++		.array_type	= NO_ARRAY,
++		.tlv_type	= QMI_COMMON_TLV_TYPE,
++	},
++};
++
++static const struct qmi_elem_info qmi_wlanfw_qdss_cfg_resp_msg_v01_ei[] = {
++	{
++		.data_type	= QMI_STRUCT,
++		.elem_len	= 1,
++		.elem_size	= sizeof(struct qmi_response_type_v01),
++		.array_type	= NO_ARRAY,
++		.tlv_type	= 0x02,
++		.offset		= offsetof(struct qmi_wlanfw_qdss_trace_config_download_resp_msg_v01,
++					   resp),
++		.ei_array	= qmi_response_type_v01_ei,
++	},
++	{
++		.data_type	= QMI_EOTI,
++		.array_type	= NO_ARRAY,
++		.tlv_type	= QMI_COMMON_TLV_TYPE,
++	},
++};
++
++/* Stock sends this after PHY ucode. A missing file is not fatal there. */
++static int ath12k_qmi_qdss_cfg_send(struct ath12k_base *ab)
++{
++	struct qmi_wlanfw_qdss_trace_config_download_req_msg_v01 *req;
++	struct qmi_wlanfw_qdss_trace_config_download_resp_msg_v01 resp = {};
++	const struct firmware *fw;
++	const u8 *tmp;
++	struct qmi_txn txn;
++	u32 remaining;
++	int ret;
++
++	if (ab->id.device != ATH12K_PCI_DEVICE_ID_WCN7860)
++		return 0;
++
++	fw = ath12k_core_firmware_request(ab, "qdss_trace_config_v2.cfg");
++	if (IS_ERR(fw)) {
++		ath12k_warn(ab, "qmi qdss config missing: %ld\n", PTR_ERR(fw));
++		return 0;
++	}
++
++	req = kzalloc(sizeof(*req), GFP_KERNEL);
++	if (!req) {
++		release_firmware(fw);
++		return -ENOMEM;
++	}
++
++	tmp = fw->data;
++	remaining = fw->size;
++	ath12k_dbg(ab, ATH12K_DBG_QMI, "qmi qdss config len %zu\n", fw->size);
++
++	while (remaining) {
++		req->total_size_valid = 1;
++		req->total_size = remaining;
++		req->seg_id_valid = 1;
++		req->data_valid = 1;
++		req->end_valid = 1;
++		req->end = 0;
++
++		if (remaining > QMI_WLANFW_MAX_DATA_SIZE_V01)
++			req->data_len = QMI_WLANFW_MAX_DATA_SIZE_V01;
++		else {
++			req->data_len = remaining;
++			req->end = 1;
++		}
++
++		memcpy(req->data, tmp, req->data_len);
++
++		ret = qmi_txn_init(&ab->qmi.handle, &txn,
++				   qmi_wlanfw_qdss_cfg_resp_msg_v01_ei, &resp);
++		if (ret < 0)
++			goto out;
++
++		ret = qmi_send_request(&ab->qmi.handle, NULL, &txn,
++				       QMI_WLANFW_QDSS_TRACE_CONFIG_DOWNLOAD_REQ_V01,
++				       QMI_WLANFW_QDSS_TRACE_CONFIG_DOWNLOAD_REQ_MSG_V01_MAX_LEN,
++				       qmi_wlanfw_qdss_cfg_req_msg_v01_ei, req);
++		if (ret < 0) {
++			qmi_txn_cancel(&txn);
++			ath12k_warn(ab, "qmi failed to send qdss config, err = %d\n",
++				    ret);
++			goto out;
++		}
++
++		ret = qmi_txn_wait(&txn,
++				   msecs_to_jiffies(ATH12K_QMI_WLANFW_TIMEOUT_MS));
++		if (ret < 0) {
++			ath12k_warn(ab, "qmi qdss config request timed out: %d\n",
++				    ret);
++			goto out;
++		}
++
++		if (resp.resp.result != QMI_RESULT_SUCCESS_V01) {
++			ath12k_warn(ab, "qmi qdss config failed, result: %d, err: %d\n",
++				    resp.resp.result, resp.resp.error);
++			ret = -EINVAL;
++			goto out;
++		}
++
++		remaining -= req->data_len;
++		tmp += req->data_len;
++		req->seg_id++;
++	}
++
++	ath12k_dbg(ab, ATH12K_DBG_QMI, "qmi qdss config sent\n");
++	ret = 0;
++out:
++	kfree(req);
++	release_firmware(fw);
++	return ret;
++}
++
+ static int ath12k_qmi_wlanfw_mode_send(struct ath12k_base *ab,
+ 				       enum ath12k_qmi_firmware_mode mode)
+ {
+@@ -3789,6 +4094,82 @@
+ 	return ret;
+ }
+ 
++/* Peach needs the TME-Lite ELF in DMA memory, then its physical
++ * address over QMI, after target capabilities and before board data.
++ * Stock cnss does this in cnss_fw_mem_ready_hdlr. The OnePlus 13s
++ * mainline port (pagani) ties a missing send to the set-mode timeout.
++ */
++static int ath12k_qmi_tme_lite_info_send(struct ath12k_base *ab)
++{
++	struct qmi_wlanfw_tme_lite_info_req_msg_v01 req = {};
++	struct qmi_wlanfw_tme_lite_info_resp_msg_v01 resp = {};
++	const struct firmware *fw;
++	struct qmi_txn txn;
++	dma_addr_t paddr;
++	void *vaddr;
++	int ret;
++
++	if (ab->id.device != ATH12K_PCI_DEVICE_ID_WCN7860)
++		return 0;
++
++	fw = ath12k_core_firmware_request(ab, "tmel_peach_20.elf");
++	if (IS_ERR(fw)) {
++		ret = PTR_ERR(fw);
++		ath12k_err(ab, "failed to load tmel_peach_20.elf: %d\n", ret);
++		return ret;
++	}
++
++	vaddr = dmam_alloc_coherent(ab->dev, fw->size, &paddr, GFP_KERNEL);
++	if (!vaddr) {
++		ret = -ENOMEM;
++		goto release_fw;
++	}
++	memcpy(vaddr, fw->data, fw->size);
++
++	req.tme_file = WLANFW_TME_LITE_PATCH_FILE_V01;
++	req.addr = paddr;
++	req.size = fw->size;
++	ath12k_dbg(ab, ATH12K_DBG_QMI, "qmi tme-lite addr %pad size %zu\n",
++		   &paddr, fw->size);
++
++	ret = qmi_txn_init(&ab->qmi.handle, &txn,
++			   qmi_wlanfw_tme_lite_info_resp_msg_v01_ei, &resp);
++	if (ret < 0)
++		goto release_fw;
++
++	ret = qmi_send_request(&ab->qmi.handle, NULL, &txn,
++			       QMI_WLANFW_TME_LITE_INFO_REQ_V01,
++			       QMI_WLANFW_TME_LITE_INFO_REQ_MSG_V01_MAX_MSG_LEN,
++			       qmi_wlanfw_tme_lite_info_req_msg_v01_ei, &req);
++	if (ret < 0) {
++		qmi_txn_cancel(&txn);
++		ath12k_warn(ab, "qmi failed to send TME-Lite info request: %d\n",
++			    ret);
++		goto release_fw;
++	}
++
++	ret = qmi_txn_wait(&txn, msecs_to_jiffies(ATH12K_QMI_WLANFW_TIMEOUT_MS));
++	if (ret < 0) {
++		ath12k_warn(ab, "qmi failed TME-Lite info request: %d\n", ret);
++		goto release_fw;
++	}
++
++	if (resp.resp.result != QMI_RESULT_SUCCESS_V01) {
++		ath12k_warn(ab, "qmi TME-Lite info request failed, result: %d err: %d\n",
++			    resp.resp.result, resp.resp.error);
++		ret = -EINVAL;
++		goto release_fw;
++	}
++
++	ath12k_dbg(ab, ATH12K_DBG_QMI, "qmi tme-lite info sent, %zu bytes\n",
++		   fw->size);
++	ret = 0;
++
++release_fw:
++	release_firmware(fw);
++	return ret;
++}
++
+ /* clang stack usage explodes if this is inlined */
+ static noinline_for_stack
+ int ath12k_qmi_event_load_bdf(struct ath12k_qmi *qmi)
+@@ -3803,10 +4184,18 @@
+ 		return ret;
+ 	}
+ 
++	ret = ath12k_qmi_tme_lite_info_send(ab);
++	if (ret < 0)
++		ath12k_warn(ab, "qmi tme-lite info send failed: %d\n", ret);
++
+ 	ret = ath12k_qmi_load_bdf_qmi(ab, ATH12K_QMI_BDF_TYPE_REGDB);
+ 	if (ret < 0) {
+ 		ath12k_warn(ab, "qmi failed to load regdb file:%d\n", ret);
+-		return ret;
++		/* WCN7860 has no upstream regdb in board-2.bin. Keep going
++		 * so the stock board.bin is still sent.
++		 */
++		if (ab->id.device != ATH12K_PCI_DEVICE_ID_WCN7860)
++			return ret;
+ 	}
+ 
+ 	ret = ath12k_qmi_load_bdf_qmi(ab, ATH12K_QMI_BDF_TYPE_ELF);
+@@ -3835,7 +4224,11 @@
+ 		}
+ 	}
+ 
+-	return ret;
++	ret = ath12k_qmi_qdss_cfg_send(ab);
++	if (ret < 0)
++		ath12k_warn(ab, "qmi qdss config send failed: %d\n", ret);
++
++	return 0;
+ }
+ 
+ static void ath12k_qmi_msg_mem_request_cb(struct qmi_handle *qmi_hdl,
+@@ -3907,6 +4300,18 @@
+ 	ath12k_qmi_driver_event_post(qmi, ATH12K_QMI_EVENT_FW_READY, NULL);
+ }
+ 
++static void ath12k_qmi_msg_cold_boot_cal_done_cb(struct qmi_handle *qmi_hdl,
++						 struct sockaddr_qrtr *sq,
++						 struct qmi_txn *txn,
++						 const void *decoded)
++{
++	struct ath12k_qmi *qmi = container_of(qmi_hdl, struct ath12k_qmi, handle);
++	struct ath12k_base *ab = qmi->ab;
++
++	ab->qmi.cal_done = 1;
++	ath12k_dbg(ab, ATH12K_DBG_QMI, "qmi cold boot calibration done\n");
++}
++
+ static const struct qmi_msg_handler ath12k_qmi_msg_handlers[] = {
+ 	{
+ 		.type = QMI_INDICATION,
+@@ -3928,6 +4333,13 @@
+ 		.ei = qmi_wlanfw_fw_ready_ind_msg_v01_ei,
+ 		.decoded_size = sizeof(struct qmi_wlanfw_fw_ready_ind_msg_v01),
+ 		.fn = ath12k_qmi_msg_fw_ready_cb,
++	},
++	{
++		.type = QMI_INDICATION,
++		.msg_id = QMI_WLFW_COLD_BOOT_CAL_DONE_IND_V01,
++		.ei = qmi_wlanfw_cold_boot_cal_done_ind_msg_v01_ei,
++		.decoded_size = sizeof(struct qmi_wlanfw_cold_boot_cal_done_ind_msg_v01),
++		.fn = ath12k_qmi_msg_cold_boot_cal_done_cb,
+ 	},
+ 
+ 	/* end of list */
+diff --git a/drivers/net/wireless/ath/ath12k/qmi.h b/drivers/net/wireless/ath/ath12k/qmi.h
+--- a/drivers/net/wireless/ath/ath12k/qmi.h
++++ b/drivers/net/wireless/ath/ath12k/qmi.h
+@@ -30,6 +30,7 @@
+ #define QMI_WLFW_REQUEST_MEM_IND_V01		0x0035
+ #define QMI_WLFW_FW_MEM_READY_IND_V01		0x0037
+ #define QMI_WLFW_FW_READY_IND_V01		0x0038
++#define QMI_WLFW_COLD_BOOT_CAL_DONE_IND_V01	0x003E
+ 
+ #define QMI_WLANFW_MAX_DATA_SIZE_V01		6144
+ 
+@@ -374,6 +375,10 @@
+ 	char placeholder;
+ };
+ 
++struct qmi_wlanfw_cold_boot_cal_done_ind_msg_v01 {
++	char placeholder;
++};
++
+ #define QMI_WLANFW_CAP_REQ_MSG_V01_MAX_LEN	0
+ #define QMI_WLANFW_CAP_REQ_V01			0x0024
+ 
+@@ -526,6 +531,51 @@
+ 	struct qmi_response_type_v01 resp;
+ };
+ 
++#define QMI_WLANFW_QDSS_TRACE_CONFIG_DOWNLOAD_REQ_V01		0x0044
++#define QMI_WLANFW_QDSS_TRACE_CONFIG_DOWNLOAD_REQ_MSG_V01_MAX_LEN 6167
++#define QMI_WLANFW_QDSS_TRACE_CONFIG_DOWNLOAD_RESP_MSG_V01_MAX_LEN 7
++struct qmi_wlanfw_qdss_trace_config_download_req_msg_v01 {
++	u8 total_size_valid;
++	u32 total_size;
++	u8 seg_id_valid;
++	u32 seg_id;
++	u8 data_valid;
++	u32 data_len;
++	u8 data[QMI_WLANFW_MAX_DATA_SIZE_V01];
++	u8 end_valid;
++	u8 end;
++};
++
++struct qmi_wlanfw_qdss_trace_config_download_resp_msg_v01 {
++	struct qmi_response_type_v01 resp;
++};
++
++/* WCN7860 (peach) needs this before board data. Stock cnss sends
++ * tmel_peach_20.elf here. Without it the secured PHY init faults and the
++ * later WLAN mode request times out.
++ */
++#define QMI_WLANFW_TME_LITE_INFO_REQ_MSG_V01_MAX_MSG_LEN	25
++#define QMI_WLANFW_TME_LITE_INFO_RESP_MSG_V01_MAX_MSG_LEN	7
++#define QMI_WLANFW_TME_LITE_INFO_REQ_V01		0x005B
++#define QMI_WLANFW_TME_LITE_INFO_RESP_V01		0x005B
++
++enum qmi_wlanfw_tme_lite_file_type_v01 {
++	WLANFW_TME_LITE_PATCH_FILE_V01 = 0,
++	WLANFW_TME_LITE_OEM_FUSE_FILE_V01 = 1,
++	WLANFW_TME_LITE_RPR_FILE_V01 = 2,
++	WLANFW_TME_LITE_DPR_FILE_V01 = 3,
++};
++
++struct qmi_wlanfw_tme_lite_info_req_msg_v01 {
++	enum qmi_wlanfw_tme_lite_file_type_v01 tme_file;
++	u64 addr;
++	u32 size;
++};
++
++struct qmi_wlanfw_tme_lite_info_resp_msg_v01 {
++	struct qmi_response_type_v01 resp;
++};
++
+ #define QMI_WLANFW_AUX_UC_INFO_REQ_MSG_V01_MAX_MSG_LEN	18
+ #define QMI_WLANFW_AUX_UC_INFO_REQ_V01	0x005A
+ 
+diff --git a/drivers/net/wireless/ath/ath12k/wifi7/dp_mon.c b/drivers/net/wireless/ath/ath12k/wifi7/dp_mon.c
+--- a/drivers/net/wireless/ath/ath12k/wifi7/dp_mon.c
++++ b/drivers/net/wireless/ath/ath12k/wifi7/dp_mon.c
+@@ -2675,8 +2675,6 @@
+ 		if (pmon->mon_last_linkdesc_paddr == paddr) {
+ 			pmon->rx_mon_stats.dup_mon_linkdesc_cnt++;
+ 			spin_unlock_bh(&pmon->mon_lock);
+-			kfree_skb_list(*head_msdu);
+-			*head_msdu = NULL;
+ 			return rx_bufs_used;
+ 		}
+ 
+@@ -2720,6 +2718,7 @@
+ 					   i, (unsigned long)rxcb->paddr,
+ 					   (unsigned long)msdu_list.paddr[i]);
+ 				drop_mpdu = true;
++				continue;
+ 			}
+ 			if (!rxcb->unmapped) {
+ 				dma_unmap_single(ar->ab->dev, rxcb->paddr,
+@@ -2802,7 +2801,7 @@
+ 	if (last)
+ 		last->next = NULL;
+ 
+-	*tail_msdu = last;
++	*tail_msdu = msdu;
+ 
+ 	if (msdu_cnt == 0)
+ 		*npackets = 1;
+@@ -2827,6 +2826,7 @@
+ 	struct ath12k_base *ab = ar->ab;
+ 	struct ath12k_dp *dp = ath12k_ab_to_dp(ab);
+ 	void *ring_entry, *mon_dst_srng;
++	struct dp_mon_mpdu *tmp_mpdu;
+ 	LIST_HEAD(rx_desc_used_list);
+ 	struct hal_srng *srng;
+ 
+@@ -2892,16 +2892,18 @@
+ 		}
+ 
+ 		if (head_msdu && tail_msdu) {
+-			struct dp_mon_mpdu tmp_mpdu = {
+-				.head = head_msdu,
+-				.tail = tail_msdu,
+-				.err_bitmap = pmon->err_bitmap,
+-				.decap_format = pmon->decap_format,
+-			};
+-
+-			ath12k_wifi7_dp_mon_rx_deliver(&ar->dp, &tmp_mpdu,
++			tmp_mpdu = kzalloc_obj(*tmp_mpdu, GFP_ATOMIC);
++			if (!tmp_mpdu)
++				break;
++
++			tmp_mpdu->head = head_msdu;
++			tmp_mpdu->tail = tail_msdu;
++			tmp_mpdu->err_bitmap = pmon->err_bitmap;
++			tmp_mpdu->decap_format = pmon->decap_format;
++			ath12k_wifi7_dp_mon_rx_deliver(&ar->dp, tmp_mpdu,
+ 						       &pmon->mon_ppdu_info, napi);
+ 			rx_mon_stats->dest_mpdu_done++;
++			kfree(tmp_mpdu);
+ 		}
+ 
+ 		ring_entry = ath12k_hal_srng_dst_get_next_entry(ar->ab,
+@@ -3209,23 +3211,18 @@
+ 		goto exit;
+ 
+ 	while ((skb = __skb_dequeue(&skb_list))) {
+-		if (!ppdu_info->ppdu_continuation)
+-			ath12k_wifi7_dp_mon_rx_memset_ppdu_info(ppdu_info);
++		memset(ppdu_info, 0, sizeof(*ppdu_info));
++		ppdu_info->peer_id = HAL_INVALID_PEERID;
+ 
+ 		hal_status = ath12k_wifi7_dp_mon_parse_rx_dest(&ar->dp, pmon, skb);
+ 
+-		if (hal_status == HAL_TLV_STATUS_PPDU_DONE) {
+-			ppdu_info->ppdu_continuation = false;
+-			if (ar->monitor_started &&
+-			    pmon->mon_ppdu_status == DP_PPDU_STATUS_START) {
+-				rx_mon_stats->status_ppdu_done++;
+-				pmon->mon_ppdu_status = DP_PPDU_STATUS_DONE;
+-				ath12k_wifi7_dp_rx_mon_dest_process(ar, mac_id,
+-								    *budget, napi);
+-				pmon->mon_ppdu_status = DP_PPDU_STATUS_START;
+-			}
+-		} else {
+-			ppdu_info->ppdu_continuation = true;
++		if (ar->monitor_started &&
++		    pmon->mon_ppdu_status == DP_PPDU_STATUS_START &&
++		    hal_status == HAL_TLV_STATUS_PPDU_DONE) {
++			rx_mon_stats->status_ppdu_done++;
++			pmon->mon_ppdu_status = DP_PPDU_STATUS_DONE;
++			ath12k_wifi7_dp_rx_mon_dest_process(ar, mac_id, *budget, napi);
++			pmon->mon_ppdu_status = DP_PPDU_STATUS_START;
+ 		}
+ 
+ 		dev_kfree_skb_any(skb);
+diff --git a/drivers/net/wireless/ath/ath12k/wifi7/dp_tx.c b/drivers/net/wireless/ath/ath12k/wifi7/dp_tx.c
+--- a/drivers/net/wireless/ath/ath12k/wifi7/dp_tx.c
++++ b/drivers/net/wireless/ath/ath12k/wifi7/dp_tx.c
+@@ -63,7 +63,7 @@
+ {
+ 	tcl_ext_cmd->info0 = le32_encode_bits(ti->paddr,
+ 					      HAL_TX_MSDU_EXT_INFO0_BUF_PTR_LO);
+-	tcl_ext_cmd->info1 = le32_encode_bits((u64)ti->paddr >> HAL_ADDR_MSB_REG_SHIFT,
++	tcl_ext_cmd->info1 = le32_encode_bits(0x0,
+ 					      HAL_TX_MSDU_EXT_INFO1_BUF_PTR_HI) |
+ 			       le32_encode_bits(ti->data_len,
+ 						HAL_TX_MSDU_EXT_INFO1_BUF_LEN);
+@@ -313,15 +313,10 @@
+ 			goto map;
+ 		}
+ 
+-		/*
+-		 * The payload may have been shifted or even the entire buffer may have
+-		 * been reallocated for alignment. In that case, hdr, eth and skb_cb
+-		 * are stale pointers. Refresh them now for later dereference.
++		/* hdr is pointing to a wrong place after alignment,
++		 * so refresh it for later use.
+ 		 */
+ 		hdr = (void *)skb->data;
+-		if (eth)
+-			eth = (struct ethhdr *)skb->data;
+-		skb_cb = ATH12K_SKB_CB(skb);
+ 	}
+ map:
+ 	ti.paddr = dma_map_single(dp->dev, skb->data, skb->len, DMA_TO_DEVICE);
+@@ -454,17 +449,15 @@
+ 	return 0;
+ 
+ fail_unmap_dma_ext:
+-	if (skb_cb->paddr_ext_desc) {
++	if (skb_cb->paddr_ext_desc)
+ 		dma_unmap_single(dp->dev, skb_cb->paddr_ext_desc,
+ 				 skb_ext_desc->len,
+ 				 DMA_TO_DEVICE);
+-		skb_cb->paddr_ext_desc = 0;
+-	}
+ fail_free_ext_skb:
+ 	kfree_skb(skb_ext_desc);
+ 
+ fail_unmap_dma:
+-	dma_unmap_single(dp->dev, skb_cb->paddr, skb->len, DMA_TO_DEVICE);
++	dma_unmap_single(dp->dev, ti.paddr, ti.data_len, DMA_TO_DEVICE);
+ 
+ fail_remove_tx_buf:
+ 	ath12k_dp_tx_release_txbuf(dp, tx_desc, pool_id);
+@@ -589,8 +582,7 @@
+ 
+ 	wbm_status = le32_get_bits(status_desc->info0,
+ 				   HTT_TX_WBM_COMP_INFO0_STATUS);
+-	if (likely(wbm_status < MAX_FW_TX_STATUS))
+-		dp->device_stats.fw_tx_status[wbm_status]++;
++	dp->device_stats.fw_tx_status[wbm_status]++;
+ 
+ 	switch (wbm_status) {
+ 	case HAL_WBM_REL_HTT_TX_COMP_STATUS_OK:
+@@ -930,14 +922,12 @@
+ 	u64 desc_va;
+ 	enum hal_wbm_rel_src_module buf_rel_source;
+ 	enum hal_wbm_tqm_rel_reason rel_status;
+-	u32 ring_size;
+ 
+ 	spin_lock_bh(&status_ring->lock);
+ 
+-	ring_size = ath12k_dp_tx_comp_ring_size(&ab->profile_param->dp_params);
+ 	ath12k_hal_srng_access_begin(ab, status_ring);
+ 
+-	while (ATH12K_TX_COMPL_NEXT(ring_size, tx_ring->tx_status_head) !=
++	while (ATH12K_TX_COMPL_NEXT(ab, tx_ring->tx_status_head) !=
+ 	       tx_ring->tx_status_tail) {
+ 		desc = ath12k_hal_srng_dst_get_next_entry(ab, status_ring);
+ 		if (!desc)
+@@ -946,11 +936,11 @@
+ 		memcpy(&tx_ring->tx_status[tx_ring->tx_status_head],
+ 		       desc, sizeof(*desc));
+ 		tx_ring->tx_status_head =
+-			ATH12K_TX_COMPL_NEXT(ring_size, tx_ring->tx_status_head);
++			ATH12K_TX_COMPL_NEXT(ab, tx_ring->tx_status_head);
+ 	}
+ 
+ 	if (ath12k_hal_srng_dst_peek(ab, status_ring) &&
+-	    (ATH12K_TX_COMPL_NEXT(ring_size, tx_ring->tx_status_head) ==
++	    (ATH12K_TX_COMPL_NEXT(ab, tx_ring->tx_status_head) ==
+ 	     tx_ring->tx_status_tail)) {
+ 		/* TODO: Process pending tx_status messages when kfifo_is_full() */
+ 		ath12k_warn(ab, "Unable to process some of the tx_status ring desc because status_fifo is full\n");
+@@ -960,13 +950,13 @@
+ 
+ 	spin_unlock_bh(&status_ring->lock);
+ 
+-	while (ATH12K_TX_COMPL_NEXT(ring_size, tx_ring->tx_status_tail) !=
++	while (ATH12K_TX_COMPL_NEXT(ab, tx_ring->tx_status_tail) !=
+ 	       tx_ring->tx_status_head) {
+ 		struct hal_wbm_completion_ring_tx *tx_status;
+ 		u32 desc_id;
+ 
+ 		tx_ring->tx_status_tail =
+-			ATH12K_TX_COMPL_NEXT(ring_size, tx_ring->tx_status_tail);
++			ATH12K_TX_COMPL_NEXT(ab, tx_ring->tx_status_tail);
+ 		tx_status = &tx_ring->tx_status[tx_ring->tx_status_tail];
+ 		ath12k_wifi7_dp_tx_status_parse(dp, tx_status, &ts);
+ 
+@@ -994,17 +984,11 @@
+ 		/* Find the HAL_WBM_RELEASE_INFO0_REL_SRC_MODULE value */
+ 		buf_rel_source = le32_get_bits(tx_status->info0,
+ 					       HAL_WBM_RELEASE_INFO0_REL_SRC_MODULE);
+-		if (likely(buf_rel_source < HAL_WBM_REL_SRC_MODULE_MAX))
+-			dp->device_stats.tx_wbm_rel_source[buf_rel_source]++;
+-		else
+-			WARN_ON_ONCE(1);
++		dp->device_stats.tx_wbm_rel_source[buf_rel_source]++;
+ 
+ 		rel_status = le32_get_bits(tx_status->info0,
+ 					   HAL_WBM_COMPL_TX_INFO0_TQM_RELEASE_REASON);
+-		if (likely(rel_status < MAX_TQM_RELEASE_REASON))
+-			dp->device_stats.tqm_rel_reason[rel_status]++;
+-		else
+-			WARN_ON_ONCE(1);
++		dp->device_stats.tqm_rel_reason[rel_status]++;
+ 
+ 		/* Release descriptor as soon as extracting necessary info
+ 		 * to reduce contention
+diff --git a/drivers/net/wireless/ath/ath12k/wifi7/hal.c b/drivers/net/wireless/ath/ath12k/wifi7/hal.c
+--- a/drivers/net/wireless/ath/ath12k/wifi7/hal.c
++++ b/drivers/net/wireless/ath/ath12k/wifi7/hal.c
+@@ -57,6 +57,14 @@
+ 		.hal_params = &ath12k_hw_hal_params_ipq5332,
+ 		.hw_regs = &ipq5424_regs,
+ 	},
++	/* WCN7860 (peach) has the QCC2072 UMAC: same regs and descriptors */
++	[ATH12K_HW_WCN7860_HW20] = {
++		.hal_ops = &hal_qcc2072_ops,
++		.hal_desc_sz = sizeof(struct hal_rx_desc_qcc2072),
++		.tcl_to_wbm_rbm_map = ath12k_hal_tcl_to_wbm_rbm_map_wcn7850,
++		.hal_params = &ath12k_hw_hal_params_wcn7850,
++		.hw_regs = &qcc2072_regs,
++	},
+ };
+ 
+ int ath12k_wifi7_hal_init(struct ath12k_base *ab)
+diff --git a/drivers/net/wireless/ath/ath12k/wifi7/hw.c b/drivers/net/wireless/ath/ath12k/wifi7/hw.c
+--- a/drivers/net/wireless/ath/ath12k/wifi7/hw.c
++++ b/drivers/net/wireless/ath/ath12k/wifi7/hw.c
+@@ -771,6 +771,104 @@
+ 
+ 		.qmi_cnss_feature_bitmap = BIT(CNSS_QDSS_CFG_MISS_V01) |
+ 					   BIT(CNSS_PCIE_PERST_NO_PULL_V01) |
++					   BIT(CNSS_AUX_UC_SUPPORT_V01),
++
++		.rfkill_pin = 0,
++		.rfkill_cfg = 0,
++		.rfkill_on_level = 0,
++
++		.rddm_size = 0x780000,
++
++		.def_num_link = 2,
++		.max_mlo_peer = 32,
++
++		.otp_board_id_register = 0,
++
++		.supports_sta_ps = true,
++
++		.acpi_guid = &wcn7850_uuid,
++		.supports_dynamic_smps_6ghz = false,
++
++		.iova_mask = 0,
++
++		.supports_aspm = true,
++
++		.ce_ie_addr = NULL,
++		.ce_remap = NULL,
++		.bdf_addr_offset = 0,
++
++		.current_cc_support = true,
++
++		.dp_primary_link_only = false,
++		.client = {
++			.max_client_single = 512,
++			.max_client_dbs = 128,
++			.max_client_dbs_sbs = 128,
++		},
++
++		.host_alloc_ml_id = false,
++	},	{
++		.name = "wcn7860 hw2.0",
++		.hw_rev = ATH12K_HW_WCN7860_HW20,
++
++		.fw = {
++			.dir = "WCN7860/hw2.0",
++			.board_size = 256 * 1024,
++			.cal_offset = 256 * 1024,
++			.m3_loader = ath12k_m3_fw_loader_driver,
++			.download_aux_ucode = true,
++		},
++
++		.max_radios = 1,
++		.single_pdev_only = true,
++		.qmi_service_ins_id = ATH12K_QMI_WLFW_SERVICE_INS_ID_V01_WCN7850,
++		.internal_sleep_clock = true,
++
++		.hw_ops = &qcc2072_ops,
++		.ring_mask = &ath12k_wifi7_hw_ring_mask_wcn7850,
++
++		.host_ce_config = ath12k_wifi7_host_ce_config_wcn7850,
++		.ce_count = 9,
++		.target_ce_config = ath12k_wifi7_target_ce_config_wlan_wcn7850,
++		.target_ce_count = 9,
++		.svc_to_ce_map =
++			ath12k_wifi7_target_service_to_ce_map_wlan_wcn7850,
++		.svc_to_ce_map_len = 14,
++
++		.rxdma1_enable = false,
++		.num_rxdma_per_pdev = 2,
++		.num_rxdma_dst_ring = 1,
++		.rx_mac_buf_ring = true,
++		.vdev_start_delay = true,
++
++		.interface_modes = BIT(NL80211_IFTYPE_STATION) |
++				   BIT(NL80211_IFTYPE_AP) |
++				   BIT(NL80211_IFTYPE_P2P_DEVICE) |
++				   BIT(NL80211_IFTYPE_P2P_CLIENT) |
++				   BIT(NL80211_IFTYPE_P2P_GO),
++		.supports_monitor = true,
++		.supports_cong_ctrl_max_msdus = false,
++
++		.idle_ps = true,
++		.download_calib = false,
++		.supports_suspend = true,
++		.tcl_ring_retry = false,
++		.reoq_lut_support = false,
++		.supports_shadow_regs = true,
++
++		.num_tcl_banks = 7,
++		.max_tx_ring = 3,
++
++		.mhi_config = &ath12k_wifi7_mhi_config_wcn7850,
++
++		.wmi_init = ath12k_wifi7_wmi_init_wcn7850,
++
++		/* Not QDSS_CFG_MISS: with it peach starts initializing at
++		 * once, rejects aux and qdss with err 90 (incompatible
++		 * state) and asserts in the aux MAC wakeup. Stock cnss2 sets
++		 * it only when the qdss file is missing. 0x50.
++		 */
++		.qmi_cnss_feature_bitmap = BIT(CNSS_PCIE_PERST_NO_PULL_V01) |
+ 					   BIT(CNSS_AUX_UC_SUPPORT_V01),
+ 
+ 		.rfkill_pin = 0,
+diff --git a/drivers/net/wireless/ath/ath12k/wifi7/pci.c b/drivers/net/wireless/ath/ath12k/wifi7/pci.c
+--- a/drivers/net/wireless/ath/ath12k/wifi7/pci.c
++++ b/drivers/net/wireless/ath/ath12k/wifi7/pci.c
+@@ -20,6 +20,7 @@
+ #define QCN9274_DEVICE_ID		0x1109
+ #define WCN7850_DEVICE_ID		0x1107
+ #define QCC2072_DEVICE_ID		0x1112
++#define WCN7860_DEVICE_ID		ATH12K_PCI_DEVICE_ID_WCN7860
+ 
+ #define ATH12K_PCI_W7_SOC_HW_VERSION_1	1
+ #define ATH12K_PCI_W7_SOC_HW_VERSION_2	2
+@@ -35,6 +36,7 @@
+ 	{ PCI_VDEVICE(QCOM, QCN9274_DEVICE_ID) },
+ 	{ PCI_VDEVICE(QCOM, WCN7850_DEVICE_ID) },
+ 	{ PCI_VDEVICE(QCOM, QCC2072_DEVICE_ID) },
++	{ PCI_VDEVICE(QCOM, WCN7860_DEVICE_ID) },
+ 	{}
+ };
+ 
+@@ -165,6 +167,19 @@
+ 		/* there is only one version till now */
+ 		ab->hw_rev = ATH12K_HW_QCC2072_HW10;
+ 		break;
++	case WCN7860_DEVICE_ID:
++		/*
++		 * WCN7860 (peach) reports SOC hw version 2 like WCN7850, but
++		 * its UMAC, window register and RX descriptors are QCC2072's.
++		 */
++		ab->id.bdf_search = ATH12K_BDF_SEARCH_BUS_AND_BOARD;
++		ab_pci->msi_config = &ath12k_wifi7_msi_config[0];
++		ab->static_window_map = false;
++		ab_pci->pci_ops = &ath12k_wifi7_pci_ops_wcn7850;
++		ab_pci->window_reg_addr = WINDOW_REG_ADDRESS_QCC2072;
++		ab->target_mem_mode = ATH12K_QMI_MEMORY_MODE_DEFAULT;
++		ab->hw_rev = ATH12K_HW_WCN7860_HW20;
++		break;
+ 	default:
+ 		dev_err(&pdev->dev, "Unknown Wi-Fi 7 PCI device found: 0x%x\n",
+ 			pci_dev->device);
+diff --git a/drivers/net/wireless/ath/ath12k/wmi.c b/drivers/net/wireless/ath/ath12k/wmi.c
+--- a/drivers/net/wireless/ath/ath12k/wmi.c
++++ b/drivers/net/wireless/ath/ath12k/wmi.c
+@@ -5050,7 +5050,6 @@
+ 					u16 tag, u16 len,
+ 					const void *ptr, void *data)
+ {
+-	struct ath12k_svc_ext_info *svc_ext_info = &ab->wmi_ab.svc_ext_info;
+ 	struct ath12k_wmi_pdev *wmi_handle = &ab->wmi_ab.wmi[0];
+ 	struct ath12k_wmi_svc_rdy_ext_parse *svc_rdy_ext = data;
+ 	int ret;
+@@ -5093,22 +5092,6 @@
+ 			if (ret) {
+ 				ath12k_warn(ab, "failed to parse tlv %d\n", ret);
+ 				return ret;
+-			}
+-
+-			if (svc_rdy_ext->tot_phy_id >
+-			    ARRAY_SIZE(svc_ext_info->mac_phy_info)) {
+-				ath12k_warn(ab, "too many PHY entries %u (max %zu)\n",
+-					    svc_rdy_ext->tot_phy_id,
+-					    ARRAY_SIZE(svc_ext_info->mac_phy_info));
+-				return -EINVAL;
+-			}
+-
+-			if (svc_rdy_ext->n_mac_phy_caps < svc_rdy_ext->tot_phy_id) {
+-				ath12k_warn(ab,
+-					    "not enough MAC/PHY caps %u, expected %u\n",
+-					    svc_rdy_ext->n_mac_phy_caps,
+-					    svc_rdy_ext->tot_phy_id);
+-				return -EINVAL;
+ 			}
+ 
+ 			ath12k_wmi_save_all_mac_phy_info(ab, svc_rdy_ext);
+@@ -6992,14 +6975,6 @@
+ 		goto mem_free;
+ 	}
+ 
+-	/*
+-	 * Set the valid pdev_idx before validating so that, even when the
+-	 * event is dropped or falls back, the completion the caller in
+-	 * ath12k_mac_hw_register() may be waiting on is still signalled at
+-	 * the end and it does not time out.
+-	 */
+-	pdev_idx = reg_info->phy_id;
+-
+ 	ret = ath12k_reg_validate_reg_info(ab, reg_info);
+ 	if (ret == ATH12K_REG_STATUS_FALLBACK) {
+ 		ath12k_warn(ab, "failed to validate reg info %d\n", ret);
+@@ -7012,10 +6987,13 @@
+ 		 * not going to create new regd for it
+ 		 */
+ 		ret = ATH12K_REG_STATUS_VALID;
++		if (reg_info->phy_id < ab->num_radios)
++			pdev_idx = reg_info->phy_id;
+ 		goto mem_free;
+ 	}
+ 
+ 	/* free old reg_info if it exist */
++	pdev_idx = reg_info->phy_id;
+ 	if (ab->reg_info[pdev_idx]) {
+ 		ath12k_reg_reset_reg_info(ab->reg_info[pdev_idx]);
+ 		kfree(ab->reg_info[pdev_idx]);
+@@ -7054,7 +7032,7 @@
+ 
+ out:
+ 	/* In some error cases, even a valid pdev_idx might not be available */
+-	if (pdev_idx < ab->num_radios)
++	if (pdev_idx != 255)
+ 		ar = ab->pdevs[pdev_idx].ar;
+ 
+ 	/* During the boot-time update, 'ar' might not be allocated,
