@@ -10,9 +10,9 @@ All features listed below as working have been verified on real Realme GT7 Pro h
 
 | Subsystem | Component | Status | Notes |
 | --- | --- | --- | --- |
-| **SoC / CPU** | Snapdragon 8 Elite (8x Oryon, SM8750) | Working | All 8 cores online, 14.2 GiB usable RAM |
+| **SoC / CPU** | Snapdragon 8 Elite (8x Oryon, SM8750) | Working | All 8 cores online, 14.2 GiB usable RAM, SCMI DVFS (`scmi-cpufreq` 3.53 GHz / 4.09+ GHz), `qcom-tsens` thermal |
 | **Display (Native KMS)** | DPU 12.0 + DSI0 + Samsung Eco² OLED Plus `AB849_P_1_A0022` | Working | **1264×2780 @ 120Hz**, DSC 1.2 (10bpc→8bpp, 2 slices/pkt), zero-copy with Adreno 830, native MIPI DCS backlight; BOE `AB849_P_3` selectable via `panel_realme_ab849.boe_p3=1` |
-| **GPU** | Adreno 830 (`0x44050000`, `msm`) | Working | GMU v5.1.25 + Mesa 26 Freedreno/Turnip (requires user's own device-signed `gen80000_zap.mbn`) |
+| **GPU** | Adreno 830 (`0x44050000`, `msm`) | Working | GMU v5.1.25 + Mesa 26 Freedreno/Turnip, devfreq up to 1100 MHz (`simple_ondemand` / `performance`), thermal cooling (requires user's own device-signed `gen80000_zap.mbn`) |
 | **Touchscreen** | Synaptics S3910 (`syna_tcm2` on SPI4) | Working | Multi-touch verified in Weston & KDE Plasma 6 |
 | **Wi-Fi 7** | Qualcomm FastConnect 7900 / WCN7860 (`peach`, PCI `17cb:110e`) | Working | `ath12k_wifi7`, runtime read-only firmware staging from device `modem_a` |
 | **USB** | M31 eUSB2 + DWC3 Gadget (CDC NCM / ECM / RNDIS) | Working | `usb0` (`172.16.42.1/24`) SSH & DHCP |
