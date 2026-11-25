@@ -20,3 +20,7 @@ firmware/
 *.elf
 *.fw
 *.mdt
+
+# Python bytecode
+__pycache__/
+*.pyc

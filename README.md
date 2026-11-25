@@ -44,9 +44,12 @@ All features listed below as working have been verified on real Realme GT7 Pro h
 │   ├── pista-wifi.sh                                          # Read-only WCN7860 firmware stager from phone modem_a
 │   ├── pista-iscsi.conf.example                               # Template for Wi-Fi / iSCSI settings
 │   └── pack_esp_fat16.py                                      # Builds 100 MiB UFS-4K-native FAT16 ESP for recovery_b
-└── scripts/
-    ├── apply_patches.sh                                       # Applies patches/0001..0005 to Linux 7.3.6
-    └── build_kernel.sh                                        # Builds ARM64 Image.efi, pista.dtb, and modules
+├── scripts/
+│   ├── apply_patches.sh                                       # Applies patches/0001..0005 to Linux 7.3.6
+│   └── build_kernel.sh                                        # Builds ARM64 Image.efi, pista.dtb, and modules
+└── tools/
+    ├── pista-kvm-recv.py                                      # Phone uinput USB gaming keyboard/mouse receiver
+    └── pista-kvm-send.py                                      # Host evdev -> TCP sender (ScrollLock / RCtrl+RAlt)
 ```
 
 ---
