@@ -9,6 +9,7 @@
 #include <dt-bindings/gpio/gpio.h>
 #include <dt-bindings/input/linux-event-codes.h>
 #include <dt-bindings/regulator/qcom,rpmh-regulator.h>
+#include <dt-bindings/thermal/thermal.h>
 #include "sm8750.dtsi"
 #include "pm8550.dtsi"
 #define PMK8550VE_SID 8
@@ -704,4 +705,284 @@
 	phy-names = "usb2-phy";
 	/delete-property/ usb-role-switch;
 	status = "okay";
+};
+
+/*
+ * Upstream sm8750.dtsi currently defines only hot (120C) and critical (125C)
+ * trips without passive cooling-maps. Add 95C passive throttling for Adreno 830
+ * (gpuss0..7) and Oryon CPU clusters so sustained workloads smoothly throttle
+ * instead of hitting the 125C emergency thermal shutdown.
+ */
+&{/thermal-zones} {
+	gpuss0-thermal {
+		polling-delay-passive = <10>;
+		trips {
+			gpuss0_alert0: gpuss0-alert0 {
+				temperature = <95000>;
+				hysteresis = <2000>;
+				type = "passive";
+			};
+		};
+		cooling-maps {
+			map0 {
+				trip = <&gpuss0_alert0>;
+				cooling-device = <&gpu THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+			};
+		};
+	};
+
+	gpuss1-thermal {
+		polling-delay-passive = <10>;
+		trips {
+			gpuss1_alert0: gpuss1-alert0 {
+				temperature = <95000>;
+				hysteresis = <2000>;
+				type = "passive";
+			};
+		};
+		cooling-maps {
+			map0 {
+				trip = <&gpuss1_alert0>;
+				cooling-device = <&gpu THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+			};
+		};
+	};
+
+	gpuss2-thermal {
+		polling-delay-passive = <10>;
+		trips {
+			gpuss2_alert0: gpuss2-alert0 {
+				temperature = <95000>;
+				hysteresis = <2000>;
+				type = "passive";
+			};
+		};
+		cooling-maps {
+			map0 {
+				trip = <&gpuss2_alert0>;
+				cooling-device = <&gpu THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+			};
+		};
+	};
+
+	gpuss3-thermal {
+		polling-delay-passive = <10>;
+		trips {
+			gpuss3_alert0: gpuss3-alert0 {
+				temperature = <95000>;
+				hysteresis = <2000>;
+				type = "passive";
+			};
+		};
+		cooling-maps {
+			map0 {
+				trip = <&gpuss3_alert0>;
+				cooling-device = <&gpu THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+			};
+		};
+	};
+
+	gpuss4-thermal {
+		polling-delay-passive = <10>;
+		trips {
+			gpuss4_alert0: gpuss4-alert0 {
+				temperature = <95000>;
+				hysteresis = <2000>;
+				type = "passive";
+			};
+		};
+		cooling-maps {
+			map0 {
+				trip = <&gpuss4_alert0>;
+				cooling-device = <&gpu THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+			};
+		};
+	};
+
+	gpuss5-thermal {
+		polling-delay-passive = <10>;
+		trips {
+			gpuss5_alert0: gpuss5-alert0 {
+				temperature = <95000>;
+				hysteresis = <2000>;
+				type = "passive";
+			};
+		};
+		cooling-maps {
+			map0 {
+				trip = <&gpuss5_alert0>;
+				cooling-device = <&gpu THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+			};
+		};
+	};
+
+	gpuss6-thermal {
+		polling-delay-passive = <10>;
+		trips {
+			gpuss6_alert0: gpuss6-alert0 {
+				temperature = <95000>;
+				hysteresis = <2000>;
+				type = "passive";
+			};
+		};
+		cooling-maps {
+			map0 {
+				trip = <&gpuss6_alert0>;
+				cooling-device = <&gpu THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+			};
+		};
+	};
+
+	gpuss7-thermal {
+		polling-delay-passive = <10>;
+		trips {
+			gpuss7_alert0: gpuss7-alert0 {
+				temperature = <95000>;
+				hysteresis = <2000>;
+				type = "passive";
+			};
+		};
+		cooling-maps {
+			map0 {
+				trip = <&gpuss7_alert0>;
+				cooling-device = <&gpu THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+			};
+		};
+	};
+
+	cpu-0-0-0-thermal {
+		polling-delay-passive = <100>;
+		trips {
+			cpu0_0_alert0: cpu-0-0-0-alert0 {
+				temperature = <95000>;
+				hysteresis = <2000>;
+				type = "passive";
+			};
+		};
+		cooling-maps {
+			map0 {
+				trip = <&cpu0_0_alert0>;
+				cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+			};
+		};
+	};
+
+	cpu-0-1-0-thermal {
+		polling-delay-passive = <100>;
+		trips {
+			cpu0_1_alert0: cpu-0-1-0-alert0 {
+				temperature = <95000>;
+				hysteresis = <2000>;
+				type = "passive";
+			};
+		};
+		cooling-maps {
+			map0 {
+				trip = <&cpu0_1_alert0>;
+				cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+			};
+		};
+	};
+
+	cpu-0-2-0-thermal {
+		polling-delay-passive = <100>;
+		trips {
+			cpu0_2_alert0: cpu-0-2-0-alert0 {
+				temperature = <95000>;
+				hysteresis = <2000>;
+				type = "passive";
+			};
+		};
+		cooling-maps {
+			map0 {
+				trip = <&cpu0_2_alert0>;
+				cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+			};
+		};
+	};
+
+	cpu-0-3-0-thermal {
+		polling-delay-passive = <100>;
+		trips {
+			cpu0_3_alert0: cpu-0-3-0-alert0 {
+				temperature = <95000>;
+				hysteresis = <2000>;
+				type = "passive";
+			};
+		};
+		cooling-maps {
+			map0 {
+				trip = <&cpu0_3_alert0>;
+				cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+			};
+		};
+	};
+
+	cpu-0-4-0-thermal {
+		polling-delay-passive = <100>;
+		trips {
+			cpu0_4_alert0: cpu-0-4-0-alert0 {
+				temperature = <95000>;
+				hysteresis = <2000>;
+				type = "passive";
+			};
+		};
+		cooling-maps {
+			map0 {
+				trip = <&cpu0_4_alert0>;
+				cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+			};
+		};
+	};
+
+	cpu-0-5-0-thermal {
+		polling-delay-passive = <100>;
+		trips {
+			cpu0_5_alert0: cpu-0-5-0-alert0 {
+				temperature = <95000>;
+				hysteresis = <2000>;
+				type = "passive";
+			};
+		};
+		cooling-maps {
+			map0 {
+				trip = <&cpu0_5_alert0>;
+				cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+			};
+		};
+	};
+
+	cpu-1-0-0-thermal {
+		polling-delay-passive = <100>;
+		trips {
+			cpu1_0_alert0: cpu-1-0-0-alert0 {
+				temperature = <95000>;
+				hysteresis = <2000>;
+				type = "passive";
+			};
+		};
+		cooling-maps {
+			map0 {
+				trip = <&cpu1_0_alert0>;
+				cooling-device = <&cpu6 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+			};
+		};
+	};
+
+	cpu-1-1-0-thermal {
+		polling-delay-passive = <100>;
+		trips {
+			cpu1_1_alert0: cpu-1-1-0-alert0 {
+				temperature = <95000>;
+				hysteresis = <2000>;
+				type = "passive";
+			};
+		};
+		cooling-maps {
+			map0 {
+				trip = <&cpu1_1_alert0>;
+				cooling-device = <&cpu6 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+			};
+		};
+	};
 };

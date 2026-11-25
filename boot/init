@@ -90,6 +90,7 @@ if [ "$RESCUE" -eq 0 ] && [ -f /etc/pista-iscsi.conf ]; then
 
     if [ -d /sys/class/net/wlan0 ]; then
         ip link set wlan0 up 2>/dev/null || true
+        # Connect Wi-Fi (auto-roam to strongest 5 GHz BSSID for the same SSID before DHCP/iSCSI)
         cat > /run/pista-wpa.conf << EOF
 ctrl_interface=/run/wpa_supplicant
 network={
@@ -102,7 +103,49 @@ EOF
         # Use '@' argv[0] prefix (systemd Root Storage Daemon convention) so
         # systemd-shutdown never SIGTERM/SIGKILLs wpa_supplicant before '/' remounts RO!
         ln -sf /sbin/wpa_supplicant /sbin/@wpa_supplicant
-        @wpa_supplicant -B -i wlan0 -c /run/pista-wpa.conf -P /run/pista-wpa.pid >/run/wpa.log 2>&1
+        @wpa_supplicant -B -i wlan0 -c /run/pista-wpa.conf -P /run/pista-wpa.pid >/run/wpa.log 2>&1 || log "Wi-Fi  : wpa_supplicant err: $(cat /run/wpa.log)"
+
+        # Wait up to 20s for initial association to complete BEFORE running DHCP
+        WPA_OK=0
+        for i in $(seq 1 40); do
+            if wpa_cli -p /run/wpa_supplicant status 2>/dev/null | grep -q '^wpa_state=COMPLETED$'; then
+                WPA_OK=1
+                break
+            fi
+            sleep 0.5
+        done
+
+        # If initial association landed on 2.4 GHz, scan and roam to strongest 5 GHz BSSID of the same SSID
+        if [ "$WPA_OK" -eq 1 ]; then
+            CUR_FREQ=$(wpa_cli -p /run/wpa_supplicant status 2>/dev/null | awk -F= '/^freq=/{print $2}')
+            if [ -n "$CUR_FREQ" ] && [ "$CUR_FREQ" -lt 5000 ] 2>/dev/null; then
+                log "Wi-Fi  : associated on ${CUR_FREQ} MHz, scanning for 5 GHz ..."
+                wpa_cli -p /run/wpa_supplicant scan >/dev/null 2>&1 || true
+                BSSID_5G=""
+                for i in $(seq 1 10); do
+                    BSSID_5G=$(wpa_cli -p /run/wpa_supplicant scan_results 2>/dev/null | awk -v s="$WIFI_SSID" 'BEGIN{FS="\t"} $2+0 >= 5000 && $5 == s {print $3, $1}' | sort -nr | head -n 1 | awk '{print $2}')
+                    [ -n "$BSSID_5G" ] && break
+                    sleep 1
+                done
+                if [ -n "$BSSID_5G" ]; then
+                    log "Wi-Fi  : roaming from ${CUR_FREQ} MHz to 5 GHz BSSID $BSSID_5G ..."
+                    wpa_cli -p /run/wpa_supplicant roam "$BSSID_5G" >/dev/null 2>&1 || true
+                    for i in $(seq 1 16); do
+                        RFREQ=$(wpa_cli -p /run/wpa_supplicant status 2>/dev/null | awk -F= '/^freq=/{print $2}')
+                        RSTATE=$(wpa_cli -p /run/wpa_supplicant status 2>/dev/null | awk -F= '/^wpa_state=/{print $2}')
+                        if [ "$RSTATE" = "COMPLETED" ] && [ -n "$RFREQ" ] && [ "$RFREQ" -ge 5000 ] 2>/dev/null; then
+                            log "Wi-Fi  : locked onto 5 GHz (${RFREQ} MHz, $BSSID_5G)"
+                            break
+                        fi
+                        sleep 0.5
+                    done
+                else
+                    log "Wi-Fi  : no 5 GHz BSSID found for $WIFI_SSID, staying on ${CUR_FREQ} MHz"
+                fi
+            else
+                log "Wi-Fi  : associated on ${CUR_FREQ} MHz"
+            fi
+        fi
 
         # Wait up to 12s for DHCP lease on wlan0
         udhcpc -i wlan0 -s /usr/share/udhcpc/default.script -q -n -t 12 -T 1 >/tmp/udhcpc.log 2>&1
@@ -186,6 +229,10 @@ NMEOF
                         ln -sf /dev/null /mnt/root/etc/systemd/system/wpa_supplicant.service
                         ln -sf /dev/null /mnt/root/etc/systemd/system/ModemManager.service
                         ln -sf /dev/null /mnt/root/etc/systemd/system/NetworkManager-wait-online.service
+
+                        # Disable Wi-Fi power save for low-latency high-throughput iSCSI
+                        mkdir -p /mnt/root/etc/udev/rules.d
+                        echo 'ACTION=="add|change", SUBSYSTEM=="net", KERNEL=="wlan0", RUN+="/usr/sbin/iw dev wlan0 set power_save off"' > /mnt/root/etc/udev/rules.d/99-pista-wifi-ps.rules
 
                         # Keep essential virtual filesystems across switch_root
                         umount /sys/kernel/debug 2>/dev/null || true
