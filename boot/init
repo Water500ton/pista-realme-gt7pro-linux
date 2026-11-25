@@ -208,7 +208,18 @@ EOF
                         # Switch Debian GPU config to unified native msm (DPU1+DSI0+Adreno 830)
                         mkdir -p /mnt/root/etc/modprobe.d /mnt/root/etc/modules-load.d
                         echo "# Unified native msm KMS (DPU1+DSI0) + Adreno 830" > /mnt/root/etc/modprobe.d/pista-gpu.conf
-                        printf "panel-realme-ab849\nmsm\n" > /mnt/root/etc/modules-load.d/pista.conf
+                        printf "panel-realme-ab849\nmsm\nqcom_pd_mapper\nqrtr_smd\nqcom_q6v5_pas\nsnd-soc-tfa9874\nsnd-soc-sc8280xp\n" > /mnt/root/etc/modules-load.d/pista.conf
+                        if [ -d /usr/share/pista-audio ]; then
+                            mkdir -p /mnt/root/lib/firmware/qcom/sm8750 \
+                                     /mnt/root/usr/share/alsa/ucm2/Qualcomm/sm8750/pista \
+                                     /mnt/root/usr/share/alsa/ucm2/conf.d/sm8750
+                            cp -f /usr/share/pista-audio/Realme-pista-tplg.bin /mnt/root/lib/firmware/qcom/sm8750/ 2>/dev/null || true
+                            cp -f /usr/share/pista-audio/Realme-pista-sd0-tplg.bin /mnt/root/lib/firmware/qcom/sm8750/ 2>/dev/null || true
+                            cp -f /usr/share/pista-audio/Realme-pista.conf /mnt/root/usr/share/alsa/ucm2/Qualcomm/sm8750/pista/ 2>/dev/null || true
+                            cp -f /usr/share/pista-audio/HiFi.conf /mnt/root/usr/share/alsa/ucm2/Qualcomm/sm8750/pista/ 2>/dev/null || true
+                            ln -sf ../../Qualcomm/sm8750/pista/Realme-pista.conf /mnt/root/usr/share/alsa/ucm2/conf.d/sm8750/Realme-pista.conf
+                            ln -sf ../../Qualcomm/sm8750/pista/Realme-pista.conf /mnt/root/usr/share/alsa/ucm2/conf.d/sm8750/Realme-GT7Pro-pista-RE6018L1.conf
+                        fi
                         # Remove hardcoded KWIN_DRM_DEVICES so KWin auto-picks unified msm (card0 or card1)
                         sed -i '/^KWIN_DRM_DEVICES=/d' /mnt/root/etc/environment 2>/dev/null || true
                         sed -i '/^GreeterEnvironment=KWIN_DRM_DEVICES=/d' /mnt/root/etc/sddm.conf.d/10-pista.conf 2>/dev/null || true

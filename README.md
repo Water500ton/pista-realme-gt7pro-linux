@@ -18,7 +18,8 @@ All features listed below as working have been verified on real Realme GT7 Pro h
 | **USB** | M31 eUSB2 + DWC3 Gadget (CDC NCM / ECM / RNDIS) | Working | `usb0` (`172.16.42.1/24`) SSH & DHCP |
 | **Storage** | UFS (`ufshcd-qcom`) + iSCSI (`iscsi_tcp`) | Working | Read-only stock partition access + remote iSCSI rootfs |
 | **Keys / RTC** | PM8550 power/volume keys, PM8xxx RTC | Working | |
-| **Audio / Modem / Camera / Battery** | LPASS, WWAN, CamSS, PMIC fuel gauge | WIP | Not yet enabled |
+| **Audio (Speakers)** | ADSP AudioReach (`q6apm`) + Secondary MI2S (`SD1`) + Dual NXP `TFA9873` (`0x34`/`0x35`) | Working | Stereo speakers verified via ALSA & PipeWire / KDE Plasma 6 (`Built-in Audio Stereo Speakers`), using in-kernel `qcom_pd_mapper`, `Realme-pista.m4` topology, UCM2, and user's own device-signed `adsp.mbn`/`adsp_dtb.mbn` |
+| **Modem / Camera / Battery** | WWAN, CamSS, PMIC fuel gauge | WIP | Not yet enabled |
 
 ---
 
@@ -32,12 +33,18 @@ All features listed below as working have been verified on real Realme GT7 Pro h
 ├── drivers/
 │   ├── gpu/drm/panel/panel-realme-ab849.c                     # AB849 1264x2780 120Hz DSC OLED panel driver
 │   └── input/touchscreen/syna_tcm2{,.h,_spi.c}                # Synaptics S3910 TCM2 SPI touchscreen driver
+├── sound/
+│   └── soc/codecs/tfa9874.c                                   # Dual NXP TFA9873/TFA9874 Class-D speaker amp driver
+├── audio/
+│   ├── topology/Realme-pista.m4                               # AudioReach Secondary MI2S (SD1) topology source
+│   └── ucm2/Qualcomm/sm8750/pista/{Realme-pista,HiFi}.conf    # ALSA UCM2 profile for PipeWire / KDE Plasma 6
 ├── patches/                                                   # Clean patch series against upstream Linux 7.3.6
 │   ├── 0001-arm64-dts-qcom-sm8750-add-realme-pista-and-adreno830.patch
 │   ├── 0002-drm-msm-sm8750-adreno830-dsc-and-qtb500-fixes.patch
 │   ├── 0003-drm-panel-add-realme-ab849-dsc-oled-panel-driver.patch
 │   ├── 0004-input-touchscreen-add-synaptics-tcm2-s3910-spi-driver.patch
-│   └── 0005-wifi-ath12k-pwrseq-add-wcn7860-peach-support.patch
+│   ├── 0005-wifi-ath12k-pwrseq-add-wcn7860-peach-support.patch
+│   └── 0006-asoc-codecs-add-nxp-tfa9873-tfa9874-speaker-amp-driver.patch
 ├── boot/
 │   ├── cmdline.txt                                            # UEFI boot kernel command line
 │   ├── init                                                   # Initramfs init (USB NCM + Wi-Fi 7 + iSCSI switch_root)
@@ -89,6 +96,10 @@ This repository intentionally contains **no proprietary firmware blobs**. You mu
 - **Adreno 830 GPU**:
   - `qcom/gen80000_sqe.fw`, `qcom/gen80000_gmu.bin`, `qcom/gen80000_aqe.fw` from upstream `linux-firmware`.
   - Device-signed `qcom/gen80000_zap.mbn` extracted read-only from your own GT7 Pro `vendor_a` image (`/vendor/firmware_mnt` or `super` -> `vendor_a` EROFS).
+- **ADSP AudioReach & Stereo Speakers**:
+  - Device-signed `qcom/sm8750/realme/pista/adsp.mbn` and `adsp_dtb.mbn` squashed from `adsp.mdt/.b*` and `adsp_dtb.mdt/.b*` inside your own GT7 Pro `modem_a` partition.
+  - Compile `audio/topology/Realme-pista.m4` against `linux-msm/audioreach-topology` with `m4` + `alsatplg` (or `libatopology`) to `/lib/firmware/qcom/sm8750/Realme-pista-tplg.bin`.
+  - Install `audio/ucm2/Qualcomm/sm8750/pista/{Realme-pista,HiFi}.conf` under `/usr/share/alsa/ucm2/Qualcomm/sm8750/pista/` and symlink `/usr/share/alsa/ucm2/conf.d/sm8750/Realme-GT7Pro-pista-RE6018L1.conf`.
 
 ### 3. VAB-Safe Booting (Important Safety Notice)
 The Realme GT7 Pro uses Android 15 Virtual A/B (VAB):

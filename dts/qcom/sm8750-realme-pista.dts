@@ -27,6 +27,30 @@
 		/* cmdline and EFI GOP framebuffer come from UEFI */
 	};
 
+	sound {
+		compatible = "qcom,sm8750-sndcard";
+		model = "Realme-pista";
+
+		pinctrl-0 = <&i2s1_active>;
+		pinctrl-names = "default";
+
+		speaker-dai-link {
+			link-name = "Speaker Playback";
+
+			cpu {
+				sound-dai = <&q6apmbedai SECONDARY_MI2S_RX>;
+			};
+
+			codec {
+				sound-dai = <&speaker_left>, <&speaker_right>;
+			};
+
+			platform {
+				sound-dai = <&q6apm>;
+			};
+		};
+	};
+
 	reserved-memory {
 		display_reserved: framebuffer@fc800000 {
 			reg = <0x0 0xfc800000 0x0 0x2b00000>;
@@ -499,6 +523,37 @@
 		drive-strength = <2>;
 		bias-pull-down;
 	};
+
+	/* Secondary MI2S to dual NXP TFA9874 speaker amplifiers */
+	i2s1_active: i2s1-active-state {
+		sck-pins {
+			pins = "gpio121";
+			function = "i2s1_sck";
+			drive-strength = <4>;
+			bias-disable;
+		};
+
+		data0-pins {
+			pins = "gpio122";
+			function = "i2s1_data0";
+			drive-strength = <4>;
+			bias-disable;
+		};
+
+		ws-pins {
+			pins = "gpio123";
+			function = "i2s1_ws";
+			drive-strength = <4>;
+			bias-disable;
+		};
+
+		data1-pins {
+			pins = "gpio124";
+			function = "i2s1_data1";
+			drive-strength = <4>;
+			bias-disable;
+		};
+	};
 };
 
 &pon_pwrkey {
@@ -592,16 +647,44 @@
 	status = "disabled";
 };
 
-&lpass_ag_noc {
-	status = "disabled";
+/* GT7 Pro stock ADSP image spans 80.5 MiB (0x5080000), larger than upstream 0x3a80000 */
+&adspslpi_mem {
+	reg = <0x0 0x9ee00000 0x0 0x5080000>;
 };
 
-&lpass_lpiaon_noc {
-	status = "disabled";
+&remoteproc_adsp {
+	firmware-name = "qcom/sm8750/realme/pista/adsp.mbn",
+			"qcom/sm8750/realme/pista/adsp_dtb.mbn";
+	status = "okay";
 };
 
-&lpass_lpicx_noc {
-	status = "disabled";
+&i2c_master_hub_0 {
+	status = "okay";
+};
+
+&i2c_hub_4 {
+	clock-frequency = <400000>;
+	status = "okay";
+
+	speaker_left: audio-codec@34 {
+		compatible = "nxp,tfa9873";
+		reg = <0x34>;
+		vdd-supply = <&vreg_l15b_1p8>;
+		reset-gpios = <&tlmm 2 GPIO_ACTIVE_HIGH>;
+		nxp,tdm-slot = <0>;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Left";
+	};
+
+	speaker_right: audio-codec@35 {
+		compatible = "nxp,tfa9873";
+		reg = <0x35>;
+		vdd-supply = <&vreg_l15b_1p8>;
+		reset-gpios = <&tlmm 164 GPIO_ACTIVE_HIGH>;
+		nxp,tdm-slot = <1>;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Right";
+	};
 };
 
 &pcie0 {

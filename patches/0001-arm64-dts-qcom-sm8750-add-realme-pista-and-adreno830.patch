@@ -1,22 +1,13 @@
-Subject: [PATCH 1/5] arm64: dts: qcom: sm8750: add Realme GT7 Pro (pista) and Adreno 830
+Subject: [PATCH 1/6] arm64: dts: qcom: sm8750: add Realme GT7 Pro (pista), Adreno 830, and audio
 
 Add Adreno 830 GPU/GMU/GXCLKCTL nodes to sm8750.dtsi and add the full
 Realme GT7 Pro (pista, RMX5010) device tree with USB 2.0 gadget, WCN7860
 Wi-Fi 7, Synaptics S3910 SPI touchscreen, Adreno 830 GPU, native
-DPU 12.0 + DSI0 + AB849 120Hz DSC OLED display, and 95C passive
-thermal cooling-maps for GPU and CPU clusters.
+DPU 12.0 + DSI0 + AB849 120Hz DSC OLED display, 95C passive thermal
+cooling-maps, ADSP AudioReach (80.5 MiB adspslpi_mem), and dual NXP
+TFA9873 stereo speaker amplifiers on i2c_hub_4 / Secondary MI2S.
 ---
 diff --git a/arch/arm64/boot/dts/qcom/Makefile b/arch/arm64/boot/dts/qcom/Makefile
---- a/arch/arm64/boot/dts/qcom/Makefile
-+++ b/arch/arm64/boot/dts/qcom/Makefile
-@@ -408,6 +408,7 @@
- dtb-$(CONFIG_ARCH_QCOM)	+= sm8650-qrd.dtb
- dtb-$(CONFIG_ARCH_QCOM)	+= sm8750-mtp.dtb
- dtb-$(CONFIG_ARCH_QCOM)	+= sm8750-qrd.dtb
-+dtb-$(CONFIG_ARCH_QCOM)	+= sm8750-realme-pista.dtb
- dtb-$(CONFIG_ARCH_QCOM)	+= talos-evk.dtb
- 
- talos-evk-el2-dtbs	:= talos-evk.dtb talos-el2.dtbo
 diff --git a/arch/arm64/boot/dts/qcom/sm8750.dtsi b/arch/arm64/boot/dts/qcom/sm8750.dtsi
 --- a/arch/arm64/boot/dts/qcom/sm8750.dtsi
 +++ b/arch/arm64/boot/dts/qcom/sm8750.dtsi
@@ -247,12 +238,10 @@ diff --git a/arch/arm64/boot/dts/qcom/sm8750.dtsi b/arch/arm64/boot/dts/qcom/sm8
  		pdc: interrupt-controller@b220000 {
  			compatible = "qcom,sm8750-pdc", "qcom,pdc";
  			reg = <0x0 0x0b220000 0x0 0x10000>, <0x0 0x164400f0 0x0 0x64>;
-@@ -5281,6 +5493,44 @@
- 					};
- 				};
+@@ -5283,6 +5495,44 @@
  			};
-+		};
-+
+ 		};
+ 
 +		adreno_smmu: iommu@3da0000 {
 +			compatible = "qcom,sm8750-smmu-500", "qcom,adreno-smmu",
 +				     "qcom,smmu-500", "arm,mmu-500";
@@ -289,14 +278,15 @@ diff --git a/arch/arm64/boot/dts/qcom/sm8750.dtsi b/arch/arm64/boot/dts/qcom/sm8
 +			clock-names = "hlos";
 +			power-domains = <&gpucc GPU_CC_CX_GDSC>;
 +			dma-coherent;
- 		};
- 
++		};
++
  		apps_smmu: iommu@15000000 {
+ 			compatible = "qcom,sm8750-smmu-500", "qcom,smmu-500", "arm,mmu-500";
+ 			reg = <0x0 0x15000000 0x0 0x100000>;
 diff --git a/arch/arm64/boot/dts/qcom/sm8750-realme-pista.dts b/arch/arm64/boot/dts/qcom/sm8750-realme-pista.dts
-new file mode 100644
 --- /dev/null
 +++ b/arch/arm64/boot/dts/qcom/sm8750-realme-pista.dts
-@@ -0,0 +1,988 @@
+@@ -0,0 +1,1071 @@
 +// SPDX-License-Identifier: BSD-3-Clause
 +/*
 + * Realme GT7 Pro (pista / RMX5010) mainline DT:
@@ -324,6 +314,30 @@ new file mode 100644
 +
 +	chosen {
 +		/* cmdline and EFI GOP framebuffer come from UEFI */
++	};
++
++	sound {
++		compatible = "qcom,sm8750-sndcard";
++		model = "Realme-pista";
++
++		pinctrl-0 = <&i2s1_active>;
++		pinctrl-names = "default";
++
++		speaker-dai-link {
++			link-name = "Speaker Playback";
++
++			cpu {
++				sound-dai = <&q6apmbedai SECONDARY_MI2S_RX>;
++			};
++
++			codec {
++				sound-dai = <&speaker_left>, <&speaker_right>;
++			};
++
++			platform {
++				sound-dai = <&q6apm>;
++			};
++		};
 +	};
 +
 +	reserved-memory {
@@ -798,6 +812,37 @@ new file mode 100644
 +		drive-strength = <2>;
 +		bias-pull-down;
 +	};
++
++	/* Secondary MI2S to dual NXP TFA9874 speaker amplifiers */
++	i2s1_active: i2s1-active-state {
++		sck-pins {
++			pins = "gpio121";
++			function = "i2s1_sck";
++			drive-strength = <4>;
++			bias-disable;
++		};
++
++		data0-pins {
++			pins = "gpio122";
++			function = "i2s1_data0";
++			drive-strength = <4>;
++			bias-disable;
++		};
++
++		ws-pins {
++			pins = "gpio123";
++			function = "i2s1_ws";
++			drive-strength = <4>;
++			bias-disable;
++		};
++
++		data1-pins {
++			pins = "gpio124";
++			function = "i2s1_data1";
++			drive-strength = <4>;
++			bias-disable;
++		};
++	};
 +};
 +
 +&pon_pwrkey {
@@ -891,16 +936,44 @@ new file mode 100644
 +	status = "disabled";
 +};
 +
-+&lpass_ag_noc {
-+	status = "disabled";
++/* GT7 Pro stock ADSP image spans 80.5 MiB (0x5080000), larger than upstream 0x3a80000 */
++&adspslpi_mem {
++	reg = <0x0 0x9ee00000 0x0 0x5080000>;
 +};
 +
-+&lpass_lpiaon_noc {
-+	status = "disabled";
++&remoteproc_adsp {
++	firmware-name = "qcom/sm8750/realme/pista/adsp.mbn",
++			"qcom/sm8750/realme/pista/adsp_dtb.mbn";
++	status = "okay";
 +};
 +
-+&lpass_lpicx_noc {
-+	status = "disabled";
++&i2c_master_hub_0 {
++	status = "okay";
++};
++
++&i2c_hub_4 {
++	clock-frequency = <400000>;
++	status = "okay";
++
++	speaker_left: audio-codec@34 {
++		compatible = "nxp,tfa9873";
++		reg = <0x34>;
++		vdd-supply = <&vreg_l15b_1p8>;
++		reset-gpios = <&tlmm 2 GPIO_ACTIVE_HIGH>;
++		nxp,tdm-slot = <0>;
++		#sound-dai-cells = <0>;
++		sound-name-prefix = "Left";
++	};
++
++	speaker_right: audio-codec@35 {
++		compatible = "nxp,tfa9873";
++		reg = <0x35>;
++		vdd-supply = <&vreg_l15b_1p8>;
++		reset-gpios = <&tlmm 164 GPIO_ACTIVE_HIGH>;
++		nxp,tdm-slot = <1>;
++		#sound-dai-cells = <0>;
++		sound-name-prefix = "Right";
++	};
 +};
 +
 +&pcie0 {
