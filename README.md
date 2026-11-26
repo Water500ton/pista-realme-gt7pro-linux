@@ -81,6 +81,7 @@ All features listed below as working have been verified on real Realme GT7 Pro h
 1. **SM8750 QTB500 Warm-Reset Workaround (`msm_mdss.c`)**: Reads `mdp_hf_qtb` (`0x017d0000`) on `msm_mdss_enable()` before the first DSI command-mode DMA fetch, preventing the SM8750 display SMMU TBU wedge (`cmd dma tx failed, ret=-110`) after warm `reboot`.
 2. **DSC 1.2 10bpc→8bpp 2-Slices-Per-Packet (`dsi_host.c` + `panel-realme-ab849.c`)**: Uses `CMD_DST_FORMAT_RGB888` when DSC is active on an `RGB101010` panel, programs `DSI_COMMAND_COMPRESSION_MODE_CTRL2_STREAM0_SLICE_WIDTH(bytes_per_pkt)`, and enables `MIPI_DSI_MODE_DSC_ALL_SLICES_IN_PKT` so both 632px horizontal slices pack cleanly into one 1264-byte packet per line.
 3. **Clean Shutdown on Wi-Fi iSCSI Root (`boot/init`)**: Launches `@wpa_supplicant` and `@iscsid` using systemd's `@` `argv[0]` Root Storage Daemon convention so `systemd-shutdown` never tears down Wi-Fi before remounting `/` read-only.
+4. **OBS Studio Preview & Hardware Encoding Tip**: Launch OBS with `MESA_LOADER_DRIVER_OVERRIDE=zink obs` (Adreno 830 Turnip Vulkan backend) to eliminate Wayland PipeWire UBWC preview flicker, and select Custom Output (FFmpeg) with `h264_v4l2m2m` or `hevc_v4l2m2m` (`NV12`) for VPU 3.5 hardware encoding.
 
 ---
 
