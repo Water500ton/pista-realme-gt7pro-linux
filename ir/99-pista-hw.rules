@@ -1,0 +1,3 @@
+# Allow video group (desktop user) to control rear flashlight LED and IR blaster without sudo
+SUBSYSTEM=="leds", KERNEL=="white:flash*", RUN+="/bin/chgrp video /sys/class/leds/%k/brightness", RUN+="/bin/chmod 0664 /sys/class/leds/%k/brightness"
+SUBSYSTEM=="lirc", KERNEL=="lirc*", GROUP="video", MODE="0660"

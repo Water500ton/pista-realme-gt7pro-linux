@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=小米红外遥控器
+Name[en]=Pista IR Remote
+Comment=Realme GT7 Pro 红外遥控器（预置小米电视 & Flipper .ir 码库）
+Exec=/usr/local/bin/pista-remote
+Icon=input-gaming
+Terminal=false
+Type=Application
+Categories=Utility;HardwareSettings;
+StartupNotify=true

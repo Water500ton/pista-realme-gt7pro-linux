@@ -1,4 +1,4 @@
-Subject: [PATCH 7/7] power: supply: qcom_battmgr: add Realme GT7 Pro gauge, health, and 18W PD support
+Subject: [PATCH 7/8] power: supply: qcom_battmgr: add Realme GT7 Pro gauge, 18W PD, and OTG 5V boost
 
 - Initialize battmgr->unit = QCOM_BATTMGR_UNIT_mAh on SM8350/SM8550 variants
   so charge_full and charge_full_design are reported instead of -ENODATA
@@ -10,11 +10,15 @@ Subject: [PATCH 7/7] power: supply: qcom_battmgr: add Realme GT7 Pro gauge, heal
   current_now sign and real V*I pack power_now
 - Negotiate safe 9V / 2A (18W) USB-PD buck charging via ADSP when a PD/PPS
   adapter is connected, with automatic 5V thermal/SOC step-down (>=45C or >=95%)
+- Enable Oplus Type-C OTG CC DRP detection (OEM_PROP_OTG_SWITCH 0x0d = 1)
+  and drive automatic cold-socket 5V VBUS boost (OEM_PROP_OTG_BOOST 0x13,
+  1500mA current limit 0x3b) via usb_register_notify() on xHCI host bus
+  add/remove so external USB drives and peripherals power on automatically
 ---
 diff --git a/drivers/power/supply/qcom_battmgr.c b/drivers/power/supply/qcom_battmgr.c
 --- a/drivers/power/supply/qcom_battmgr.c
 +++ b/drivers/power/supply/qcom_battmgr.c
-@@ -9,6 +9,7 @@
+@@ -9,11 +9,13 @@
  #include <linux/module.h>
  #include <linux/mutex.h>
  #include <linux/nvmem-consumer.h>
@@ -22,7 +26,13 @@ diff --git a/drivers/power/supply/qcom_battmgr.c b/drivers/power/supply/qcom_bat
  #include <linux/of_device.h>
  #include <linux/power_supply.h>
  #include <linux/property.h>
-@@ -99,6 +100,14 @@
+ #include <linux/soc/qcom/pdr.h>
+ #include <linux/soc/qcom/pmic_glink.h>
++#include <linux/usb.h>
+ #include <linux/math.h>
+ #include <linux/units.h>
+ 
+@@ -99,6 +101,19 @@
  #define WLS_BOOST_EN			6
  
  #define BATTMGR_CHG_CTRL_LIMIT_EN	0x48
@@ -31,13 +41,18 @@ diff --git a/drivers/power/supply/qcom_battmgr.c b/drivers/power/supply/qcom_bat
 +#define BATTMGR_OEM_READ_BUFFER		0x10000
 +#define BATTMGR_OEM_BUFFER_WORDS	128
 +#define OEM_PROP_USB_ICL		0x05
++#define OEM_PROP_OTG_SWITCH		0x0d
++#define OEM_PROP_OTG_BOOST		0x13
++#define OEM_PROP_OTG_BOOST_CURR_LIMIT	0x3b
 +#define OEM_PROP_BATT_FCC		0x42
 +#define OEM_PROP_PD_VOLT_MV		0x47
++#define USB_PROP_OTG_SWITCH		0x12
++#define USB_PROP_OTG_BOOST		0x18
 +#define BATT_PD_VOLT_MV			0x19
  #define CHARGE_CTRL_START_THR_MIN	50
  #define CHARGE_CTRL_START_THR_MAX	95
  #define CHARGE_CTRL_END_THR_MIN		55
-@@ -146,6 +155,17 @@
+@@ -146,6 +161,17 @@
  	__le32 delta_soc;
  };
  
@@ -55,7 +70,7 @@ diff --git a/drivers/power/supply/qcom_battmgr.c b/drivers/power/supply/qcom_bat
  struct qcom_battmgr_message {
  	struct pmic_glink_hdr hdr;
  	union {
-@@ -308,6 +328,22 @@
+@@ -308,6 +334,22 @@
  	unsigned int current_max;
  };
  
@@ -78,7 +93,7 @@ diff --git a/drivers/power/supply/qcom_battmgr.c b/drivers/power/supply/qcom_bat
  struct qcom_battmgr {
  	struct device *dev;
  	struct pmic_glink_client *client;
-@@ -331,8 +367,11 @@
+@@ -331,8 +373,15 @@
  	struct qcom_battmgr_ac ac;
  	struct qcom_battmgr_usb usb;
  	struct qcom_battmgr_wireless wireless;
@@ -87,10 +102,14 @@ diff --git a/drivers/power/supply/qcom_battmgr.c b/drivers/power/supply/qcom_bat
  	struct work_struct enable_work;
 +	struct delayed_work pd_work;
 +	bool pd_9v_active;
++	struct work_struct otg_work;
++	struct notifier_block usb_nb;
++	atomic_t otg_bus_cnt;
++	bool otg_boost_active;
  
  	/*
  	 * @lock is used to prevent concurrent power supply requests to the
-@@ -452,6 +491,60 @@
+@@ -452,6 +501,60 @@
  	[POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD] = BATT_CHG_CTRL_END_THR,
  };
  
@@ -151,7 +170,7 @@ diff --git a/drivers/power/supply/qcom_battmgr.c b/drivers/power/supply/qcom_bat
  static int qcom_battmgr_bat_sm8350_update(struct qcom_battmgr *battmgr,
  					  enum power_supply_property psp)
  {
-@@ -464,7 +557,42 @@
+@@ -464,7 +567,42 @@
  	prop = sm8350_bat_prop_map[psp];
  
  	mutex_lock(&battmgr->lock);
@@ -194,7 +213,7 @@ diff --git a/drivers/power/supply/qcom_battmgr.c b/drivers/power/supply/qcom_bat
  	mutex_unlock(&battmgr->lock);
  
  	return ret;
-@@ -531,6 +659,21 @@
+@@ -531,6 +669,21 @@
  	switch (psp) {
  	case POWER_SUPPLY_PROP_STATUS:
  		val->intval = battmgr->status.status;
@@ -216,7 +235,7 @@ diff --git a/drivers/power/supply/qcom_battmgr.c b/drivers/power/supply/qcom_bat
  		break;
  	case POWER_SUPPLY_PROP_CHARGE_TYPE:
  		val->intval = battmgr->info.charge_type;
-@@ -555,9 +698,14 @@
+@@ -555,9 +708,14 @@
  		break;
  	case POWER_SUPPLY_PROP_VOLTAGE_NOW:
  		val->intval = battmgr->status.voltage_now;
@@ -231,7 +250,7 @@ diff --git a/drivers/power/supply/qcom_battmgr.c b/drivers/power/supply/qcom_bat
  		break;
  	case POWER_SUPPLY_PROP_CURRENT_NOW:
  		val->intval = battmgr->status.current_now;
-@@ -1214,12 +1362,24 @@
+@@ -1214,12 +1372,24 @@
  		break;
  	case NOTIF_USB_PROPERTY:
  		power_supply_changed(battmgr->usb_psy);
@@ -257,7 +276,7 @@ diff --git a/drivers/power/supply/qcom_battmgr.c b/drivers/power/supply/qcom_bat
  		break;
  	}
  }
-@@ -1384,6 +1544,10 @@
+@@ -1384,6 +1554,10 @@
  		battmgr->error = 0;
  		break;
  	default:
@@ -268,7 +287,7 @@ diff --git a/drivers/power/supply/qcom_battmgr.c b/drivers/power/supply/qcom_bat
  		dev_warn(battmgr->dev, "unknown message %#x\n", opcode);
  		break;
  	}
-@@ -1460,7 +1624,9 @@
+@@ -1460,7 +1634,9 @@
  			battmgr->info.voltage_max = le32_to_cpu(resp->intval.value);
  			break;
  		case BATT_CURR_NOW:
@@ -279,7 +298,7 @@ diff --git a/drivers/power/supply/qcom_battmgr.c b/drivers/power/supply/qcom_bat
  			break;
  		case BATT_TEMP:
  			val = le32_to_cpu(resp->intval.value);
-@@ -1583,11 +1749,65 @@
+@@ -1583,11 +1759,65 @@
  			break;
  		}
  		break;
@@ -345,7 +364,7 @@ diff --git a/drivers/power/supply/qcom_battmgr.c b/drivers/power/supply/qcom_bat
  		dev_warn(battmgr->dev, "unknown message %#x\n", opcode);
  		break;
  	}
-@@ -1611,6 +1831,85 @@
+@@ -1611,6 +1841,137 @@
  		qcom_battmgr_sm8350_callback(battmgr, data, len);
  }
  
@@ -428,20 +447,96 @@ diff --git a/drivers/power/supply/qcom_battmgr.c b/drivers/power/supply/qcom_bat
 +	power_supply_changed(battmgr->bat_psy);
 +}
 +
++static void qcom_battmgr_otg_worker(struct work_struct *work)
++{
++	struct qcom_battmgr *battmgr = container_of(work, struct qcom_battmgr, otg_work);
++	bool want_boost = atomic_read(&battmgr->otg_bus_cnt) > 0;
++	int ret;
++
++	if (!battmgr->service_up || want_boost == battmgr->otg_boost_active)
++		return;
++
++	mutex_lock(&battmgr->lock);
++	if (want_boost) {
++		qcom_battmgr_request_property(battmgr, BATTMGR_OEM_PROPERTY_SET,
++					      OEM_PROP_OTG_BOOST_CURR_LIMIT, 1500);
++	}
++	ret = qcom_battmgr_request_property(battmgr, BATTMGR_OEM_PROPERTY_SET,
++					    OEM_PROP_OTG_BOOST, want_boost ? 1 : 0);
++	if (ret)
++		ret = qcom_battmgr_request_property(battmgr, BATTMGR_USB_PROPERTY_SET,
++						    USB_PROP_OTG_BOOST, want_boost ? 1 : 0);
++	if (!ret)
++		battmgr->otg_boost_active = want_boost;
++	mutex_unlock(&battmgr->lock);
++
++	dev_info(battmgr->dev, "pista OTG 5V boost %s: %d\n",
++		 want_boost ? "ON" : "OFF", ret);
++}
++
++#if IS_ENABLED(CONFIG_USB)
++static int qcom_battmgr_usb_notify(struct notifier_block *nb,
++				   unsigned long action, void *data)
++{
++	struct qcom_battmgr *battmgr = container_of(nb, struct qcom_battmgr, usb_nb);
++
++	if (action == USB_BUS_ADD) {
++		if (atomic_inc_return(&battmgr->otg_bus_cnt) == 1)
++			schedule_work(&battmgr->otg_work);
++	} else if (action == USB_BUS_REMOVE) {
++		if (atomic_dec_if_positive(&battmgr->otg_bus_cnt) == 0)
++			schedule_work(&battmgr->otg_work);
++	}
++
++	return NOTIFY_OK;
++}
++
++static void qcom_battmgr_usb_unregister(void *data)
++{
++	struct qcom_battmgr *battmgr = data;
++
++	usb_unregister_notify(&battmgr->usb_nb);
++}
++#endif
++
  static void qcom_battmgr_enable_worker(struct work_struct *work)
  {
  	struct qcom_battmgr *battmgr = container_of(work, struct qcom_battmgr, enable_work);
-@@ -1624,6 +1923,9 @@
+@@ -1624,6 +1985,33 @@
  	ret = qcom_battmgr_request(battmgr, &req, sizeof(req));
  	if (ret)
  		dev_err(battmgr->dev, "failed to request power notifications\n");
 +
-+	if (of_machine_is_compatible("realme,pista"))
++	if (of_machine_is_compatible("realme,pista")) {
++		bool want_boost = atomic_read(&battmgr->otg_bus_cnt) > 0;
++
++		mutex_lock(&battmgr->lock);
++		ret = qcom_battmgr_request_property(battmgr, BATTMGR_OEM_PROPERTY_SET,
++						    OEM_PROP_OTG_SWITCH, 1);
++		if (ret)
++			ret = qcom_battmgr_request_property(battmgr, BATTMGR_USB_PROPERTY_SET,
++							    USB_PROP_OTG_SWITCH, 1);
++		dev_info(battmgr->dev, "pista OTG switch enable: %d\n", ret);
++
++		/* Ensure cold-socket (0V VBUS) unless USB host bus is already active */
++		if (want_boost)
++			qcom_battmgr_request_property(battmgr, BATTMGR_OEM_PROPERTY_SET,
++						      OEM_PROP_OTG_BOOST_CURR_LIMIT, 1500);
++		ret = qcom_battmgr_request_property(battmgr, BATTMGR_OEM_PROPERTY_SET,
++						    OEM_PROP_OTG_BOOST, want_boost ? 1 : 0);
++		if (ret)
++			ret = qcom_battmgr_request_property(battmgr, BATTMGR_USB_PROPERTY_SET,
++							    USB_PROP_OTG_BOOST, want_boost ? 1 : 0);
++		if (!ret)
++			battmgr->otg_boost_active = want_boost;
++		mutex_unlock(&battmgr->lock);
++
 +		mod_delayed_work(system_dfl_wq, &battmgr->pd_work, msecs_to_jiffies(1500));
++	}
  }
  
  static void qcom_battmgr_pdr_notify(void *priv, int state)
-@@ -1649,7 +1951,7 @@
+@@ -1649,7 +2037,7 @@
  	{}
  };
  
@@ -450,7 +545,7 @@ diff --git a/drivers/power/supply/qcom_battmgr.c b/drivers/power/supply/qcom_bat
  
  static int qcom_battmgr_probe(struct auxiliary_device *adev,
  			      const struct auxiliary_device_id *id)
-@@ -1717,6 +2019,8 @@
+@@ -1717,6 +2105,8 @@
  			return dev_err_probe(dev, PTR_ERR(battmgr->wls_psy),
  					     "failed to register wireless charing power supply\n");
  	} else {
@@ -459,7 +554,7 @@ diff --git a/drivers/power/supply/qcom_battmgr.c b/drivers/power/supply/qcom_bat
  		if (battmgr->variant == QCOM_BATTMGR_SM8550)
  			psy_desc = &sm8550_bat_psy_desc;
  		else
-@@ -1743,6 +2047,11 @@
+@@ -1743,6 +2133,26 @@
  	if (ret)
  		return ret;
  
@@ -467,6 +562,21 @@ diff --git a/drivers/power/supply/qcom_battmgr.c b/drivers/power/supply/qcom_bat
 +					   qcom_battmgr_pd_worker);
 +	if (ret)
 +		return ret;
++
++	ret = devm_work_autocancel(dev, &battmgr->otg_work,
++				   qcom_battmgr_otg_worker);
++	if (ret)
++		return ret;
++
++#if IS_ENABLED(CONFIG_USB)
++	if (of_machine_is_compatible("realme,pista")) {
++		battmgr->usb_nb.notifier_call = qcom_battmgr_usb_notify;
++		usb_register_notify(&battmgr->usb_nb);
++		ret = devm_add_action_or_reset(dev, qcom_battmgr_usb_unregister, battmgr);
++		if (ret)
++			return ret;
++	}
++#endif
 +
  	battmgr->client = devm_pmic_glink_client_alloc(dev, PMIC_GLINK_OWNER_BATTMGR,
  						       qcom_battmgr_callback,

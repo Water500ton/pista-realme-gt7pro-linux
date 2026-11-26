@@ -1,11 +1,16 @@
-Subject: [PATCH 1/6] arm64: dts: qcom: sm8750: add Realme GT7 Pro (pista), Adreno 830, and audio
+Subject: [PATCH 1/8] arm64: dts: qcom: sm8750: add Realme GT7 Pro (pista) full board DTS
 
 Add Adreno 830 GPU/GMU/GXCLKCTL nodes to sm8750.dtsi and add the full
-Realme GT7 Pro (pista, RMX5010) device tree with USB 2.0 gadget, WCN7860
-Wi-Fi 7, Synaptics S3910 SPI touchscreen, Adreno 830 GPU, native
-DPU 12.0 + DSI0 + AB849 120Hz DSC OLED display, 95C passive thermal
-cooling-maps, ADSP AudioReach (80.5 MiB adspslpi_mem), and dual NXP
-TFA9873 stereo speaker amplifiers on i2c_hub_4 / Secondary MI2S.
+Realme GT7 Pro (pista, RMX5010) device tree with:
+- USB 2.0 dual-role OTG + Type-C UCSI PMIC GLINK connector
+- WCN7860 Wi-Fi 7 & Ganges 2.0 Bluetooth 6.0 (UART14 @ 8 Mbps)
+- Synaptics S3910 SPI touchscreen & physical volume/power keys
+- Adreno 830 GPU + native DPU 12.0 + DSI0 + AB849 120Hz DSC OLED display
+- ADSP AudioReach (80.5 MiB adspslpi_mem), dual NXP TFA9874 speakers, WCD9395 dual mics
+- PM8550 rear flashlight/torch LED (single populated channel 1)
+- Qualcomm Iris VPU 3.5 hardware video decoder/encoder (&iris + &videocc)
+- SPI5 IR blaster (&spi5 gpio53 MOSI + PM8550 L9B 2.504V + ir-spi-led)
+- 95C passive thermal cooling-maps for Adreno 830 and Oryon CPU clusters
 ---
 diff --git a/arch/arm64/boot/dts/qcom/Makefile b/arch/arm64/boot/dts/qcom/Makefile
 diff --git a/arch/arm64/boot/dts/qcom/sm8750.dtsi b/arch/arm64/boot/dts/qcom/sm8750.dtsi
@@ -287,7 +292,7 @@ diff --git a/arch/arm64/boot/dts/qcom/sm8750-realme-pista.dts b/arch/arm64/boot/
 new file mode 100644
 --- /dev/null
 +++ b/arch/arm64/boot/dts/qcom/sm8750-realme-pista.dts
-@@ -0,0 +1,1224 @@
+@@ -0,0 +1,1297 @@
 +// SPDX-License-Identifier: BSD-3-Clause
 +/*
 + * Realme GT7 Pro (pista / RMX5010) mainline DT:
@@ -298,6 +303,7 @@ new file mode 100644
 +
 +#include <dt-bindings/gpio/gpio.h>
 +#include <dt-bindings/input/linux-event-codes.h>
++#include <dt-bindings/leds/common.h>
 +#include <dt-bindings/regulator/qcom,rpmh-regulator.h>
 +#include <dt-bindings/thermal/thermal.h>
 +#include "sm8750.dtsi"
@@ -325,6 +331,29 @@ new file mode 100644
 +		compatible = "qcom,sm8750-pmic-glink",
 +			     "qcom,sm8550-pmic-glink",
 +			     "qcom,pmic-glink";
++		#address-cells = <1>;
++		#size-cells = <0>;
++
++		connector@0 {
++			compatible = "usb-c-connector";
++			reg = <0>;
++
++			power-role = "dual";
++			data-role = "dual";
++
++			ports {
++				#address-cells = <1>;
++				#size-cells = <0>;
++
++				port@0 {
++					reg = <0>;
++
++					pmic_glink_hs_in: endpoint {
++						remote-endpoint = <&usb_dwc3_hs>;
++					};
++				};
++			};
++		};
 +	};
 +
 +	wcd939x: audio-codec {
@@ -558,6 +587,7 @@ new file mode 100644
 +		vdd-l1-l4-l10-supply = <&vreg_s3g_1p8>;
 +		vdd-l2-l13-l14-supply = <&vreg_bob1>;
 +		vdd-l5-l16-supply = <&vreg_bob1>;
++		vdd-l8-l9-supply = <&vreg_bob1>;
 +		vdd-l11-supply = <&vreg_s7i_1p2>;
 +		vdd-l12-supply = <&vreg_s3g_1p8>;
 +		vdd-l15-supply = <&vreg_s3g_1p8>;
@@ -593,6 +623,16 @@ new file mode 100644
 +			regulator-name = "vreg_l5b_3p1";
 +			regulator-min-microvolt = <3100000>;
 +			regulator-max-microvolt = <3148000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++			regulator-allow-set-load;
++			regulator-allowed-modes = <RPMH_REGULATOR_MODE_LPM
++						   RPMH_REGULATOR_MODE_HPM>;
++		};
++
++		vreg_l9b_2p5: ldo9 {
++			regulator-name = "vreg_l9b_2p5";
++			regulator-min-microvolt = <2504000>;
++			regulator-max-microvolt = <2504000>;
 +			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
 +			regulator-allow-set-load;
 +			regulator-allowed-modes = <RPMH_REGULATOR_MODE_LPM
@@ -942,6 +982,13 @@ new file mode 100644
 +		bias-disable;
 +		output-low;
 +	};
++
++	qup_spi5_mosi_active: qup-spi5-mosi-active-state {
++		pins = "gpio53";
++		function = "qup1_se5";
++		drive-strength = <6>;
++		bias-disable;
++	};
 +};
 +
 +&swr1 {
@@ -963,6 +1010,19 @@ new file mode 100644
 +		compatible = "sdw20217010e00";
 +		reg = <0 3>;
 +		qcom,tx-port-mapping = <2 2 3 4>;
++	};
++};
++
++&pm8550_flash {
++	status = "okay";
++
++	led-0 {
++		function = LED_FUNCTION_FLASH;
++		color = <LED_COLOR_ID_WHITE>;
++		led-sources = <1>;
++		led-max-microamp = <500000>;
++		flash-max-microamp = <1500000>;
++		flash-max-timeout-us = <1280000>;
 +	};
 +};
 +
@@ -1056,10 +1116,6 @@ new file mode 100644
 +};
 +
 +&camcc {
-+	status = "disabled";
-+};
-+
-+&videocc {
 +	status = "disabled";
 +};
 +
@@ -1215,6 +1271,24 @@ new file mode 100644
 +	};
 +};
 +
++&spi5 {
++	pinctrl-0 = <&qup_spi5_mosi_active>;
++	pinctrl-names = "default";
++	status = "okay";
++
++	ir-led@0 {
++		compatible = "ir-spi-led";
++		reg = <0>;
++		irda_regulator-supply = <&vreg_l9b_2p5>;
++		spi-max-frequency = <5000000>;
++	};
++};
++
++&iris {
++	firmware-name = "qcom/sm8750/realme/pista/vpu35_4v.mbn";
++	status = "okay";
++};
++
 +&gpu {
 +	status = "okay";
 +};
@@ -1224,13 +1298,17 @@ new file mode 100644
 +};
 +
 +&usb {
-+	dr_mode = "peripheral";
++	dr_mode = "otg";
++	role-switch-default-mode = "peripheral";
 +	maximum-speed = "high-speed";
 +	qcom,select-utmi-as-pipe-clk;
 +	phys = <&usb_hsphy>;
 +	phy-names = "usb2-phy";
-+	/delete-property/ usb-role-switch;
 +	status = "okay";
++};
++
++&usb_dwc3_hs {
++	remote-endpoint = <&pmic_glink_hs_in>;
 +};
 +
 +/*

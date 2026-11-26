@@ -15,13 +15,16 @@ All features listed below as working have been verified on real Realme GT7 Pro h
 | **GPU** | Adreno 830 (`0x44050000`, `msm`) | Working | GMU v5.1.25 + Mesa 26 Freedreno/Turnip, devfreq up to 1100 MHz (`simple_ondemand` / `performance`), thermal cooling (requires user's own device-signed `gen80000_zap.mbn`) |
 | **Touchscreen** | Synaptics S3910 (`syna_tcm2` on SPI4) | Working | Multi-touch verified in Weston & KDE Plasma 6 |
 | **Wi-Fi 7** | Qualcomm FastConnect 7900 / WCN7860 (`peach`, PCI `17cb:110e`) | Working | `ath12k_wifi7`, runtime read-only firmware staging from device `modem_a` |
-| **USB** | M31 eUSB2 + DWC3 Gadget (CDC NCM / ECM / RNDIS) | Working | `usb0` (`172.16.42.1/24`) SSH & DHCP |
+| **USB (Device & Host OTG)** | M31 eUSB2 + DWC3 OTG (`xHCI` + CDC NCM Gadget) + `ucsi_glink` + Oplus Auto 5V VBUS Boost | Working | Dual-role Type-C (`peripheral` default `usb0` `172.16.42.1/24` + automatic `host` switch on plug-in with cold-socket 5.1V / 1.5A VBUS boost via `qcom_battmgr` `usb_register_notify()`; verified with 500GB 2.5" external HDD over UAS @ **43.3 MB/s**). *Hardware note: GT7 Pro Type-C is physically USB 2.0 only (`usb_qmp_dp_phy` disabled in stock DTB; no USB 3.x / DP Alt-Mode).* |
 | **Storage** | UFS (`ufshcd-qcom`) + iSCSI (`iscsi_tcp`) | Working | Read-only stock partition access + remote iSCSI rootfs |
 | **Keys / RTC** | PMK8550 PON Power + Vol+ (`pon_pwrkey` / `pon_resin`), PM8550 GPIO6 Vol- (`gpio-keys`), PM8xxx RTC | Working | Power, Volume Up, and Volume Down all verified in KDE Plasma 6 (`POWER_RESET_QCOM_PON` + `KEYBOARD_GPIO`) |
 | **Audio (Speakers & Dual Mic)** | ADSP AudioReach (`q6apm`), Secondary MI2S (`SD1`) + Dual NXP `TFA9873` (`0x34`/`0x35`), SoundWire `WCD9395` (`AMIC1` + `AMIC5`) | Working | Stereo speakers & dual internal microphones (stereo 48 kHz capture + full-duplex) verified via ALSA & PipeWire / KDE Plasma 6 (`Built-in Audio Stereo Speakers` / `Internal Microphones`), using in-kernel `qcom_pd_mapper`, `Realme-pista.m4` topology, UCM2, and user's own device-signed `adsp.mbn`/`adsp_dtb.mbn` |
 | **Bluetooth 6.0** | Qualcomm FastConnect 7900 / WCN7860 (`Ganges 2.0`, `0x40210200`) on `uart14` @ 8 Mbps | Working | `btqca` + `hci_uart` (`patches/0008` PeriSS baudrate `0x31`/`0x34` + `gngbtfw20.mbn`/`gngbtnv20.bin`), BlueZ 5.88 + KDE Plasma 6 `bluedevil` + PipeWire `libspa-0.2-bluetooth` (Classic/BLE/A2DP/HFP/LE Audio/HIDP/UHID), real device scan verified |
-| **Battery / Charging** | ADSP `charger_pd` (`pmic_glink` + `qcom_battmgr`) + Oplus hardware fuel gauge (`OEM_READ_BUFFER`) | Working | Real SOC %, 2S 6500 mAh (~25.2 Wh) capacity, hardware SOH health %, cycle count, temperature, charging/discharging hotplug notifications, and **18W USB-PD (9V/2A)** fast charging verified in UPower & KDE Plasma 6 |
-| **Modem / Camera** | WWAN, CamSS | WIP | Not yet enabled |
+| **Battery / Charging** | ADSP `charger_pd` (`pmic_glink` + `qcom_battmgr`) + Oplus hardware fuel gauge (`OEM_READ_BUFFER`) | Working | Real SOC %, 2S 6500 mAh (~25.2 Wh) capacity, hardware SOH health %, cycle count, temperature, charging/discharging hotplug notifications, **18W USB-PD (9V/2A)** fast charging, and automatic cold-socket **5V OTG VBUS boost** verified in UPower & KDE Plasma 6 |
+| **Flashlight / Torch LED** | PM8550 Flash LED (`pm8550_flash`, `leds-qcom-flash`) | Working | Single populated white channel (`led-sources = <1>`) exposed at `/sys/class/leds/white:flash` (`0..255` -> `0..500 mA` torch, up to `1500 mA` / `1280 ms` flash strobe) |
+| **Hardware Video Codec** | Qualcomm Iris VPU 3.5 (`qcom,sm8750-iris` + `videocc`) | Working | `/dev/video0` hardware decoder (**H.264 / HEVC / VP9 / AV1**, NV12/P010/UBWC) and `/dev/video1` hardware encoder (**H.264 / HEVC**); end-to-end V4L2 M2M encode+decode loopback verified with user's own device-signed `vpu35_4v.mbn` |
+| **IR Blaster** | QUPv3 `spi5` (`gpio53` MOSI) + PM8550 `L9B` (`2.504V`) + `ir-spi` | Working | Raw 38 kHz LIRC transmitter at `/dev/lirc0` + touch-friendly GTK3 GUI [`ir/pista-remote.py`](ir/pista-remote.py) preloaded with verified Xiaomi TV / Mi Box codes & Flipper-IRDB `.ir` import; verified on real Xiaomi TV |
+| **Modem / Camera / Sensors / Haptics** | WWAN, CamSS, ADSP SSC, PMIH0108 | WIP | Not yet enabled |
 
 ---
 
@@ -44,6 +47,10 @@ All features listed below as working have been verified on real Realme GT7 Pro h
 │   ├── pista-bt-bdaddr.sh                                     # Deterministic persistent BDADDR helper (from /etc/machine-id)
 │   ├── pista-bt-bdaddr.service                                # Systemd oneshot unit for automatic public-addr config
 │   └── 99-pista-bt-bdaddr.rules                               # Udev trigger on hci0 add
+├── ir/
+│   ├── pista-remote.py                                        # Touch-friendly GTK3 IR remote GUI (Xiaomi TV preset + Flipper .ir + torch)
+│   ├── pista-remote.desktop                                   # Desktop launcher entry
+│   └── 99-pista-hw.rules                                      # Udev permissions for /dev/lirc0 & /sys/class/leds/white:flash
 ├── patches/                                                   # Clean patch series against upstream Linux 7.3.6
 │   ├── 0001-arm64-dts-qcom-sm8750-add-realme-pista-and-adreno830.patch
 │   ├── 0002-drm-msm-sm8750-adreno830-dsc-and-qtb500-fixes.patch
@@ -111,6 +118,10 @@ This repository intentionally contains **no proprietary firmware blobs**. You mu
 - **WCN7860 / Ganges 2.0 Bluetooth 6.0**:
   - Extract `gngbtfw20.mbn` and `gngbtnv20.bin` (and any `gngbtnv20.b*`) read-only from your own GT7 Pro `bluetooth_a` partition (`/dev/disk/by-partlabel/bluetooth_a`, VFAT `image/`) into `/lib/firmware/qca/`.
   - Install `bluetooth/pista-bt-bdaddr.sh` -> `/usr/local/sbin/`, `bluetooth/pista-bt-bdaddr.service` -> `/etc/systemd/system/`, and `bluetooth/99-pista-bt-bdaddr.rules` -> `/etc/udev/rules.d/` to automatically configure a persistent public BD address on boot.
+- **Qualcomm Iris VPU 3.5 Hardware Video Codec**:
+  - Extract device-signed `vpu35_4v.mbn` read-only from your own GT7 Pro `vendor_a` image (`super` -> `vendor_a` EROFS `/firmware/vpu35_4v.mbn`) to `/lib/firmware/qcom/sm8750/realme/pista/vpu35_4v.mbn`.
+- **IR Blaster & Rear Flashlight GUI (`ir/pista-remote.py`)**:
+  - Install `ir/99-pista-hw.rules` -> `/etc/udev/rules.d/`, `ir/pista-remote.py` -> `/usr/local/bin/pista-remote`, and `ir/pista-remote.desktop` -> `/usr/share/applications/` (requires `python3-gi` / GTK3; no root needed for users in the `video` group).
 
 ### 3. VAB-Safe Booting (Important Safety Notice)
 The Realme GT7 Pro uses Android 15 Virtual A/B (VAB):
