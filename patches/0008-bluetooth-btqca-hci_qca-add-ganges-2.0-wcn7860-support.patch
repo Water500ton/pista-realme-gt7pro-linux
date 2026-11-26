@@ -1,0 +1,231 @@
+From: Water500t <Water500t@localhost>
+Subject: [PATCH 8/8] Bluetooth: btqca & hci_qca: add Qualcomm Ganges 2.0 (WCN7860) support
+
+Add support for Qualcomm FastConnect 7900 / WCN7860 (Ganges 2.0,
+Product ID 0x21, SoC version 0x40210200, ROM 0x20) on SM8750 devices:
+- Detect Ganges (soc_id >> 16 == 0x4021) in btqca and hci_qca
+- Support 8 Mbps (0x15) UART baudrate and 7-byte Peripheral HCI
+  SetPeriBaudRateReq (0x31 0x00 0xF1 0xFF 0x02 0x02 <baud>) with
+  0x34 Peripheral HCI event handling and completion synchronization
+- Send EDL patch config command and download ELF rampatch
+  (qca/gngbtfw20.mbn) and NVM (qca/gngbtnv20.*) firmware
+- Flush serdev TX buffer before closing port on setup retries
+
+---
+diff --git a/drivers/bluetooth/btqca.h b/drivers/bluetooth/btqca.h
+--- a/drivers/bluetooth/btqca.h
++++ b/drivers/bluetooth/btqca.h
+@@ -74,6 +74,7 @@
+ 	QCA_BAUDRATE_1600000,
+ 	QCA_BAUDRATE_3200000,
+ 	QCA_BAUDRATE_3500000,
++	QCA_BAUDRATE_8000000	= 0x15,
+ 	QCA_BAUDRATE_AUTO	= 0xFE,
+ 	QCA_BAUDRATE_RESERVED
+ };
+diff --git a/drivers/bluetooth/btqca.c b/drivers/bluetooth/btqca.c
+--- a/drivers/bluetooth/btqca.c
++++ b/drivers/bluetooth/btqca.c
+@@ -757,6 +757,7 @@
+ 	u8 rom_ver = 0;
+ 	u32 soc_ver;
+ 	u16 boardid = 0;
++	bool is_ganges = (le32_to_cpu(ver.soc_id) >> 16) == 0x4021;
+ 
+ 	bt_dev_dbg(hdev, "QCA setup on UART");
+ 
+@@ -776,7 +777,7 @@
+ 	else
+ 		rom_ver = ((soc_ver & 0x00000f00) >> 0x04) | (soc_ver & 0x0000000f);
+ 
+-	if (soc_type == QCA_WCN6750)
++	if (soc_type == QCA_WCN6750 || (soc_type == QCA_WCN7850 && is_ganges))
+ 		qca_send_patch_config_cmd(hdev);
+ 
+ 	/* Download rampatch file */
+@@ -824,8 +825,14 @@
+ 				 "qca/wcnhpbtfw%02x.tlv", rom_ver);
+ 			break;
+ 		case QCA_WCN7850:
+-			snprintf(config.fwname, sizeof(config.fwname),
+-				 "qca/hmtbtfw%02x.tlv", rom_ver);
++			if (is_ganges) {
++				config.type = ELF_TYPE_PATCH;
++				snprintf(config.fwname, sizeof(config.fwname),
++					 "qca/gngbtfw%02x.mbn", rom_ver);
++			} else {
++				snprintf(config.fwname, sizeof(config.fwname),
++					 "qca/hmtbtfw%02x.tlv", rom_ver);
++			}
+ 			break;
+ 		default:
+ 			snprintf(config.fwname, sizeof(config.fwname),
+@@ -919,7 +926,7 @@
+ 			break;
+ 		case QCA_WCN7850:
+ 			qca_get_nvm_name_by_board(config.fwname, sizeof(config.fwname),
+-				 "hmtnv", soc_type, ver, rom_ver, boardid);
++				 is_ganges ? "gngbtnv" : "hmtnv", soc_type, ver, rom_ver, boardid);
+ 			break;
+ 		default:
+ 			snprintf(config.fwname, sizeof(config.fwname),
+diff --git a/drivers/bluetooth/hci_qca.c b/drivers/bluetooth/hci_qca.c
+--- a/drivers/bluetooth/hci_qca.c
++++ b/drivers/bluetooth/hci_qca.c
+@@ -80,6 +80,7 @@
+ 	QCA_BT_OFF,
+ 	QCA_ROM_FW,
+ 	QCA_DEBUGFS_CREATED,
++	QCA_GANGES,
+ };
+ 
+ enum qca_capabilities {
+@@ -1267,11 +1268,34 @@
+ 	.lsize = 0, \
+ 	.maxlen = HCI_MAX_IBS_SIZE
+ 
++static int qca_recv_peri_event(struct hci_dev *hdev, struct sk_buff *skb)
++{
++	struct hci_uart *hu = hci_get_drvdata(hdev);
++	struct qca_data *qca = hu->priv;
++
++	bt_dev_dbg(hdev, "QCA Peri event len=%u: %*ph", skb->len,
++		   min_t(int, skb->len, 16), skb->data);
++	if (test_bit(QCA_DROP_VENDOR_EVENT, &qca->flags))
++		complete(&qca->drop_ev_comp);
++	kfree_skb(skb);
++	return 0;
++}
++
++#define QCA_PERI_EVENT_PKT 0x34
++
++#define QCA_PERI_EVENT \
++	.type = QCA_PERI_EVENT_PKT, \
++	.hlen = 3, \
++	.loff = 2, \
++	.lsize = 1, \
++	.maxlen = HCI_MAX_EVENT_SIZE
++
+ static const struct h4_recv_pkt qca_recv_pkts[] = {
+ 	{ H4_RECV_ACL,             .recv = qca_recv_acl_data },
+ 	{ H4_RECV_SCO,             .recv = hci_recv_frame    },
+ 	{ H4_RECV_EVENT,           .recv = qca_recv_event    },
+ 	{ H4_RECV_ISO,             .recv = hci_recv_frame    },
++	{ QCA_PERI_EVENT,          .recv = qca_recv_peri_event },
+ 	{ QCA_IBS_WAKE_IND_EVENT,  .recv = qca_ibs_wake_ind  },
+ 	{ QCA_IBS_WAKE_ACK_EVENT,  .recv = qca_ibs_wake_ack  },
+ 	{ QCA_IBS_SLEEP_IND_EVENT, .recv = qca_ibs_sleep_ind },
+@@ -1334,6 +1358,10 @@
+ 		return QCA_BAUDRATE_3200000;
+ 	case 3500000:
+ 		return QCA_BAUDRATE_3500000;
++	case 4000000:
++		return QCA_BAUDRATE_4000000;
++	case 8000000:
++		return QCA_BAUDRATE_8000000;
+ 	default:
+ 		return QCA_BAUDRATE_115200;
+ 	}
+@@ -1345,20 +1373,33 @@
+ 	struct qca_data *qca = hu->priv;
+ 	struct sk_buff *skb;
+ 	u8 cmd[] = { 0x01, 0x48, 0xFC, 0x01, 0x00 };
++	u8 peri_cmd[] = { 0x31, 0x00, 0xF1, 0xFF, 0x02, 0x02, 0x00 };
++	const u8 *buf;
++	size_t len;
+ 
+-	if (baudrate > QCA_BAUDRATE_3200000)
++	if (baudrate > QCA_BAUDRATE_8000000)
+ 		return -EINVAL;
+ 
+-	cmd[4] = baudrate;
++	if (test_bit(QCA_GANGES, &qca->flags)) {
++		peri_cmd[6] = baudrate;
++		buf = peri_cmd;
++		len = sizeof(peri_cmd);
++	} else {
++		if (baudrate > QCA_BAUDRATE_3200000)
++			return -EINVAL;
++		cmd[4] = baudrate;
++		buf = cmd;
++		len = sizeof(cmd);
++	}
+ 
+-	skb = bt_skb_alloc(sizeof(cmd), GFP_KERNEL);
++	skb = bt_skb_alloc(len, GFP_KERNEL);
+ 	if (!skb) {
+ 		bt_dev_err(hdev, "Failed to allocate baudrate packet");
+ 		return -ENOMEM;
+ 	}
+ 
+ 	/* Assign commands to change baudrate and packet type. */
+-	skb_put_data(skb, cmd, sizeof(cmd));
++	skb_put_data(skb, buf, len);
+ 	hci_skb_pkt_type(skb) = HCI_COMMAND_PKT;
+ 
+ 	skb_queue_tail(&qca->txq, skb);
+@@ -1382,10 +1423,13 @@
+ 	case QCA_WCN3998:
+ 	case QCA_WCN6750:
+ 	case QCA_WCN6855:
+-	case QCA_WCN7850:
+ 		usleep_range(1000, 10000);
+ 		break;
+ 
++	case QCA_WCN7850:
++		msleep(20);
++		break;
++
+ 	default:
+ 		msleep(300);
+ 	}
+@@ -1526,6 +1570,13 @@
+ 			set_bit(QCA_DROP_VENDOR_EVENT, &qca->flags);
+ 			break;
+ 
++		case QCA_WCN7850:
++			if (test_bit(QCA_GANGES, &qca->flags)) {
++				reinit_completion(&qca->drop_ev_comp);
++				set_bit(QCA_DROP_VENDOR_EVENT, &qca->flags);
++			}
++			break;
++
+ 		default:
+ 			break;
+ 		}
+@@ -1570,6 +1621,16 @@
+ 			clear_bit(QCA_DROP_VENDOR_EVENT, &qca->flags);
+ 			break;
+ 
++		case QCA_WCN7850:
++			if (test_bit(QCA_GANGES, &qca->flags)) {
++				if (!wait_for_completion_timeout(&qca->drop_ev_comp,
++							 msecs_to_jiffies(200)))
++					bt_dev_warn(hu->hdev,
++						    "Ganges peri baudrate event timeout");
++				clear_bit(QCA_DROP_VENDOR_EVENT, &qca->flags);
++			}
++			break;
++
+ 		default:
+ 			break;
+ 		}
+@@ -1994,6 +2055,10 @@
+ 		ret = qca_read_soc_version(hdev, &ver, soc_type);
+ 		if (ret)
+ 			goto out;
++		if ((le32_to_cpu(ver.soc_id) >> 16) == 0x4021)
++			set_bit(QCA_GANGES, &qca->flags);
++		else
++			clear_bit(QCA_GANGES, &qca->flags);
+ 		break;
+ 
+ 	default:
+@@ -2060,6 +2125,7 @@
+ 		if (retries < MAX_INIT_RETRIES) {
+ 			bt_dev_warn(hdev, "Retry BT power ON:%d", retries);
+ 			if (hu->serdev) {
++				serdev_device_write_flush(hu->serdev);
+ 				serdev_device_close(hu->serdev);
+ 				ret = serdev_device_open(hu->serdev);
+ 				if (ret) {

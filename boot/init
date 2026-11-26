@@ -194,9 +194,9 @@ EOF
                         [ -x /mnt/root/lib/systemd/systemd ] && INIT_BIN="/lib/systemd/systemd"
                         log "iSCSI  : Debian rootfs ready on $ROOT_DEV -> switch_root $INIT_BIN!"
 
-                        # Auto-sync kernel modules to Debian rootfs whenever kernel or display modules change
+                        # Auto-sync kernel modules to Debian rootfs whenever kernel or display/audio/BT modules change
                         KVER=$(uname -r)
-                        KSTAMP="$(uname -v):$(sha256sum "/lib/modules/$KVER/kernel/drivers/gpu/drm/panel/panel-realme-ab849.ko" "/lib/modules/$KVER/kernel/drivers/gpu/drm/msm/msm.ko" 2>/dev/null | tr '\n' ';')"
+                        KSTAMP="$(uname -v):$(sha256sum "/lib/modules/$KVER/kernel/drivers/gpu/drm/panel/panel-realme-ab849.ko" "/lib/modules/$KVER/kernel/drivers/gpu/drm/msm/msm.ko" "/lib/modules/$KVER/kernel/sound/soc/codecs/snd-soc-wcd939x.ko" "/lib/modules/$KVER/kernel/drivers/bluetooth/hci_uart.ko" "/lib/modules/$KVER/kernel/drivers/bluetooth/btqca.ko" 2>/dev/null | tr '\n' ';')"
                         if [ "$(cat "/mnt/root/lib/modules/$KVER/.pista-ver" 2>/dev/null)" != "$KSTAMP" ]; then
                             log "iSCSI  : syncing /lib/modules/$KVER into Debian rootfs..."
                             rm -rf "/mnt/root/lib/modules/$KVER"
@@ -208,7 +208,7 @@ EOF
                         # Switch Debian GPU config to unified native msm (DPU1+DSI0+Adreno 830)
                         mkdir -p /mnt/root/etc/modprobe.d /mnt/root/etc/modules-load.d
                         echo "# Unified native msm KMS (DPU1+DSI0) + Adreno 830" > /mnt/root/etc/modprobe.d/pista-gpu.conf
-                        printf "panel-realme-ab849\nmsm\nqcom_pd_mapper\nqrtr_smd\nqcom_q6v5_pas\nsnd-soc-tfa9874\nsnd-soc-sc8280xp\n" > /mnt/root/etc/modules-load.d/pista.conf
+                        printf "panel-realme-ab849\nmsm\nqcom_pd_mapper\nqrtr_smd\nqcom_q6v5_pas\npinctrl-sm8650-lpass-lpi\nsnd-soc-lpass-va-macro\nsnd-soc-lpass-rx-macro\nsnd-soc-lpass-tx-macro\nsoundwire-qcom\nsnd-soc-wcd939x-sdw\nsnd-soc-wcd939x\nsnd-soc-tfa9874\nsnd-soc-sc8280xp\nbluetooth\nbtqca\nhci_uart\nrfcomm\nbnep\nhidp\nuhid\n" > /mnt/root/etc/modules-load.d/pista.conf
                         if [ -d /usr/share/pista-audio ]; then
                             mkdir -p /mnt/root/lib/firmware/qcom/sm8750 \
                                      /mnt/root/usr/share/alsa/ucm2/Qualcomm/sm8750/pista \

@@ -18,7 +18,8 @@ All features listed below as working have been verified on real Realme GT7 Pro h
 | **USB** | M31 eUSB2 + DWC3 Gadget (CDC NCM / ECM / RNDIS) | Working | `usb0` (`172.16.42.1/24`) SSH & DHCP |
 | **Storage** | UFS (`ufshcd-qcom`) + iSCSI (`iscsi_tcp`) | Working | Read-only stock partition access + remote iSCSI rootfs |
 | **Keys / RTC** | PMK8550 PON Power + Vol+ (`pon_pwrkey` / `pon_resin`), PM8550 GPIO6 Vol- (`gpio-keys`), PM8xxx RTC | Working | Power, Volume Up, and Volume Down all verified in KDE Plasma 6 (`POWER_RESET_QCOM_PON` + `KEYBOARD_GPIO`) |
-| **Audio (Speakers)** | ADSP AudioReach (`q6apm`) + Secondary MI2S (`SD1`) + Dual NXP `TFA9873` (`0x34`/`0x35`) | Working | Stereo speakers verified via ALSA & PipeWire / KDE Plasma 6 (`Built-in Audio Stereo Speakers`), using in-kernel `qcom_pd_mapper`, `Realme-pista.m4` topology, UCM2, and user's own device-signed `adsp.mbn`/`adsp_dtb.mbn` |
+| **Audio (Speakers & Dual Mic)** | ADSP AudioReach (`q6apm`), Secondary MI2S (`SD1`) + Dual NXP `TFA9873` (`0x34`/`0x35`), SoundWire `WCD9395` (`AMIC1` + `AMIC5`) | Working | Stereo speakers & dual internal microphones (stereo 48 kHz capture + full-duplex) verified via ALSA & PipeWire / KDE Plasma 6 (`Built-in Audio Stereo Speakers` / `Internal Microphones`), using in-kernel `qcom_pd_mapper`, `Realme-pista.m4` topology, UCM2, and user's own device-signed `adsp.mbn`/`adsp_dtb.mbn` |
+| **Bluetooth 6.0** | Qualcomm FastConnect 7900 / WCN7860 (`Ganges 2.0`, `0x40210200`) on `uart14` @ 8 Mbps | Working | `btqca` + `hci_uart` (`patches/0008` PeriSS baudrate `0x31`/`0x34` + `gngbtfw20.mbn`/`gngbtnv20.bin`), BlueZ 5.88 + KDE Plasma 6 `bluedevil` + PipeWire `libspa-0.2-bluetooth` (Classic/BLE/A2DP/HFP/LE Audio/HIDP/UHID), real device scan verified |
 | **Battery / Charging** | ADSP `charger_pd` (`pmic_glink` + `qcom_battmgr`) + Oplus hardware fuel gauge (`OEM_READ_BUFFER`) | Working | Real SOC %, 2S 6500 mAh (~25.2 Wh) capacity, hardware SOH health %, cycle count, temperature, charging/discharging hotplug notifications, and **18W USB-PD (9V/2A)** fast charging verified in UPower & KDE Plasma 6 |
 | **Modem / Camera** | WWAN, CamSS | WIP | Not yet enabled |
 
@@ -37,8 +38,12 @@ All features listed below as working have been verified on real Realme GT7 Pro h
 ├── sound/
 │   └── soc/codecs/tfa9874.c                                   # Dual NXP TFA9873/TFA9874 Class-D speaker amp driver
 ├── audio/
-│   ├── topology/Realme-pista.m4                               # AudioReach Secondary MI2S (SD1) topology source
-│   └── ucm2/Qualcomm/sm8750/pista/{Realme-pista,HiFi}.conf    # ALSA UCM2 profile for PipeWire / KDE Plasma 6
+│   ├── topology/Realme-pista.m4                               # AudioReach Secondary MI2S (SD1) + TX3 WCD9395 topology source
+│   └── ucm2/Qualcomm/sm8750/pista/{Realme-pista,HiFi}.conf    # ALSA UCM2 profile (Speakers + Dual Mic) for PipeWire / KDE Plasma 6
+├── bluetooth/
+│   ├── pista-bt-bdaddr.sh                                     # Deterministic persistent BDADDR helper (from /etc/machine-id)
+│   ├── pista-bt-bdaddr.service                                # Systemd oneshot unit for automatic public-addr config
+│   └── 99-pista-bt-bdaddr.rules                               # Udev trigger on hci0 add
 ├── patches/                                                   # Clean patch series against upstream Linux 7.3.6
 │   ├── 0001-arm64-dts-qcom-sm8750-add-realme-pista-and-adreno830.patch
 │   ├── 0002-drm-msm-sm8750-adreno830-dsc-and-qtb500-fixes.patch
@@ -46,7 +51,8 @@ All features listed below as working have been verified on real Realme GT7 Pro h
 │   ├── 0004-input-touchscreen-add-synaptics-tcm2-s3910-spi-driver.patch
 │   ├── 0005-wifi-ath12k-pwrseq-add-wcn7860-peach-support.patch
 │   ├── 0006-asoc-codecs-add-nxp-tfa9873-tfa9874-speaker-amp-driver.patch
-│   └── 0007-power-supply-qcom_battmgr-add-realme-pista-gauge-and-pd18w.patch
+│   ├── 0007-power-supply-qcom_battmgr-add-realme-pista-gauge-and-pd18w.patch
+│   └── 0008-bluetooth-btqca-hci_qca-add-ganges-2.0-wcn7860-support.patch
 ├── boot/
 │   ├── cmdline.txt                                            # UEFI boot kernel command line
 │   ├── init                                                   # Initramfs init (USB NCM + Wi-Fi 7 + iSCSI switch_root)
@@ -54,7 +60,7 @@ All features listed below as working have been verified on real Realme GT7 Pro h
 │   ├── pista-iscsi.conf.example                               # Template for Wi-Fi / iSCSI settings
 │   └── pack_esp_fat16.py                                      # Builds 100 MiB UFS-4K-native FAT16 ESP for recovery_b
 ├── scripts/
-│   ├── apply_patches.sh                                       # Applies patches/0001..0005 to Linux 7.3.6
+│   ├── apply_patches.sh                                       # Applies patches/0001..0008 to Linux 7.3.6
 │   └── build_kernel.sh                                        # Builds ARM64 Image.efi, pista.dtb, and modules
 └── tools/
     ├── pista-kvm-recv.py                                      # Phone uinput USB gaming keyboard/mouse receiver
@@ -98,10 +104,13 @@ This repository intentionally contains **no proprietary firmware blobs**. You mu
 - **Adreno 830 GPU**:
   - `qcom/gen80000_sqe.fw`, `qcom/gen80000_gmu.bin`, `qcom/gen80000_aqe.fw` from upstream `linux-firmware`.
   - Device-signed `qcom/gen80000_zap.mbn` extracted read-only from your own GT7 Pro `vendor_a` image (`/vendor/firmware_mnt` or `super` -> `vendor_a` EROFS).
-- **ADSP AudioReach & Stereo Speakers**:
+- **ADSP AudioReach, Stereo Speakers & Dual Microphones**:
   - Device-signed `qcom/sm8750/realme/pista/adsp.mbn` and `adsp_dtb.mbn` squashed from `adsp.mdt/.b*` and `adsp_dtb.mdt/.b*` inside your own GT7 Pro `modem_a` partition.
   - Compile `audio/topology/Realme-pista.m4` against `linux-msm/audioreach-topology` with `m4` + `alsatplg` (or `libatopology`) to `/lib/firmware/qcom/sm8750/Realme-pista-tplg.bin`.
   - Install `audio/ucm2/Qualcomm/sm8750/pista/{Realme-pista,HiFi}.conf` under `/usr/share/alsa/ucm2/Qualcomm/sm8750/pista/` and symlink `/usr/share/alsa/ucm2/conf.d/sm8750/Realme-GT7Pro-pista-RE6018L1.conf`.
+- **WCN7860 / Ganges 2.0 Bluetooth 6.0**:
+  - Extract `gngbtfw20.mbn` and `gngbtnv20.bin` (and any `gngbtnv20.b*`) read-only from your own GT7 Pro `bluetooth_a` partition (`/dev/disk/by-partlabel/bluetooth_a`, VFAT `image/`) into `/lib/firmware/qca/`.
+  - Install `bluetooth/pista-bt-bdaddr.sh` -> `/usr/local/sbin/`, `bluetooth/pista-bt-bdaddr.service` -> `/etc/systemd/system/`, and `bluetooth/99-pista-bt-bdaddr.rules` -> `/etc/udev/rules.d/` to automatically configure a persistent public BD address on boot.
 
 ### 3. VAB-Safe Booting (Important Safety Notice)
 The Realme GT7 Pro uses Android 15 Virtual A/B (VAB):

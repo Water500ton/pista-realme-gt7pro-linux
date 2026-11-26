@@ -1,0 +1,11 @@
+[Unit]
+Description=Configure Bluetooth public BD address on Realme GT7 Pro
+After=bluetooth.service
+Wants=bluetooth.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/pista-bt-bdaddr.sh
+
+[Install]
+WantedBy=multi-user.target
