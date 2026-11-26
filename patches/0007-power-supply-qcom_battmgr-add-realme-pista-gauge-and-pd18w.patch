@@ -1,0 +1,473 @@
+Subject: [PATCH 7/7] power: supply: qcom_battmgr: add Realme GT7 Pro gauge, health, and 18W PD support
+
+- Initialize battmgr->unit = QCOM_BATTMGR_UNIT_mAh on SM8350/SM8550 variants
+  so charge_full and charge_full_design are reported instead of -ENODATA
+- Fix supplied_to battery name ("qcom-battmgr-bat") and notify both USB and
+  battery power supplies on USB/OEM GLINK notifications (0x50..0x7f)
+- Read Oplus ADSP OEM_READ_BUFFER (opcode 0x10000) to expose real hardware
+  fuel-gauge SOH, cycle count, and 2S dual-cell voltages on Realme GT7 Pro
+  (2S x 3250 mAh = 6500 mAh / ~25.2 Wh pack), with standard Linux ABI
+  current_now sign and real V*I pack power_now
+- Negotiate safe 9V / 2A (18W) USB-PD buck charging via ADSP when a PD/PPS
+  adapter is connected, with automatic 5V thermal/SOC step-down (>=45C or >=95%)
+---
+diff --git a/drivers/power/supply/qcom_battmgr.c b/drivers/power/supply/qcom_battmgr.c
+--- a/drivers/power/supply/qcom_battmgr.c
++++ b/drivers/power/supply/qcom_battmgr.c
+@@ -9,6 +9,7 @@
+ #include <linux/module.h>
+ #include <linux/mutex.h>
+ #include <linux/nvmem-consumer.h>
++#include <linux/of.h>
+ #include <linux/of_device.h>
+ #include <linux/power_supply.h>
+ #include <linux/property.h>
+@@ -99,6 +100,14 @@
+ #define WLS_BOOST_EN			6
+ 
+ #define BATTMGR_CHG_CTRL_LIMIT_EN	0x48
++#define BATTMGR_OEM_PROPERTY_SET	0x300
++#define BATTMGR_OEM_PROPERTY_GET	0x301
++#define BATTMGR_OEM_READ_BUFFER		0x10000
++#define BATTMGR_OEM_BUFFER_WORDS	128
++#define OEM_PROP_USB_ICL		0x05
++#define OEM_PROP_BATT_FCC		0x42
++#define OEM_PROP_PD_VOLT_MV		0x47
++#define BATT_PD_VOLT_MV			0x19
+ #define CHARGE_CTRL_START_THR_MIN	50
+ #define CHARGE_CTRL_START_THR_MAX	95
+ #define CHARGE_CTRL_END_THR_MIN		55
+@@ -146,6 +155,17 @@
+ 	__le32 delta_soc;
+ };
+ 
++struct qcom_battmgr_oem_read_request {
++	struct pmic_glink_hdr hdr;
++	__le32 data_size;
++};
++
++struct qcom_battmgr_oem_read_response {
++	struct pmic_glink_hdr hdr;
++	__le32 data[BATTMGR_OEM_BUFFER_WORDS];
++	__le32 data_size;
++};
++
+ struct qcom_battmgr_message {
+ 	struct pmic_glink_hdr hdr;
+ 	union {
+@@ -308,6 +328,22 @@
+ 	unsigned int current_max;
+ };
+ 
++struct qcom_battmgr_oem {
++	bool valid;
++	bool logged;
++	unsigned long last_update;
++	int temp;
++	int curr;
++	u32 vbat_max;
++	u32 soc_centi;
++	u32 rm_mah;
++	u32 fcc_mah;
++	u32 cc;
++	u32 soh;
++	u32 vbat_min;
++	u32 gauge_type;
++};
++
+ struct qcom_battmgr {
+ 	struct device *dev;
+ 	struct pmic_glink_client *client;
+@@ -331,8 +367,11 @@
+ 	struct qcom_battmgr_ac ac;
+ 	struct qcom_battmgr_usb usb;
+ 	struct qcom_battmgr_wireless wireless;
++	struct qcom_battmgr_oem oem;
+ 
+ 	struct work_struct enable_work;
++	struct delayed_work pd_work;
++	bool pd_9v_active;
+ 
+ 	/*
+ 	 * @lock is used to prevent concurrent power supply requests to the
+@@ -452,6 +491,60 @@
+ 	[POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD] = BATT_CHG_CTRL_END_THR,
+ };
+ 
++static int qcom_battmgr_oem_read_buffer(struct qcom_battmgr *battmgr)
++{
++	struct qcom_battmgr_oem_read_request request = {
++		.hdr.owner = cpu_to_le32(PMIC_GLINK_OWNER_BATTMGR),
++		.hdr.type = cpu_to_le32(PMIC_GLINK_REQ_RESP),
++		.hdr.opcode = cpu_to_le32(BATTMGR_OEM_READ_BUFFER),
++		.data_size = cpu_to_le32(BATTMGR_OEM_BUFFER_WORDS * sizeof(__le32)),
++	};
++	int ret;
++
++	if (battmgr->oem.valid &&
++	    time_before(jiffies, battmgr->oem.last_update + 5 * HZ))
++		return 0;
++
++	ret = qcom_battmgr_request(battmgr, &request, sizeof(request));
++	if (!ret && battmgr->oem.valid)
++		battmgr->oem.last_update = jiffies;
++
++	return ret;
++}
++
++static bool qcom_battmgr_is_pista_2s(struct qcom_battmgr *battmgr)
++{
++	return of_machine_is_compatible("realme,pista") && battmgr->oem.valid;
++}
++
++static void qcom_battmgr_apply_oem_overrides(struct qcom_battmgr *battmgr)
++{
++	const u32 design_uah_2s = 3250000; /* 2S x 3250 mAh = 6500 mAh equiv (~25.2 Wh) */
++
++	if (!battmgr->oem.valid)
++		return;
++
++	if (battmgr->oem.soh > 0 && battmgr->oem.soh <= 100)
++		battmgr->status.soh_percent = battmgr->oem.soh;
++
++	if (battmgr->oem.cc > 0)
++		battmgr->info.cycle_count = battmgr->oem.cc;
++
++	if (qcom_battmgr_is_pista_2s(battmgr)) {
++		battmgr->info.design_capacity = design_uah_2s;
++		if (battmgr->oem.soh > 0 && battmgr->oem.soh <= 100)
++			battmgr->info.last_full_capacity =
++				DIV_ROUND_CLOSEST_ULL((u64)design_uah_2s * battmgr->oem.soh, 100);
++		else if (battmgr->oem.fcc_mah > 0)
++			battmgr->info.last_full_capacity = battmgr->oem.fcc_mah * 1000;
++	} else if (battmgr->oem.fcc_mah > 0) {
++		battmgr->info.last_full_capacity = battmgr->oem.fcc_mah * 1000;
++		if (battmgr->oem.soh > 0 && battmgr->oem.soh <= 100)
++			battmgr->info.design_capacity =
++				DIV_ROUND_CLOSEST_ULL((u64)battmgr->oem.fcc_mah * 100, battmgr->oem.soh) * 1000;
++	}
++}
++
+ static int qcom_battmgr_bat_sm8350_update(struct qcom_battmgr *battmgr,
+ 					  enum power_supply_property psp)
+ {
+@@ -464,7 +557,42 @@
+ 	prop = sm8350_bat_prop_map[psp];
+ 
+ 	mutex_lock(&battmgr->lock);
++	if (psp == POWER_SUPPLY_PROP_POWER_NOW && of_machine_is_compatible("realme,pista")) {
++		/* Compute pack power from 2S voltage and signed current; ADSP BATT_POWER_NOW is invalid */
++		ret = qcom_battmgr_request_property(battmgr, BATTMGR_BAT_PROPERTY_GET, BATT_VOLT_NOW, 0);
++		if (!ret)
++			ret = qcom_battmgr_request_property(battmgr, BATTMGR_BAT_PROPERTY_GET, BATT_CURR_NOW, 0);
++		qcom_battmgr_oem_read_buffer(battmgr);
++		if (!ret) {
++			u32 v_uv = battmgr->status.voltage_now;
++
++			if (qcom_battmgr_is_pista_2s(battmgr) && battmgr->oem.vbat_min > 2000 && v_uv < 5500000)
++				v_uv += battmgr->oem.vbat_min * 1000;
++			battmgr->status.power_now = div_s64((s64)v_uv * battmgr->status.current_now, 1000000);
++		}
++		mutex_unlock(&battmgr->lock);
++		return ret;
++	}
++
+ 	ret = qcom_battmgr_request_property(battmgr, BATTMGR_BAT_PROPERTY_GET, prop, 0);
++	if (psp == POWER_SUPPLY_PROP_STATUS) {
++		qcom_battmgr_request_property(battmgr, BATTMGR_USB_PROPERTY_GET, USB_ONLINE, 0);
++	} else if (psp == POWER_SUPPLY_PROP_CHARGE_FULL ||
++		   psp == POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN ||
++		   psp == POWER_SUPPLY_PROP_STATE_OF_HEALTH ||
++		   psp == POWER_SUPPLY_PROP_CYCLE_COUNT ||
++		   psp == POWER_SUPPLY_PROP_VOLTAGE_NOW ||
++		   psp == POWER_SUPPLY_PROP_VOLTAGE_OCV) {
++		qcom_battmgr_oem_read_buffer(battmgr);
++		if (battmgr->oem.valid) {
++			qcom_battmgr_apply_oem_overrides(battmgr);
++			if (psp == POWER_SUPPLY_PROP_CHARGE_FULL ||
++			    psp == POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN ||
++			    psp == POWER_SUPPLY_PROP_STATE_OF_HEALTH ||
++			    psp == POWER_SUPPLY_PROP_CYCLE_COUNT)
++				ret = 0;
++		}
++	}
+ 	mutex_unlock(&battmgr->lock);
+ 
+ 	return ret;
+@@ -531,6 +659,21 @@
+ 	switch (psp) {
+ 	case POWER_SUPPLY_PROP_STATUS:
+ 		val->intval = battmgr->status.status;
++		if (battmgr->variant != QCOM_BATTMGR_SC8280XP &&
++		    battmgr->variant != QCOM_BATTMGR_X1E80100) {
++			if (battmgr->usb.online || battmgr->wireless.online) {
++				if (val->intval == POWER_SUPPLY_STATUS_DISCHARGING ||
++				    val->intval == POWER_SUPPLY_STATUS_NOT_CHARGING ||
++				    val->intval == POWER_SUPPLY_STATUS_UNKNOWN) {
++					val->intval = (battmgr->status.percent >= 100 &&
++						       battmgr->status.percent != (unsigned int)-1) ?
++						      POWER_SUPPLY_STATUS_FULL :
++						      POWER_SUPPLY_STATUS_CHARGING;
++				}
++			} else if (val->intval == POWER_SUPPLY_STATUS_CHARGING) {
++				val->intval = POWER_SUPPLY_STATUS_DISCHARGING;
++			}
++		}
+ 		break;
+ 	case POWER_SUPPLY_PROP_CHARGE_TYPE:
+ 		val->intval = battmgr->info.charge_type;
+@@ -555,9 +698,14 @@
+ 		break;
+ 	case POWER_SUPPLY_PROP_VOLTAGE_NOW:
+ 		val->intval = battmgr->status.voltage_now;
++		if (qcom_battmgr_is_pista_2s(battmgr) &&
++		    battmgr->oem.vbat_min > 2000 && val->intval < 5500000)
++			val->intval += battmgr->oem.vbat_min * 1000;
+ 		break;
+ 	case POWER_SUPPLY_PROP_VOLTAGE_OCV:
+ 		val->intval = battmgr->status.voltage_ocv;
++		if (qcom_battmgr_is_pista_2s(battmgr) && val->intval < 5500000)
++			val->intval *= 2;
+ 		break;
+ 	case POWER_SUPPLY_PROP_CURRENT_NOW:
+ 		val->intval = battmgr->status.current_now;
+@@ -1214,12 +1362,24 @@
+ 		break;
+ 	case NOTIF_USB_PROPERTY:
+ 		power_supply_changed(battmgr->usb_psy);
++		power_supply_changed(battmgr->bat_psy);
++		if (of_machine_is_compatible("realme,pista"))
++			mod_delayed_work(system_dfl_wq, &battmgr->pd_work, msecs_to_jiffies(1500));
+ 		break;
+ 	case NOTIF_WLS_PROPERTY:
+ 		power_supply_changed(battmgr->wls_psy);
++		power_supply_changed(battmgr->bat_psy);
+ 		break;
+ 	default:
+-		dev_err(battmgr->dev, "unknown notification: %#x\n", notification);
++		if (notification >= 0x50 && notification <= 0x7f) {
++			dev_dbg(battmgr->dev, "oem notification: %#x\n", notification);
++			power_supply_changed(battmgr->usb_psy);
++			power_supply_changed(battmgr->bat_psy);
++			if (of_machine_is_compatible("realme,pista"))
++				mod_delayed_work(system_dfl_wq, &battmgr->pd_work, msecs_to_jiffies(1500));
++		} else {
++			dev_err(battmgr->dev, "unknown notification: %#x\n", notification);
++		}
+ 		break;
+ 	}
+ }
+@@ -1384,6 +1544,10 @@
+ 		battmgr->error = 0;
+ 		break;
+ 	default:
++		if (opcode > BATTMGR_OEM_READ_BUFFER && opcode <= BATTMGR_OEM_READ_BUFFER + 0x20) {
++			dev_dbg(battmgr->dev, "ignoring oem message %#x\n", opcode);
++			return;
++		}
+ 		dev_warn(battmgr->dev, "unknown message %#x\n", opcode);
+ 		break;
+ 	}
+@@ -1460,7 +1624,9 @@
+ 			battmgr->info.voltage_max = le32_to_cpu(resp->intval.value);
+ 			break;
+ 		case BATT_CURR_NOW:
+-			battmgr->status.current_now = le32_to_cpu(resp->intval.value);
++			battmgr->status.current_now = (s32)le32_to_cpu(resp->intval.value);
++			if (of_machine_is_compatible("realme,pista"))
++				battmgr->status.current_now = -battmgr->status.current_now;
+ 			break;
+ 		case BATT_TEMP:
+ 			val = le32_to_cpu(resp->intval.value);
+@@ -1583,11 +1749,65 @@
+ 			break;
+ 		}
+ 		break;
++	case BATTMGR_BAT_PROPERTY_SET:
++	case BATTMGR_USB_PROPERTY_SET:
++	case BATTMGR_WLS_PROPERTY_SET:
++	case BATTMGR_OEM_PROPERTY_SET:
++		if (payload_len == sizeof(resp->intval))
++			battmgr->error = le32_to_cpu(resp->intval.result);
++		else
++			battmgr->error = 0;
++		break;
+ 	case BATTMGR_REQUEST_NOTIFICATION:
+ 	case BATTMGR_CHG_CTRL_LIMIT_EN:
+ 		battmgr->error = 0;
+ 		break;
++	case BATTMGR_OEM_READ_BUFFER: {
++		const struct qcom_battmgr_oem_read_response *oem_resp =
++			(const struct qcom_battmgr_oem_read_response *)resp;
++		u32 data_size;
++
++		if (len >= sizeof(*oem_resp)) {
++			data_size = le32_to_cpu(oem_resp->data_size);
++			if (data_size >= 15 * sizeof(__le32) &&
++			    data_size <= BATTMGR_OEM_BUFFER_WORDS * sizeof(__le32)) {
++				battmgr->oem.temp = (s32)le32_to_cpu(oem_resp->data[0]);
++				battmgr->oem.curr = (s32)le32_to_cpu(oem_resp->data[1]);
++				battmgr->oem.vbat_max = le32_to_cpu(oem_resp->data[2]);
++				battmgr->oem.soc_centi = le32_to_cpu(oem_resp->data[3]);
++				battmgr->oem.rm_mah = le32_to_cpu(oem_resp->data[4]);
++				battmgr->oem.fcc_mah = le32_to_cpu(oem_resp->data[6]);
++				battmgr->oem.cc = le32_to_cpu(oem_resp->data[7]);
++				battmgr->oem.soh = le32_to_cpu(oem_resp->data[8]);
++				battmgr->oem.vbat_min = le32_to_cpu(oem_resp->data[13]);
++				battmgr->oem.gauge_type = le32_to_cpu(oem_resp->data[14]);
++				battmgr->oem.valid = true;
++				if (!battmgr->oem.logged) {
++					battmgr->oem.logged = true;
++					dev_info(battmgr->dev,
++						 "oem gauge: soc=%u.%02u%% rm=%umAh fcc=%umAh cc=%u soh=%u%% v=%u/%umV curr=%d temp=%d type=%u\n",
++						 battmgr->oem.soc_centi / 100,
++						 battmgr->oem.soc_centi % 100,
++						 battmgr->oem.rm_mah,
++						 battmgr->oem.fcc_mah,
++						 battmgr->oem.cc,
++						 battmgr->oem.soh,
++						 battmgr->oem.vbat_max,
++						 battmgr->oem.vbat_min,
++						 battmgr->oem.curr,
++						 battmgr->oem.temp,
++						 battmgr->oem.gauge_type);
++				}
++			}
++		}
++		battmgr->error = 0;
++		break;
++	}
+ 	default:
++		if (opcode > BATTMGR_OEM_READ_BUFFER && opcode <= BATTMGR_OEM_READ_BUFFER + 0x20) {
++			dev_dbg(battmgr->dev, "ignoring oem message %#x\n", opcode);
++			return;
++		}
+ 		dev_warn(battmgr->dev, "unknown message %#x\n", opcode);
+ 		break;
+ 	}
+@@ -1611,6 +1831,85 @@
+ 		qcom_battmgr_sm8350_callback(battmgr, data, len);
+ }
+ 
++static bool qcom_battmgr_usb_is_pd(unsigned int usb_type)
++{
++	return usb_type == POWER_SUPPLY_USB_TYPE_PD ||
++	       usb_type == POWER_SUPPLY_USB_TYPE_PD_DRP ||
++	       usb_type == POWER_SUPPLY_USB_TYPE_PD_PPS;
++}
++
++static int qcom_battmgr_pista_set_pd_voltage(struct qcom_battmgr *battmgr, u32 mv)
++{
++	int ret;
++
++	ret = qcom_battmgr_request_property(battmgr, BATTMGR_OEM_PROPERTY_SET,
++					    OEM_PROP_PD_VOLT_MV, mv);
++	if (!ret)
++		return 0;
++
++	return qcom_battmgr_request_property(battmgr, BATTMGR_BAT_PROPERTY_SET,
++					     BATT_PD_VOLT_MV, mv);
++}
++
++static void qcom_battmgr_pd_worker(struct work_struct *work)
++{
++	struct qcom_battmgr *battmgr =
++		container_of(work, struct qcom_battmgr, pd_work.work);
++	int ret_v, ret_icl;
++	bool is_pd, want_9v;
++
++	if (!battmgr->service_up)
++		return;
++
++	mutex_lock(&battmgr->lock);
++	if (qcom_battmgr_request_property(battmgr, BATTMGR_USB_PROPERTY_GET, USB_ONLINE, 0) ||
++	    !battmgr->usb.online) {
++		battmgr->pd_9v_active = false;
++		mutex_unlock(&battmgr->lock);
++		return;
++	}
++
++	qcom_battmgr_request_property(battmgr, BATTMGR_USB_PROPERTY_GET, USB_ADAP_TYPE, 0);
++	qcom_battmgr_request_property(battmgr, BATTMGR_USB_PROPERTY_GET, USB_VOLT_NOW, 0);
++	qcom_battmgr_request_property(battmgr, BATTMGR_BAT_PROPERTY_GET, BATT_TEMP, 0);
++	qcom_battmgr_request_property(battmgr, BATTMGR_BAT_PROPERTY_GET, BATT_CAPACITY, 0);
++
++	is_pd = qcom_battmgr_usb_is_pd(battmgr->usb.usb_type);
++	want_9v = is_pd &&
++		  battmgr->status.temperature < 420 &&
++		  battmgr->status.percent < 90;
++
++	if (want_9v && (!battmgr->pd_9v_active || battmgr->usb.voltage_now < 7500000)) {
++		ret_v = qcom_battmgr_pista_set_pd_voltage(battmgr, 9000);
++		ret_icl = qcom_battmgr_request_property(battmgr, BATTMGR_USB_PROPERTY_SET,
++							USB_INPUT_CURR_LIMIT, 2000000);
++		if (ret_icl)
++			ret_icl = qcom_battmgr_request_property(battmgr, BATTMGR_OEM_PROPERTY_SET,
++								OEM_PROP_USB_ICL, 2000000);
++		dev_info(battmgr->dev,
++			 "pd 18w req (type=%u vbus=%umV temp=%d soc=%u%%): volt=%d icl=%d\n",
++			 battmgr->usb.usb_type, battmgr->usb.voltage_now / 1000,
++			 battmgr->status.temperature, battmgr->status.percent,
++			 ret_v, ret_icl);
++		if (!ret_v)
++			battmgr->pd_9v_active = true;
++	} else if (battmgr->pd_9v_active &&
++		   (!is_pd || battmgr->status.temperature >= 450 || battmgr->status.percent >= 95)) {
++		ret_v = qcom_battmgr_pista_set_pd_voltage(battmgr, 5000);
++		dev_info(battmgr->dev,
++			 "pd drop to 5v (temp=%d soc=%u%%): ret=%d\n",
++			 battmgr->status.temperature, battmgr->status.percent, ret_v);
++		battmgr->pd_9v_active = false;
++	}
++
++	if (battmgr->pd_9v_active)
++		mod_delayed_work(system_dfl_wq, &battmgr->pd_work, msecs_to_jiffies(30000));
++	mutex_unlock(&battmgr->lock);
++
++	power_supply_changed(battmgr->usb_psy);
++	power_supply_changed(battmgr->bat_psy);
++}
++
+ static void qcom_battmgr_enable_worker(struct work_struct *work)
+ {
+ 	struct qcom_battmgr *battmgr = container_of(work, struct qcom_battmgr, enable_work);
+@@ -1624,6 +1923,9 @@
+ 	ret = qcom_battmgr_request(battmgr, &req, sizeof(req));
+ 	if (ret)
+ 		dev_err(battmgr->dev, "failed to request power notifications\n");
++
++	if (of_machine_is_compatible("realme,pista"))
++		mod_delayed_work(system_dfl_wq, &battmgr->pd_work, msecs_to_jiffies(1500));
+ }
+ 
+ static void qcom_battmgr_pdr_notify(void *priv, int state)
+@@ -1649,7 +1951,7 @@
+ 	{}
+ };
+ 
+-static char *qcom_battmgr_battery[] = { "battery" };
++static char *qcom_battmgr_battery[] = { "qcom-battmgr-bat" };
+ 
+ static int qcom_battmgr_probe(struct auxiliary_device *adev,
+ 			      const struct auxiliary_device_id *id)
+@@ -1717,6 +2019,8 @@
+ 			return dev_err_probe(dev, PTR_ERR(battmgr->wls_psy),
+ 					     "failed to register wireless charing power supply\n");
+ 	} else {
++		battmgr->unit = QCOM_BATTMGR_UNIT_mAh;
++
+ 		if (battmgr->variant == QCOM_BATTMGR_SM8550)
+ 			psy_desc = &sm8550_bat_psy_desc;
+ 		else
+@@ -1743,6 +2047,11 @@
+ 	if (ret)
+ 		return ret;
+ 
++	ret = devm_delayed_work_autocancel(dev, &battmgr->pd_work,
++					   qcom_battmgr_pd_worker);
++	if (ret)
++		return ret;
++
+ 	battmgr->client = devm_pmic_glink_client_alloc(dev, PMIC_GLINK_OWNER_BATTMGR,
+ 						       qcom_battmgr_callback,
+ 						       qcom_battmgr_pdr_notify,

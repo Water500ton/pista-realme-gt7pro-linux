@@ -27,6 +27,12 @@
 		/* cmdline and EFI GOP framebuffer come from UEFI */
 	};
 
+	pmic-glink {
+		compatible = "qcom,sm8750-pmic-glink",
+			     "qcom,sm8550-pmic-glink",
+			     "qcom,pmic-glink";
+	};
+
 	sound {
 		compatible = "qcom,sm8750-sndcard";
 		model = "Realme-pista";
@@ -95,6 +101,22 @@
 		regulator-max-microvolt = <3700000>;
 		regulator-always-on;
 		regulator-boot-on;
+	};
+
+	gpio-keys {
+		compatible = "gpio-keys";
+
+		pinctrl-0 = <&volume_down_n>;
+		pinctrl-names = "default";
+
+		key-volume-down {
+			label = "Volume Down";
+			linux,code = <KEY_VOLUMEDOWN>;
+			gpios = <&pm8550_gpios 6 GPIO_ACTIVE_LOW>;
+			debounce-interval = <15>;
+			linux,can-disable;
+			wakeup-source;
+		};
 	};
 
 	/*
@@ -556,12 +578,22 @@
 	};
 };
 
+&pm8550_gpios {
+	volume_down_n: volume-down-n-state {
+		pins = "gpio6";
+		function = "normal";
+		bias-pull-up;
+		input-enable;
+		power-source = <1>;
+	};
+};
+
 &pon_pwrkey {
 	status = "okay";
 };
 
 &pon_resin {
-	linux,code = <KEY_VOLUMEDOWN>;
+	linux,code = <KEY_VOLUMEUP>;
 	status = "okay";
 };
 

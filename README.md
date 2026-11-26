@@ -17,9 +17,10 @@ All features listed below as working have been verified on real Realme GT7 Pro h
 | **Wi-Fi 7** | Qualcomm FastConnect 7900 / WCN7860 (`peach`, PCI `17cb:110e`) | Working | `ath12k_wifi7`, runtime read-only firmware staging from device `modem_a` |
 | **USB** | M31 eUSB2 + DWC3 Gadget (CDC NCM / ECM / RNDIS) | Working | `usb0` (`172.16.42.1/24`) SSH & DHCP |
 | **Storage** | UFS (`ufshcd-qcom`) + iSCSI (`iscsi_tcp`) | Working | Read-only stock partition access + remote iSCSI rootfs |
-| **Keys / RTC** | PM8550 power/volume keys, PM8xxx RTC | Working | |
+| **Keys / RTC** | PMK8550 PON Power + Vol+ (`pon_pwrkey` / `pon_resin`), PM8550 GPIO6 Vol- (`gpio-keys`), PM8xxx RTC | Working | Power, Volume Up, and Volume Down all verified in KDE Plasma 6 (`POWER_RESET_QCOM_PON` + `KEYBOARD_GPIO`) |
 | **Audio (Speakers)** | ADSP AudioReach (`q6apm`) + Secondary MI2S (`SD1`) + Dual NXP `TFA9873` (`0x34`/`0x35`) | Working | Stereo speakers verified via ALSA & PipeWire / KDE Plasma 6 (`Built-in Audio Stereo Speakers`), using in-kernel `qcom_pd_mapper`, `Realme-pista.m4` topology, UCM2, and user's own device-signed `adsp.mbn`/`adsp_dtb.mbn` |
-| **Modem / Camera / Battery** | WWAN, CamSS, PMIC fuel gauge | WIP | Not yet enabled |
+| **Battery / Charging** | ADSP `charger_pd` (`pmic_glink` + `qcom_battmgr`) + Oplus hardware fuel gauge (`OEM_READ_BUFFER`) | Working | Real SOC %, 2S 6500 mAh (~25.2 Wh) capacity, hardware SOH health %, cycle count, temperature, charging/discharging hotplug notifications, and **18W USB-PD (9V/2A)** fast charging verified in UPower & KDE Plasma 6 |
+| **Modem / Camera** | WWAN, CamSS | WIP | Not yet enabled |
 
 ---
 
@@ -44,7 +45,8 @@ All features listed below as working have been verified on real Realme GT7 Pro h
 │   ├── 0003-drm-panel-add-realme-ab849-dsc-oled-panel-driver.patch
 │   ├── 0004-input-touchscreen-add-synaptics-tcm2-s3910-spi-driver.patch
 │   ├── 0005-wifi-ath12k-pwrseq-add-wcn7860-peach-support.patch
-│   └── 0006-asoc-codecs-add-nxp-tfa9873-tfa9874-speaker-amp-driver.patch
+│   ├── 0006-asoc-codecs-add-nxp-tfa9873-tfa9874-speaker-amp-driver.patch
+│   └── 0007-power-supply-qcom_battmgr-add-realme-pista-gauge-and-pd18w.patch
 ├── boot/
 │   ├── cmdline.txt                                            # UEFI boot kernel command line
 │   ├── init                                                   # Initramfs init (USB NCM + Wi-Fi 7 + iSCSI switch_root)
