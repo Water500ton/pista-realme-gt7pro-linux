@@ -824,10 +824,6 @@
 	status = "disabled";
 };
 
-&nsp_noc {
-	status = "disabled";
-};
-
 /* GT7 Pro stock ADSP image spans 80.5 MiB (0x5080000), larger than upstream 0x3a80000 */
 &adspslpi_mem {
 	reg = <0x0 0x9ee00000 0x0 0x5080000>;
@@ -836,6 +832,12 @@
 &remoteproc_adsp {
 	firmware-name = "qcom/sm8750/realme/pista/adsp.mbn",
 			"qcom/sm8750/realme/pista/adsp_dtb.mbn";
+	status = "okay";
+};
+
+&remoteproc_cdsp {
+	firmware-name = "qcom/sm8750/realme/pista/cdsp.mbn",
+			"qcom/sm8750/realme/pista/cdsp_dtb.mbn";
 	status = "okay";
 };
 

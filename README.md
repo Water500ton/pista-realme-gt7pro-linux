@@ -25,6 +25,7 @@ All features listed below as working have been verified on real Realme GT7 Pro h
 | **Hardware Video Codec** | Qualcomm Iris VPU 3.5 (`qcom,sm8750-iris` + `videocc`) | Working | `/dev/video0` hardware decoder (**H.264 / HEVC / VP9 / AV1**, NV12/P010/UBWC) and `/dev/video1` hardware encoder (**H.264 / HEVC**); end-to-end V4L2 M2M encode+decode loopback verified with user's own device-signed `vpu35_4v.mbn` |
 | **IR Blaster** | QUPv3 `spi5` (`gpio53` MOSI) + PM8550 `L9B` (`2.504V`) + `ir-spi` | Working | Raw 38 kHz LIRC transmitter at `/dev/lirc0` + touch-friendly GTK3 GUI [`ir/pista-remote.py`](ir/pista-remote.py) preloaded with verified Xiaomi TV / Mi Box codes & Flipper-IRDB `.ir` import; verified on real Xiaomi TV |
 | **Sensors (ADSP SSC)** | `fastrpc` (`/dev/fastrpc-adsp-secure`) + patched `hexagonrpcd` + `libssc` + `iio-sensor-proxy` | Working | Live **Accelerometer** (`BMI26x`), **Proximity** (`TCS3720`), **Magnetometer** (`AK09919`), and **Compass / Rotation Vector** (`rotv`) streaming via ADSP SSC & `iio-sensor-proxy` (`monitor-sensor` + KDE Plasma 6 auto-rotate); requires user's own device sensor registry/configs staged read-only from `persist`/`vendor_a`/`odm_a`/`dsp_a` |
+| **NPU (Hexagon V79 CDSP)** | `remoteproc_cdsp` (`qcom,sm8650-cdsp-pas`) + `nsp_noc` + `fastrpc` (`/dev/fastrpc-cdsp`) | Working | Hexagon **V79** (`0x8c79`), **6× 128-byte HVX** vector engines, **8 MiB VTCM** SRAM, 9 SMMU compute context banks, and **Unsigned PD** compute verified end-to-end via DMA-BUF (`fastrpc_shell_unsigned_3`); requires user's own device-signed `cdsp.mbn`/`cdsp_dtb.mbn` + `dsp_a/cdsp/` |
 | **Modem / Camera / Haptics** | WWAN, CamSS, PMIH0108 | WIP | Not yet enabled |
 
 ---
@@ -132,6 +133,8 @@ This repository intentionally contains **no proprietary firmware blobs**. You mu
 - **ADSP SSC Sensors (`sensors/`)**:
   - Extract your own device's sensor files read-only into `/var/lib/pista-sensors/`: `persist/sensors/registry/registry/*` -> `sensors/registry/`, `vendor_a/etc/sensors/config/*` + `odm_a/etc/sensor/config/*` -> `sensors/config/`, `vendor_a/etc/sensors/sns_reg_config` -> `sensors/sns_reg.conf`, `dsp_a/adsp/*` -> `dsp/adsp/`, and populate `socinfo/{hw_platform=MTP,soc_id=618,revision=2.0}`.
   - Build upstream `linux-msm/hexagonrpc` with `sensors/hexagonrpcd-pista.patch` (adds `/odm/etc/sensor/config` virtual mapping and keeps the FastRPC listener alive on SM8750 extended method IDs such as method 36), and install `sensors/79-pista-sensors.rules`, `sensors/hexagonrpcd-override.conf`, and `sensors/iio-sensor-proxy-override.conf`.
+- **Hexagon V79 NPU (CDSP)**:
+  - Squash `cdsp.mdt/.b*` and `cdsp_dtb.mdt/.b*` read-only from your own GT7 Pro `modem_a` partition into `/lib/firmware/qcom/sm8750/realme/pista/cdsp.mbn` and `cdsp_dtb.mbn`, and extract `dsp_a/cdsp/*` (`fastrpc_shell_3`, `fastrpc_shell_unsigned_3`, etc.) into `/usr/lib/qcom/cdsp/`. Add your user to the `fastrpc` group for non-root access to `/dev/fastrpc-cdsp`.
 
 ### 3. VAB-Safe Booting (Important Safety Notice)
 The Realme GT7 Pro uses Android 15 Virtual A/B (VAB):
