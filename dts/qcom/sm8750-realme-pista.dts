@@ -419,14 +419,14 @@
 
 		vreg_s1d_0p97: smps1 {
 			regulator-name = "vreg_s1d_0p97";
-			regulator-min-microvolt = <880000>;
+			regulator-min-microvolt = <976000>;
 			regulator-max-microvolt = <1100000>;
 			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
 		};
 
 		vreg_s4d_0p85: smps4 {
 			regulator-name = "vreg_s4d_0p85";
-			regulator-min-microvolt = <500000>;
+			regulator-min-microvolt = <876000>;
 			regulator-max-microvolt = <1036000>;
 			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
 		};
@@ -464,7 +464,7 @@
 
 		vreg_s5f_0p85: smps5 {
 			regulator-name = "vreg_s5f_0p85";
-			regulator-min-microvolt = <500000>;
+			regulator-min-microvolt = <876000>;
 			regulator-max-microvolt = <1000000>;
 			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
 		};
@@ -474,9 +474,6 @@
 			regulator-min-microvolt = <880000>;
 			regulator-max-microvolt = <920000>;
 			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
-			regulator-allow-set-load;
-			regulator-allowed-modes = <RPMH_REGULATOR_MODE_LPM
-						   RPMH_REGULATOR_MODE_HPM>;
 		};
 
 		vreg_l2f_1p2: ldo2 {
@@ -510,12 +507,9 @@
 
 		vreg_s3g_1p8: smps3 {
 			regulator-name = "vreg_s3g_1p8";
-			regulator-min-microvolt = <1856000>;
+			regulator-min-microvolt = <1864000>;
 			regulator-max-microvolt = <2000000>;
-			regulator-initial-mode = <RPMH_REGULATOR_MODE_LPM>;
-			regulator-allow-set-load;
-			regulator-allowed-modes = <RPMH_REGULATOR_MODE_LPM
-						   RPMH_REGULATOR_MODE_HPM>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
 		};
 
 		vreg_l3g_1p2: ldo3 {
@@ -540,7 +534,7 @@
 
 		vreg_s7i_1p2: smps7 {
 			regulator-name = "vreg_s7i_1p2";
-			regulator-min-microvolt = <1224000>;
+			regulator-min-microvolt = <1312000>;
 			regulator-max-microvolt = <1340000>;
 			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
 		};
@@ -857,6 +851,66 @@
 	firmware-name = "qcom/sm8750/realme/pista/modem.mbn",
 			"qcom/sm8750/realme/pista/modem_dtb.mbn";
 	status = "okay";
+};
+
+&soc {
+	imem@14680000 {
+		compatible = "simple-mfd";
+		reg = <0x0 0x14680000 0x0 0x2c000>;
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges = <0x0 0x0 0x14680000 0x2c000>;
+
+		ipa_modem_tables: modem-tables@3000 {
+			reg = <0x3000 0x2000>;
+		};
+	};
+
+	ipa: ipa@3f40000 {
+		compatible = "qcom,sm8750-ipa";
+
+		iommus = <&apps_smmu 0x4a0 0x0>,
+			 <&apps_smmu 0x4a2 0x0>;
+		reg = <0x0 0x03f40000 0x0 0x10000>,
+		      <0x0 0x03f50000 0x0 0x5000>,
+		      <0x0 0x03e04000 0x0 0xfc000>;
+		reg-names = "ipa-reg",
+			    "ipa-shared",
+			    "gsi";
+
+		interrupts-extended = <&intc GIC_SPI 655 IRQ_TYPE_LEVEL_HIGH>,
+				      <&intc GIC_SPI 432 IRQ_TYPE_LEVEL_HIGH>,
+				      <&ipa_smp2p_in 0 IRQ_TYPE_EDGE_RISING>,
+				      <&ipa_smp2p_in 1 IRQ_TYPE_EDGE_RISING>;
+		interrupt-names = "ipa",
+				  "gsi",
+				  "ipa-clock-query",
+				  "ipa-setup-ready";
+
+		clocks = <&rpmhcc RPMH_IPA_CLK>;
+		clock-names = "core";
+
+		interconnects = <&aggre2_noc MASTER_IPA QCOM_ICC_TAG_ALWAYS
+				 &mc_virt SLAVE_EBI1 QCOM_ICC_TAG_ALWAYS>,
+				<&gem_noc MASTER_APPSS_PROC QCOM_ICC_TAG_ACTIVE_ONLY
+				 &cnoc_main SLAVE_IPA_CFG QCOM_ICC_TAG_ACTIVE_ONLY>;
+		interconnect-names = "memory",
+				     "config";
+
+		qcom,qmp = <&aoss_qmp>;
+
+		qcom,smem-states = <&ipa_smp2p_out 0>,
+				   <&ipa_smp2p_out 1>;
+		qcom,smem-state-names = "ipa-clock-enabled-valid",
+					"ipa-clock-enabled";
+
+		qcom,gsi-loader = "self";
+		memory-region = <&ipa_gsi_mem>;
+		firmware-name = "qcom/sm8750/realme/pista/ipa_fws.mbn";
+		sram = <&ipa_modem_tables>;
+
+		status = "okay";
+	};
 };
 
 &i2c_master_hub_0 {

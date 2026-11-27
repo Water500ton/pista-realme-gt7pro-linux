@@ -26,7 +26,7 @@ All features listed below as working have been verified on real Realme GT7 Pro h
 | **IR Blaster** | QUPv3 `spi5` (`gpio53` MOSI) + PM8550 `L9B` (`2.504V`) + `ir-spi` | Working | Raw 38 kHz LIRC transmitter at `/dev/lirc0` + touch-friendly GTK3 GUI [`ir/pista-remote.py`](ir/pista-remote.py) preloaded with verified Xiaomi TV / Mi Box codes & Flipper-IRDB `.ir` import; verified on real Xiaomi TV |
 | **Sensors (ADSP SSC)** | `fastrpc` (`/dev/fastrpc-adsp-secure`) + patched `hexagonrpcd` + `libssc` + `iio-sensor-proxy` | Working | Live **Accelerometer** (`BMI26x`), **Proximity** (`TCS3720`), **Magnetometer** (`AK09919`), and **Compass / Rotation Vector** (`rotv`) streaming via ADSP SSC & `iio-sensor-proxy` (`monitor-sensor` + KDE Plasma 6 auto-rotate); requires user's own device sensor registry/configs staged read-only from `persist`/`vendor_a`/`odm_a`/`dsp_a` |
 | **NPU (Hexagon V79 CDSP)** | `remoteproc_cdsp` (`qcom,sm8650-cdsp-pas`) + `nsp_noc` + `fastrpc` (`/dev/fastrpc-cdsp`) | Working | Hexagon **V79** (`0x8c79`), **6× 128-byte HVX** vector engines, **8 MiB VTCM** SRAM, 9 SMMU compute context banks, and **Unsigned PD** compute verified end-to-end via DMA-BUF (`fastrpc_shell_unsigned_3`); requires user's own device-signed `cdsp.mbn`/`cdsp_dtb.mbn` + `dsp_a/cdsp/` |
-| **5G Modem (MPSS)** | `remoteproc_mpss` (`qcom,sm8750-mpss-pas`) + `rmtfs_mem@d7c00000` + sandboxed `rmtfs` + `tqftpserv` | Partial | Modem boots on demand (`auto_boot = false`) alongside ADSP & CDSP; 50+ QMI services (`DMS`/`NAS`/`UIM`/`WMS`/`Voice`/`LOC`) & **dual physical USIM slots** verified live via `qmicli -d qrtr://0` using RAM-only EFS sandbox (`/var/lib/pista-rmtfs`, never touches UFS EFS). *Blocked for cellular data/RF online:* mainline Linux 7.3.6 lacks the SM8750 **IPA v5.5** driver (`drivers/net/ipa` currently ends at `sm8550-ipa` v5.0). |
+| **5G Modem (MPSS + IPA v5.5)** | `remoteproc_mpss` (`qcom,sm8750-mpss-pas`) + SM8750 **IPA v5.5** (`qcom,sm8750-ipa`, `rmnet_ipa0` + `rmnet.ko` QMAPv5) + EFS-safe `rmtfs` sandbox + `tqftpserv` | Working | **5G NR SA (`n78` 100 MHz)** & **4G LTE** live network registration, **dual physical USIM slots**, and end-to-end **cellular IPv4 data** (`ping` @ **28.8 ms** RTT + multi-MB HTTP download with QMAPv5 hardware aggregation & checksum offload, 0 errors/drops) verified alongside active Wi-Fi 7 (`wlan0`), ADSP, and CDSP. Uses RAM-only EFS/NV sandbox (`/var/lib/pista-rmtfs`, never touches UFS EFS/NV). *Notes:* `modem/pista-cellular.py` handles clean DPM/WDA/WDS QMAPv5 bringup (upstream `ModemManager 1.24.2` has a DSDS dual-active-slot false SIM-swap quirk); QMI LOC service (`16 v2`) is online (`standalone` / engine lock unlocked), while SM8750 GNSS event registration remains WIP. |
 | **Camera / Haptics / NFC** | CamSS, PMIH0108 HV-Haptics, NXP NFC | WIP | Not yet enabled |
 
 ---
@@ -60,7 +60,8 @@ All features listed below as working have been verified on real Realme GT7 Pro h
 │   ├── hexagonrpcd-override.conf                              # Systemd drop-in (/dev/fastrpc-adsp-secure + /var/lib/pista-sensors/)
 │   └── iio-sensor-proxy-override.conf                         # Systemd drop-in ordering iio-sensor-proxy after hexagonrpcd
 ├── modem/
-│   └── rmtfs-override.conf                                    # EFS-safe RAM-only sandboxed rmtfs systemd drop-in (never writes UFS EFS)
+│   ├── rmtfs-override.conf                                    # EFS-safe RAM-only sandboxed rmtfs systemd drop-in (never writes UFS EFS)
+│   └── pista-cellular.py                                      # QRTR/QMI DPM+WDA+WDS QMAPv5 cellular data helper for rmnet_ipa0
 ├── patches/                                                   # Clean patch series against upstream Linux 7.3.6
 │   ├── 0001-arm64-dts-qcom-sm8750-add-realme-pista-and-adreno830.patch
 │   ├── 0002-drm-msm-sm8750-adreno830-dsc-and-qtb500-fixes.patch
@@ -69,7 +70,8 @@ All features listed below as working have been verified on real Realme GT7 Pro h
 │   ├── 0005-wifi-ath12k-pwrseq-add-wcn7860-peach-support.patch
 │   ├── 0006-asoc-codecs-add-nxp-tfa9873-tfa9874-speaker-amp-driver.patch
 │   ├── 0007-power-supply-qcom_battmgr-add-realme-pista-gauge-and-pd18w.patch
-│   └── 0008-bluetooth-btqca-hci_qca-add-ganges-2.0-wcn7860-support.patch
+│   ├── 0008-bluetooth-btqca-hci_qca-add-ganges-2.0-wcn7860-support.patch
+│   └── 0009-net-ipa-add-sm8750-ipa-v5.5-and-qmi-smem-tlv-support.patch
 ├── boot/
 │   ├── cmdline.txt                                            # UEFI boot kernel command line
 │   ├── init                                                   # Initramfs init (USB NCM + Wi-Fi 7 + iSCSI switch_root)
@@ -77,7 +79,7 @@ All features listed below as working have been verified on real Realme GT7 Pro h
 │   ├── pista-iscsi.conf.example                               # Template for Wi-Fi / iSCSI settings
 │   └── pack_esp_fat16.py                                      # Builds 100 MiB UFS-4K-native FAT16 ESP for recovery_b
 ├── scripts/
-│   ├── apply_patches.sh                                       # Applies patches/0001..0008 to Linux 7.3.6
+│   ├── apply_patches.sh                                       # Applies patches/0001..0009 to Linux 7.3.6
 │   └── build_kernel.sh                                        # Builds ARM64 Image.efi, pista.dtb, and modules
 └── tools/
     ├── pista-kvm-recv.py                                      # Phone uinput USB gaming keyboard/mouse receiver
@@ -92,6 +94,8 @@ All features listed below as working have been verified on real Realme GT7 Pro h
 2. **DSC 1.2 10bpc→8bpp 2-Slices-Per-Packet (`dsi_host.c` + `panel-realme-ab849.c`)**: Uses `CMD_DST_FORMAT_RGB888` when DSC is active on an `RGB101010` panel, programs `DSI_COMMAND_COMPRESSION_MODE_CTRL2_STREAM0_SLICE_WIDTH(bytes_per_pkt)`, and enables `MIPI_DSI_MODE_DSC_ALL_SLICES_IN_PKT` so both 632px horizontal slices pack cleanly into one 1264-byte packet per line.
 3. **Clean Shutdown on Wi-Fi iSCSI Root (`boot/init`)**: Launches `@wpa_supplicant` and `@iscsid` using systemd's `@` `argv[0]` Root Storage Daemon convention so `systemd-shutdown` never tears down Wi-Fi before remounting `/` read-only.
 4. **OBS Studio Preview & Hardware Encoding Tip**: Launch OBS with `MESA_LOADER_DRIVER_OVERRIDE=zink obs` (Adreno 830 Turnip Vulkan backend) to eliminate Wayland PipeWire UBWC preview flicker, and select Custom Output (FFmpeg) with `h264_v4l2m2m` or `hevc_v4l2m2m` (`NV12`) for VPU 3.5 hardware encoding.
+5. **SM8750 IPA v5.5 (`patches/0009` + `dts/qcom/sm8750-realme-pista.dts`)**: Adds SM8750 GSI endpoints (`AP_LAN_RX` ch14/ep17, `AP_MODEM_RX` ch1/ep24, `MODEM_AP_RX` ch7/ep22), SM8750 non-overlapping IPA SRAM partitions, and the three SM8750 `QMI_IPA_INIT_MODEM_DRIVER_REQ` TLVs (`0x23` `hw_filter_stats`, `0x24` `ipa_smem_info`, `0x25` `smem_info`, req size 197) needed to prevent MPSS `IPA_SMEM_ALLOC_EX` assertion on handshake.
+6. **WCN7860 / MPSS Shared SMPS Coexistence (`sm8750-realme-pista.dts`)**: Raises `vreg_s4d_0p85`/`vreg_s5f_0p85` (`876 mV`), `vreg_s7i_1p2` (`1312 mV`), `vreg_s3g_1p8` (`1864 mV` HPM), `vreg_s1d_0p97` (`976 mV`), and `vreg_l1f_0p88` (HPM) to match stock `wlan_peach` requirements so MPSS RF bringup never browns out `1c00000.pcie` (WCN7860 Wi-Fi 7).
 
 ---
 
@@ -138,9 +142,9 @@ This repository intentionally contains **no proprietary firmware blobs**. You mu
   - Build upstream `linux-msm/hexagonrpc` with `sensors/hexagonrpcd-pista.patch` (adds `/odm/etc/sensor/config` virtual mapping and keeps the FastRPC listener alive on SM8750 extended method IDs such as method 36), and install `sensors/79-pista-sensors.rules`, `sensors/hexagonrpcd-override.conf`, and `sensors/iio-sensor-proxy-override.conf`.
 - **Hexagon V79 NPU (CDSP)**:
   - Squash `cdsp.mdt/.b*` and `cdsp_dtb.mdt/.b*` read-only from your own GT7 Pro `modem_a` partition into `/lib/firmware/qcom/sm8750/realme/pista/cdsp.mbn` and `cdsp_dtb.mbn`, and extract `dsp_a/cdsp/*` (`fastrpc_shell_3`, `fastrpc_shell_unsigned_3`, etc.) into `/usr/lib/qcom/cdsp/`. Add your user to the `fastrpc` group for non-root access to `/dev/fastrpc-cdsp`.
-- **5G Modem (MPSS — EFS-Safe Sandbox)**:
-  - Squash `modem.mdt/.b*` and `modem_dtb.mdt/.b*` read-only from `modem_a` into `/lib/firmware/qcom/sm8750/realme/pista/`, copy `modem_pr/`, `modem_oem/`, `pakala/`, `modemr.jsn` for `tqftpserv`, and copy `modemst1`, `modemst2`, `fsg`, `fsc` read-only into `/var/lib/pista-rmtfs/` (symlink `modem_fs1 -> modemst1`, `modem_fs2 -> modemst2`, `modem_fsg -> fsg`, `modem_fsc -> fsc`).
-  - Install `modem/rmtfs-override.conf` -> `/etc/systemd/system/rmtfs.service.d/override.conf` (runs `rmtfs -o /var/lib/pista-rmtfs -r` so Android's UFS EFS partitions are never touched), then start MPSS on demand with `echo start > /sys/class/remoteproc/remoteproc0/state`.
+- **5G Modem (MPSS + IPA v5.5 — EFS-Safe Sandbox)**:
+  - Squash `modem.mdt/.b*`, `modem_dtb.mdt/.b*`, and `ipa_fws.mdt/.b*` read-only from `modem_a` into `/lib/firmware/qcom/sm8750/realme/pista/`, copy `modem_pr/`, `modem_oem/`, `pakala/`, `modemr.jsn` for `tqftpserv`, and copy `modemst1`, `modemst2`, `fsg`, `fsc` (plus `oplusstanvbk_a` -> `oem_stanvbk` and `oplusdycnvbk` -> `oem_dycnvbk` for full RF online calibration) read-only into `/var/lib/pista-rmtfs/` (with symlinks `modem_fs1 -> modemst1`, `modem_fs2 -> modemst2`, `modem_fsg -> fsg`, `modem_fsc -> fsc`).
+  - Install `modem/rmtfs-override.conf` -> `/etc/systemd/system/rmtfs.service.d/override.conf` (runs `rmtfs -o /var/lib/pista-rmtfs -r` so Android's UFS EFS/NV partitions are never touched), start MPSS on demand with `echo start > /sys/class/remoteproc/remoteproc0/state`, enable radio via `qmicli -d qrtr://0 --dms-set-operating-mode=online` (and optionally `--nas-set-system-selection-preference="5gnr|lte|umts|gsm"` for 5G NR SA), and bring up cellular data with `sudo python3 modem/pista-cellular.py --profile 1` (uses QMAPv5 with hardware checksum offload on `rmnet_ipa0` -> `rmnet_data0`).
 
 ### 3. VAB-Safe Booting (Important Safety Notice)
 The Realme GT7 Pro uses Android 15 Virtual A/B (VAB):
