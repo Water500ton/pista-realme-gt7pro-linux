@@ -8,6 +8,7 @@ camera PMICs, SM8750 CAMSS + CCI0/1/2 + MCLK pinctrl, rear 8MP Sony
 IMX355 ultrawide, and front 16MP Sony IMX471 selfie cameras.
 ---
 diff --git a/arch/arm64/boot/dts/qcom/sm8750.dtsi b/arch/arm64/boot/dts/qcom/sm8750.dtsi
+index dd738d1..958c23d 100644
 --- a/arch/arm64/boot/dts/qcom/sm8750.dtsi
 +++ b/arch/arm64/boot/dts/qcom/sm8750.dtsi
 @@ -8,7 +8,9 @@
@@ -20,7 +21,7 @@ diff --git a/arch/arm64/boot/dts/qcom/sm8750.dtsi b/arch/arm64/boot/dts/qcom/sm8
  #include <dt-bindings/clock/qcom,sm8750-tcsr.h>
  #include <dt-bindings/clock/qcom,sm8750-videocc.h>
  #include <dt-bindings/dma/qcom-gpi.h>
-@@ -3495,6 +3497,275 @@
+@@ -3495,6 +3497,275 @@ dispcc: clock-controller@af00000 {
  			#power-domain-cells = <1>;
  		};
  
@@ -296,7 +297,7 @@ diff --git a/arch/arm64/boot/dts/qcom/sm8750.dtsi b/arch/arm64/boot/dts/qcom/sm8
  		camcc: clock-controller@ade0000 {
  			compatible = "qcom,sm8750-camcc";
  			reg = <0x0 0xade0000 0x0 0x20000>;
-@@ -3507,6 +3778,219 @@
+@@ -3507,6 +3778,219 @@ camcc: clock-controller@ade0000 {
  			required-opps = <&rpmhpd_opp_low_svs>,
  					<&rpmhpd_opp_low_svs>;
  
@@ -516,7 +517,7 @@ diff --git a/arch/arm64/boot/dts/qcom/sm8750.dtsi b/arch/arm64/boot/dts/qcom/sm8
  			#clock-cells = <1>;
  			#reset-cells = <1>;
  			#power-domain-cells = <1>;
-@@ -3633,6 +4117,254 @@
+@@ -3633,6 +4117,254 @@ tlmm: pinctrl@f100000 {
  			gpio-ranges = <&tlmm 0 0 216>;
  			wakeup-parent = <&pdc>;
  
@@ -771,7 +772,7 @@ diff --git a/arch/arm64/boot/dts/qcom/sm8750.dtsi b/arch/arm64/boot/dts/qcom/sm8
  			hub_i2c0_data_clk: hub-i2c0-data-clk-state {
  				/* SDA, SCL */
  				pins = "gpio64", "gpio65";
-@@ -5283,6 +6015,44 @@
+@@ -5283,6 +6015,44 @@ tpdm_swao_out: endpoint {
  			};
  		};
  
@@ -818,9 +819,10 @@ diff --git a/arch/arm64/boot/dts/qcom/sm8750.dtsi b/arch/arm64/boot/dts/qcom/sm8
  			reg = <0x0 0x15000000 0x0 0x100000>;
 diff --git a/arch/arm64/boot/dts/qcom/sm8750-realme-pista.dts b/arch/arm64/boot/dts/qcom/sm8750-realme-pista.dts
 new file mode 100644
+index 0000000..b804b20
 --- /dev/null
 +++ b/arch/arm64/boot/dts/qcom/sm8750-realme-pista.dts
-@@ -0,0 +1,1735 @@
+@@ -0,0 +1,1757 @@
 +// SPDX-License-Identifier: BSD-3-Clause
 +/*
 + * Realme GT7 Pro (pista / RMX5010) mainline DT:
@@ -1893,7 +1895,7 @@ new file mode 100644
 +		dovdd-supply = <&vreg_l5m_1p8>;
 +
 +		orientation = <1>;
-+		rotation = <270>;
++		rotation = <90>;
 +
 +		port {
 +			imx355_ep: endpoint {
@@ -1906,6 +1908,15 @@ new file mode 100644
 +};
 +
 +&cci0_i2c1 {
++	/* Rear 50MP Main Wide AF VCM (Asahi Kasei AK7377) */
++	imx906_vcm: ak7377@c {
++		compatible = "asahi-kasei,ak7377";
++		reg = <0x0c>;
++
++		vdd-supply = <&vreg_l3n_2p8>;
++		vio-supply = <&vreg_l5m_1p8>;
++	};
++
 +	/* Rear 50MP Main Wide (Sony IMX906) -> CSIPHY2 (C-PHY 3-trio) */
 +	camera@1a {
 +		compatible = "sony,imx906";
@@ -1923,6 +1934,8 @@ new file mode 100644
 +		vdig-supply = <&vreg_l2m_1p12>;
 +		vio-supply = <&vreg_l5m_1p8>;
 +		vcustom1-supply = <&vreg_l6m_1p8>;
++
++		lens-focus = <&imx906_vcm>;
 +
 +		orientation = <1>;
 +		rotation = <270>;
@@ -1948,6 +1961,15 @@ new file mode 100644
 +};
 +
 +&cci1_i2c0 {
++	/* Rear 50MP 3x Periscope Telephoto AF VCM (Asahi Kasei AK7316) */
++	imx882_vcm: ak7316@2d {
++		compatible = "asahi-kasei,ak7316";
++		reg = <0x2d>;
++
++		vdd-supply = <&vreg_l7n_3p1>;
++		vio-supply = <&vreg_l5m_1p8>;
++	};
++
 +	/* Rear 50MP 3x Periscope Telephoto (Sony IMX882 / LYT-600) -> CSIPHY1 (C-PHY 3-trio) */
 +	camera@1a {
 +		compatible = "sony,imx882";
@@ -1964,6 +1986,8 @@ new file mode 100644
 +		vana-supply = <&vreg_l3m_2p8>;
 +		vdig-supply = <&vreg_l1n_1p1>;
 +		vio-supply = <&vreg_l5m_1p8>;
++
++		lens-focus = <&imx882_vcm>;
 +
 +		orientation = <1>;
 +		rotation = <270>;

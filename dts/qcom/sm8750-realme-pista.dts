@@ -1070,7 +1070,7 @@
 		dovdd-supply = <&vreg_l5m_1p8>;
 
 		orientation = <1>;
-		rotation = <270>;
+		rotation = <90>;
 
 		port {
 			imx355_ep: endpoint {
@@ -1083,6 +1083,15 @@
 };
 
 &cci0_i2c1 {
+	/* Rear 50MP Main Wide AF VCM (Asahi Kasei AK7377) */
+	imx906_vcm: ak7377@c {
+		compatible = "asahi-kasei,ak7377";
+		reg = <0x0c>;
+
+		vdd-supply = <&vreg_l3n_2p8>;
+		vio-supply = <&vreg_l5m_1p8>;
+	};
+
 	/* Rear 50MP Main Wide (Sony IMX906) -> CSIPHY2 (C-PHY 3-trio) */
 	camera@1a {
 		compatible = "sony,imx906";
@@ -1100,6 +1109,8 @@
 		vdig-supply = <&vreg_l2m_1p12>;
 		vio-supply = <&vreg_l5m_1p8>;
 		vcustom1-supply = <&vreg_l6m_1p8>;
+
+		lens-focus = <&imx906_vcm>;
 
 		orientation = <1>;
 		rotation = <270>;
@@ -1125,6 +1136,15 @@
 };
 
 &cci1_i2c0 {
+	/* Rear 50MP 3x Periscope Telephoto AF VCM (Asahi Kasei AK7316) */
+	imx882_vcm: ak7316@2d {
+		compatible = "asahi-kasei,ak7316";
+		reg = <0x2d>;
+
+		vdd-supply = <&vreg_l7n_3p1>;
+		vio-supply = <&vreg_l5m_1p8>;
+	};
+
 	/* Rear 50MP 3x Periscope Telephoto (Sony IMX882 / LYT-600) -> CSIPHY1 (C-PHY 3-trio) */
 	camera@1a {
 		compatible = "sony,imx882";
@@ -1141,6 +1161,8 @@
 		vana-supply = <&vreg_l3m_2p8>;
 		vdig-supply = <&vreg_l1n_1p1>;
 		vio-supply = <&vreg_l5m_1p8>;
+
+		lens-focus = <&imx882_vcm>;
 
 		orientation = <1>;
 		rotation = <270>;

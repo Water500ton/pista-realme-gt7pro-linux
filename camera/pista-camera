@@ -1,12 +1,21 @@
 #!/usr/bin/env python3
-"""Touch-friendly GTK3 + GStreamer libcamera Camera App for Realme GT7 Pro (SM8750)."""
+"""Touch-friendly GTK3 + GStreamer libcamera Camera App with Stock-Calibrated AF
+for Realme GT7 Pro (SM8750 / pista)."""
 
 import datetime
+import fcntl
+import glob
+import json
+import math
 import os
+import struct
 import subprocess
 import sys
+import threading
+import time
 
 import gi
+import numpy as np
 
 gi.require_version("Gtk", "3.0")
 gi.require_version("Gdk", "3.0")
@@ -16,12 +25,51 @@ from PIL import Image
 
 Gst.init(None)
 
+AF_CALIB_PATH = "/etc/pista-camera-af.json"
+V4L2_CID_FOCUS_ABSOLUTE = 0x009A090A
+VIDIOC_S_CTRL = 0xC008561C
+
+# Fallback defaults derived from Realme GT7 Pro Sunny IMX906 / IMX882 EEPROMs
+DEFAULT_AF_CALIB = {
+    "rear_main": {
+        "sensor": "imx906",
+        "vcm": "ak7375 3-000c",
+        "eeprom_bus": 3,
+        "eeprom_addr": 0x50,
+        "dac_inf": 159,
+        "dist_inf_cm": 500,
+        "dac_mid": 303,
+        "dist_mid_cm": 50,
+        "dac_macro": 947,
+        "dist_macro_cm": 10,
+        "dac_min": 115,
+        "dac_max": 985,
+        "dac_hyperfocal": 195,
+    },
+    "rear_tele": {
+        "sensor": "imx882",
+        "vcm": "ak7375 4-002d",
+        "eeprom_bus": 4,
+        "eeprom_addr": 0x50,
+        "dac_inf": 300,
+        "dist_inf_cm": 5300,
+        "dac_mid": 576,
+        "dist_mid_cm": 130,
+        "dac_macro": 851,
+        "dist_macro_cm": 65,
+        "dac_min": 240,
+        "dac_max": 910,
+        "dac_hyperfocal": 400,
+    },
+}
+
 CAMERAS = [
     {
         "key": "rear_main",
         "label": "后置 50MP 主摄 (IMX906)",
         "short": "1× 主摄",
         "path": "/base/soc@0/cci@ac7b000/i2c-bus@1/camera@1a",
+        "vcm_name": "ak7375 3-000c",
         "width": 2048,
         "height": 1536,
         "rot_deg": 270,
@@ -32,9 +80,10 @@ CAMERAS = [
         "label": "后置 8MP 超广角 (IMX355)",
         "short": "0.6× 广角",
         "path": "/base/soc@0/cci@ac7b000/i2c-bus@0/camera@1a",
+        "vcm_name": None,
         "width": 1640,
         "height": 1232,
-        "rot_deg": 270,   # counterclockwise: fixes 90° CW raw sensor orientation
+        "rot_deg": 90,    # clockwise: matches physical ultrawide mounting
         "mirror": False,
     },
     {
@@ -42,6 +91,7 @@ CAMERAS = [
         "label": "后置 50MP 3×潜望长焦 (IMX882)",
         "short": "3× 长焦",
         "path": "/base/soc@0/cci@ac7c000/i2c-bus@0/camera@1a",
+        "vcm_name": "ak7375 4-002d",
         "width": 2048,
         "height": 1536,
         "rot_deg": 270,
@@ -52,6 +102,7 @@ CAMERAS = [
         "label": "前置 16MP 自拍 (IMX471)",
         "short": "前置自拍",
         "path": "/base/soc@0/geniqup@8c0000/i2c@884000/camera@10",
+        "vcm_name": None,
         "width": 1920,
         "height": 1088,
         "rot_deg": 90,    # clockwise for upright portrait
@@ -71,6 +122,551 @@ FLIP_METHOD_MAP = {
     (270, True): "upper-right-diagonal",
 }
 
+
+def find_vcm_subdev(vcm_name: str):
+    if not vcm_name:
+        return None
+    for path in sorted(glob.glob("/sys/class/video4linux/v4l-subdev*/name")):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                if f.read().strip() == vcm_name:
+                    dev_name = os.path.basename(os.path.dirname(path))
+                    return f"/dev/{dev_name}"
+        except OSError:
+            continue
+    return None
+
+
+def load_af_calibration():
+    calib = json.loads(json.dumps(DEFAULT_AF_CALIB))
+    if os.path.isfile(AF_CALIB_PATH):
+        try:
+            with open(AF_CALIB_PATH, "r", encoding="utf-8") as f:
+                user_data = json.load(f)
+            for key, vals in user_data.items():
+                if key in calib and isinstance(vals, dict):
+                    calib[key].update(vals)
+        except Exception:
+            pass
+    return calib
+
+
+def calibrate_eeprom_cli():
+    """Read factory GT24P128G AF calibration (0x0092..0x0097) from hardware (run as root)."""
+    calib = load_af_calibration()
+    for key, spec in [
+        ("rear_main", ("ak7375 3-000c", 3, 500, 50, 10)),
+        ("rear_tele", ("ak7375 4-002d", 4, 5300, 130, 65)),
+    ]:
+        vcm_name, bus, dist_inf, dist_mid, dist_macro = spec
+        subdev = find_vcm_subdev(vcm_name)
+        if not subdev:
+            print(f"[{key}] VCM {vcm_name} not found, keeping default")
+            continue
+        fd = os.open(subdev, os.O_RDWR)
+        try:
+            time.sleep(0.04)
+            r = subprocess.run(
+                ["i2ctransfer", "-y", str(bus), "w2@0x50", "0x00", "0x92", "r6"],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            raw = [int(tok, 16) for tok in r.stdout.strip().split()]
+            if len(raw) == 6:
+                macro_12 = raw[0] | (raw[1] << 8)
+                inf_12 = raw[2] | (raw[3] << 8)
+                mid_12 = raw[4] | (raw[5] << 8)
+                if 200 <= inf_12 < macro_12 <= 4095:
+                    dac_inf = round(inf_12 / 4.0)
+                    dac_macro = round(macro_12 / 4.0)
+                    dac_mid = round(mid_12 / 4.0) if inf_12 < mid_12 < macro_12 else (dac_inf + dac_macro) // 2
+                    dac_min = max(20, dac_inf - 45)
+                    dac_max = min(1000, dac_macro + 45)
+                    # Hyperfocal ~ 1.5m (main) / 3.5m (tele)
+                    d_inf = 100.0 / dist_inf
+                    d_mac = 100.0 / dist_macro
+                    d_hyp = 100.0 / (150.0 if key == "rear_main" else 350.0)
+                    slope = (dac_macro - dac_inf) / max(0.01, (d_mac - d_inf))
+                    dac_hyp = int(round(dac_inf + slope * max(0.0, d_hyp - d_inf)))
+                    calib[key].update({
+                        "dac_inf": dac_inf,
+                        "dac_mid": dac_mid,
+                        "dac_macro": dac_macro,
+                        "dac_min": dac_min,
+                        "dac_max": dac_max,
+                        "dac_hyperfocal": max(dac_min, min(dac_max, dac_hyp)),
+                    })
+                    print(f"[{key}] EEPROM OK: inf={dac_inf}, mid={dac_mid}, macro={dac_macro}, hyp={dac_hyp}")
+        except Exception as exc:
+            print(f"[{key}] EEPROM read failed: {exc}")
+        finally:
+            os.close(fd)
+    with open(AF_CALIB_PATH, "w", encoding="utf-8") as f:
+        json.dump(calib, f, indent=2)
+    os.chmod(AF_CALIB_PATH, 0o644)
+    print(f"Saved calibration to {AF_CALIB_PATH}")
+
+
+def dac_to_distance_str(dac: int, cal: dict) -> str:
+    if not cal:
+        return f"DAC {dac}"
+    dac_inf = cal["dac_inf"]
+    dac_macro = cal["dac_macro"]
+    if dac <= dac_inf + 8:
+        return "∞"
+    d_inf = 100.0 / float(cal.get("dist_inf_cm", 500))
+    d_mac = 100.0 / float(cal.get("dist_macro_cm", 10))
+    frac = max(0.0, (dac - dac_inf) / max(1.0, float(dac_macro - dac_inf)))
+    diopter = d_inf + frac * (d_mac - d_inf)
+    if diopter <= 0.12:
+        return "∞"
+    dist_cm = 100.0 / diopter
+    if dist_cm >= 100.0:
+        return f"{dist_cm / 100.0:.1f}m"
+    return f"{int(round(dist_cm))}cm"
+
+
+class VcmController:
+    """Direct ioctl wrapper around AK7377 / AK7316 V4L2 lens subdevice."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.fd = None
+        self.dev_path = None
+        self.cur_dac = 512
+
+    def open(self, vcm_name: str, initial_dac: int = 512) -> bool:
+        self.close()
+        if not vcm_name:
+            return False
+        dev = find_vcm_subdev(vcm_name)
+        if not dev:
+            return False
+        try:
+            fd = os.open(dev, os.O_RDWR)
+            with self._lock:
+                self.fd = fd
+                self.dev_path = dev
+                self.cur_dac = int(initial_dac)
+            self.set_focus(initial_dac)
+            return True
+        except OSError:
+            return False
+
+    def close(self):
+        with self._lock:
+            fd = self.fd
+            self.fd = None
+            self.dev_path = None
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    def is_open(self) -> bool:
+        return self.fd is not None
+
+    def set_focus(self, dac: int) -> bool:
+        dac = max(0, min(1023, int(round(dac))))
+        with self._lock:
+            if self.fd is None:
+                return False
+            try:
+                fcntl.ioctl(self.fd, VIDIOC_S_CTRL, struct.pack("Ii", V4L2_CID_FOCUS_ABSOLUTE, dac))
+                self.cur_dac = dac
+                return True
+            except OSError:
+                return False
+
+
+class StockStyleAFEngine:
+    """Qualcomm BAF-inspired multi-band CDAF + CAF engine with factory EEPROM calibration.
+
+    Features:
+      - Dual-band spatial focus value (2px Tenengrad + 1px Modified Laplacian SML)
+      - Noise-floor coring + mean-luma^2 normalization (immune to AE shifts & ISO grain)
+      - 3x3 center-weighted ROI matrix (suppresses background edges)
+      - Smart bidirectional coarse sweep with early peak termination
+      - Fine bracket search + 3-point parabolic sub-step peak interpolation
+      - Continuous AF (CAF) scene-change monitor via ROI SAD + FV drop detection
+    """
+
+    STATE_IDLE = "IDLE"
+    STATE_COARSE = "COARSE"
+    STATE_FINE = "FINE"
+    STATE_LOCKED = "LOCKED"
+    STATE_MF = "MF"
+
+    # 3x3 center-weighted Qualcomm BAF zone weights
+    ZONE_WEIGHTS = (
+        (0.50, 0.75, 0.50),
+        (0.75, 1.50, 0.75),
+        (0.50, 0.75, 0.50),
+    )
+
+    def __init__(self, vcm: VcmController, on_update_cb):
+        self.vcm = vcm
+        self.on_update_cb = on_update_cb
+        self._lock = threading.Lock()
+
+        self.cal = None
+        self.caf_enabled = True
+        self.state = self.STATE_IDLE
+        self.roi_norm = (0.5, 0.5)  # (cx, cy) normalized in viewfinder coords
+        self.roi_size = 0.24        # 24% of frame min dimension
+
+        # Sweep state (pipelined FIFO: send 1 DAC per frame, pair with frame latency = 2)
+        self.pipeline_latency = 2   # frames from VCM ioctl to rendered frame in gtksink
+        self.wait_left = 0
+        self.sweep_dacs = []
+        self.send_idx = 0
+        self.inflight_dacs = []     # FIFO queue of commanded DACs waiting to appear
+        self.measured_dacs = []
+        self.measured_fvs = []
+        self.coarse_step = 85
+        self.coarse_min_fv = 0.0
+        self.coarse_peak_fv = 0.0
+        self.fine_step = 24
+
+        # Lock & CAF monitoring state
+        self.locked_dac = 200
+        self.locked_fv = 0.0
+        self.last_fv = 0.0
+        self.prev_patch = None
+        self.fv_drop_count = 0
+        self.motion_active = False
+        self.stable_after_motion = 0
+        self.last_lock_time = 0.0
+        self.warmup_frames = 0
+
+    def configure(self, cal: dict, caf_enabled: bool = True):
+        with self._lock:
+            self.cal = cal
+            self.caf_enabled = caf_enabled
+            self.roi_norm = (0.5, 0.5)
+            self.prev_patch = None
+            self.fv_drop_count = 0
+            self.motion_active = False
+            self.stable_after_motion = 0
+            self.warmup_frames = 5  # let SoftISP AE stabilize on camera start
+            if cal is None:
+                self.state = self.STATE_IDLE
+            elif caf_enabled:
+                self.locked_dac = cal["dac_hyperfocal"]
+                self.state = self.STATE_IDLE
+            else:
+                self.state = self.STATE_MF
+
+    def set_manual(self, dac: int):
+        with self._lock:
+            self.caf_enabled = False
+            self.state = self.STATE_MF
+            self.locked_dac = int(dac)
+        self.vcm.set_focus(dac)
+        self._emit("mf", dac, 0.0)
+
+    def set_caf_enabled(self, enabled: bool):
+        with self._lock:
+            self.caf_enabled = enabled
+            if not enabled:
+                self.state = self.STATE_MF
+            elif self.cal is not None:
+                self.roi_norm = (0.5, 0.5)
+        if enabled and self.cal is not None:
+            self.trigger_af(0.5, 0.5)
+        else:
+            self._emit("mf", self.vcm.cur_dac, self.last_fv)
+
+    def trigger_af(self, cx: float = 0.5, cy: float = 0.5):
+        with self._lock:
+            if not self.cal or not self.vcm.is_open():
+                return
+            self.roi_norm = (
+                max(0.14, min(0.86, float(cx))),
+                max(0.14, min(0.86, float(cy))),
+            )
+            self.warmup_frames = 0
+            self._start_coarse_locked()
+
+    def _begin_pipeline_sweep_locked(self, pts: list, new_state: str):
+        cur = self.vcm.cur_dac
+        self.sweep_dacs = pts
+        self.send_idx = 0
+        self.inflight_dacs = []
+        self.measured_dacs = []
+        self.measured_fvs = []
+        self.state = new_state
+
+        # Command first DAC and prime latency pipeline (wait 1 extra frame on huge jump)
+        first_dac = self.sweep_dacs[0]
+        self.vcm.set_focus(first_dac)
+        self.inflight_dacs.append(first_dac)
+        self.send_idx = 1
+        self.wait_left = self.pipeline_latency + (1 if abs(first_dac - cur) > 300 else 0)
+
+    def _start_coarse_locked(self):
+        c = self.cal
+        d_min = c["dac_min"]
+        d_max = c["dac_max"]
+        span = d_max - d_min
+        # 10 diopter-uniform coarse points (~85-95 DAC on IMX906, ~70 DAC on IMX882)
+        n_steps = 10
+        self.coarse_step = max(30, int(round(span / (n_steps - 1))))
+        pts = [int(round(d_min + i * span / (n_steps - 1))) for i in range(n_steps)]
+
+        # Bidirectional: start from whichever boundary is closer to current lens position
+        if abs(self.vcm.cur_dac - d_max) < abs(self.vcm.cur_dac - d_min):
+            pts.reverse()
+
+        self.coarse_min_fv = float("inf")
+        self.coarse_peak_fv = 0.0
+        self.fv_drop_count = 0
+        self.motion_active = False
+        self.stable_after_motion = 0
+        self.prev_patch = None
+
+        self._begin_pipeline_sweep_locked(pts, self.STATE_COARSE)
+        self._emit("scanning", pts[0], 0.0)
+
+    def _start_fine_locked(self, center_dac: int):
+        c = self.cal
+        d_min = c["dac_min"]
+        d_max = c["dac_max"]
+        self.fine_step = max(10, int(round(self.coarse_step / 3.0)))
+        # 5-point tight fine bracket centered on coarse peak: [-2, -1, 0, +1, +2] * fine_step
+        pts = []
+        for k in (-2, -1, 0, 1, 2):
+            v = max(d_min, min(d_max, int(round(center_dac + k * self.fine_step))))
+            if not pts or pts[-1] != v:
+                pts.append(v)
+        if abs(self.vcm.cur_dac - pts[-1]) < abs(self.vcm.cur_dac - pts[0]):
+            pts.reverse()
+        self._begin_pipeline_sweep_locked(pts, self.STATE_FINE)
+
+    def _finish_lock_locked(self):
+        fvs = self.measured_fvs
+        dacs = self.measured_dacs
+        if not fvs:
+            self.state = self.STATE_LOCKED
+            return
+
+        best_i = int(np.argmax(fvs))
+        best_fv = fvs[best_i]
+        best_dac = dacs[best_i]
+        # Compare against FULL-RANGE coarse baseline (not narrow fine-bracket minimum!)
+        baseline_fv = min(self.coarse_min_fv, min(fvs))
+        peak_overall = max(self.coarse_peak_fv, best_fv)
+
+        # Low-contrast guard: only fall back to hyperfocal if full range had <12% contrast change
+        if peak_overall < 15.0 or (baseline_fv > 0 and (peak_overall / max(baseline_fv, 1e-3)) < 1.12):
+            best_dac = self.cal["dac_hyperfocal"]
+            status = "fallback"
+        else:
+            # 3-point parabolic sub-step interpolation around fine peak
+            if 0 < best_i < len(fvs) - 1:
+                y0, y1, y2 = fvs[best_i - 1], fvs[best_i], fvs[best_i + 1]
+                x0, x1, x2 = dacs[best_i - 1], dacs[best_i], dacs[best_i + 1]
+                denom = (y0 - 2.0 * y1 + y2)
+                if denom < -1e-6:
+                    offset = 0.5 * (y0 - y2) / denom
+                    offset = max(-0.48, min(0.48, offset))
+                    step_dir = (x2 - x0) * 0.5
+                    best_dac = int(round(x1 + offset * step_dir))
+            best_dac = max(self.cal["dac_min"], min(self.cal["dac_max"], best_dac))
+            status = "locked"
+
+        self.vcm.set_focus(best_dac)
+        self.locked_dac = best_dac
+        self.locked_fv = best_fv
+        self.last_lock_time = time.monotonic()
+        self.state = self.STATE_LOCKED
+        self.wait_left = self.pipeline_latency + 1
+        self.prev_patch = None
+        self.fv_drop_count = 0
+        self.motion_active = False
+        self.stable_after_motion = 0
+        self._emit(status, best_dac, best_fv)
+
+    def _compute_baf_metric(self, arr_rgbx: np.ndarray):
+        """Compute Qualcomm BAF-style dual-band center-weighted normalized FV + downsampled patch."""
+        h, w, _ = arr_rgbx.shape
+        cx, cy = self.roi_norm
+        half_w = max(32, int(w * self.roi_size * 0.5))
+        half_h = max(32, int(h * self.roi_size * 0.5))
+        x0 = max(0, min(w - 2 * half_w, int(cx * w) - half_w))
+        y0 = max(0, min(h - 2 * half_h, int(cy * h) - half_h))
+        x1 = min(w, x0 + 2 * half_w)
+        y1 = min(h, y0 + 2 * half_h)
+
+        # Green channel (index 1 for both RGBx and BGRx), subsampled 2x for <1ms CPU time
+        g = arr_rgbx[y0:y1:2, x0:x1:2, 1].astype(np.float32)
+        rh, rw = g.shape
+        if rh < 12 or rw < 12:
+            return 0.0, None
+
+        mean_g = float(g.mean()) + 2.0
+        # Adaptive noise-floor coring (rejects high-ISO sensor grain)
+        thr = max(3.0, 0.022 * mean_g)
+
+        # Coarse band (2-pixel gradient Tenengrad)
+        gx = np.maximum(0.0, np.abs(g[1:-1, 2:] - g[1:-1, :-2]) - thr)
+        gy = np.maximum(0.0, np.abs(g[2:, 1:-1] - g[:-2, 1:-1]) - thr)
+        # Fine band (1-pixel Modified Laplacian SML)
+        lx = np.abs(2.0 * g[1:-1, 1:-1] - g[1:-1, :-2] - g[1:-1, 2:])
+        ly = np.abs(2.0 * g[1:-1, 1:-1] - g[:-2, 1:-1] - g[2:, 1:-1])
+        sml = np.maximum(0.0, lx + ly - thr)
+
+        energy = (gx * gx) + (gy * gy) + 2.0 * (sml * sml)
+
+        # 3x3 center-weighted zone sum
+        eh, ew = energy.shape
+        ys = (0, eh // 3, (2 * eh) // 3, eh)
+        xs = (0, ew // 3, (2 * ew) // 3, ew)
+        wsum = 0.0
+        wtot = 0.0
+        for r in range(3):
+            for c in range(3):
+                wt = self.ZONE_WEIGHTS[r][c]
+                zone = energy[ys[r]:ys[r + 1], xs[c]:xs[c + 1]]
+                if zone.size:
+                    wsum += wt * float(zone.mean())
+                    wtot += wt
+
+        fv = (wsum / max(wtot, 1.0)) / (mean_g * mean_g + 16.0) * 1e5
+
+        # Tiny 16x16 luma patch for CAF scene-change SAD detector
+        sy = max(1, rh // 16)
+        sx = max(1, rw // 16)
+        patch = g[::sy, ::sx] / mean_g
+        return fv, patch
+
+    def process_frame(self, arr_rgbx: np.ndarray):
+        with self._lock:
+            if not self.cal or not self.vcm.is_open():
+                return
+            if self.state == self.STATE_MF:
+                return
+
+            if self.warmup_frames > 0:
+                self.warmup_frames -= 1
+                if self.warmup_frames == 0 and self.caf_enabled and self.state == self.STATE_IDLE:
+                    self._start_coarse_locked()
+                return
+
+            if self.wait_left > 0:
+                self.wait_left -= 1
+                # While priming the latency FIFO (excluding any extra jump-settle frame), feed next DAC
+                if (
+                    self.state in (self.STATE_COARSE, self.STATE_FINE)
+                    and self.wait_left < self.pipeline_latency
+                    and self.send_idx < len(self.sweep_dacs)
+                ):
+                    nxt = self.sweep_dacs[self.send_idx]
+                    self.vcm.set_focus(nxt)
+                    self.inflight_dacs.append(nxt)
+                    self.send_idx += 1
+                return
+
+            fv, patch = self._compute_baf_metric(arr_rgbx)
+            self.last_fv = fv
+
+            if self.state == self.STATE_COARSE:
+                if self.inflight_dacs:
+                    measured_dac = self.inflight_dacs.pop(0)
+                    self.measured_dacs.append(measured_dac)
+                    self.measured_fvs.append(fv)
+                    if fv < self.coarse_min_fv:
+                        self.coarse_min_fv = fv
+                    if fv > self.coarse_peak_fv:
+                        self.coarse_peak_fv = fv
+
+                # Early peak termination once we clearly pass a strong optical peak
+                early_stop = False
+                if len(self.measured_fvs) >= 4:
+                    pk_i = int(np.argmax(self.measured_fvs))
+                    pk_v = self.measured_fvs[pk_i]
+                    mn_v = min(self.measured_fvs[:pk_i + 1])
+                    if (
+                        pk_i <= len(self.measured_fvs) - 3
+                        and pk_v > max(35.0, mn_v * 1.35)
+                        and self.measured_fvs[-1] < pk_v * 0.72
+                        and self.measured_fvs[-2] < pk_v * 0.85
+                    ):
+                        early_stop = True
+
+                if early_stop or (self.send_idx >= len(self.sweep_dacs) and not self.inflight_dacs):
+                    pk_i = int(np.argmax(self.measured_fvs))
+                    pk_dac = self.measured_dacs[pk_i]
+                    self._start_fine_locked(pk_dac)
+                elif self.send_idx < len(self.sweep_dacs):
+                    nxt = self.sweep_dacs[self.send_idx]
+                    self.vcm.set_focus(nxt)
+                    self.inflight_dacs.append(nxt)
+                    self.send_idx += 1
+
+            elif self.state == self.STATE_FINE:
+                if self.inflight_dacs:
+                    measured_dac = self.inflight_dacs.pop(0)
+                    self.measured_dacs.append(measured_dac)
+                    self.measured_fvs.append(fv)
+
+                if self.send_idx >= len(self.sweep_dacs) and not self.inflight_dacs:
+                    self._finish_lock_locked()
+                elif self.send_idx < len(self.sweep_dacs):
+                    nxt = self.sweep_dacs[self.send_idx]
+                    self.vcm.set_focus(nxt)
+                    self.inflight_dacs.append(nxt)
+                    self.send_idx += 1
+
+            elif self.state == self.STATE_LOCKED and self.caf_enabled:
+                now = time.monotonic()
+                # Refresh baseline FV right after settling at final locked DAC
+                if self.prev_patch is None:
+                    self.prev_patch = patch
+                    if fv > self.locked_fv * 0.6:
+                        self.locked_fv = max(self.locked_fv, fv)
+                    return
+
+                # 1.6s anti-hunting cooldown after lock
+                if now - self.last_lock_time < 1.6:
+                    self.prev_patch = patch
+                    return
+
+                sad = 0.0
+                if patch is not None and patch.shape == self.prev_patch.shape:
+                    sad = float(np.mean(np.abs(patch - self.prev_patch)))
+                self.prev_patch = patch
+
+                # Detect camera panning / new subject entering frame -> wait until still -> refocus
+                if sad > 0.075:
+                    self.motion_active = True
+                    self.stable_after_motion = 0
+                    self.fv_drop_count = 0
+                    return
+
+                if self.motion_active:
+                    self.stable_after_motion += 1
+                    if self.stable_after_motion >= 5:
+                        self.motion_active = False
+                        self.stable_after_motion = 0
+                        self._start_coarse_locked()
+                    return
+
+                # Detect sustained defocus (e.g. subject moved closer/farther while phone is still)
+                if self.locked_fv > 30.0 and fv < self.locked_fv * 0.74:
+                    self.fv_drop_count += 1
+                    if self.fv_drop_count >= 6:
+                        self._start_coarse_locked()
+                else:
+                    self.fv_drop_count = 0
+
+    def _emit(self, status: str, dac: int, fv: float):
+        if self.on_update_cb:
+            GLib.idle_add(self.on_update_cb, status, int(dac), float(fv), self.roi_norm)
+
+
 CSS = b"""
 window {
     background-color: #000000;
@@ -78,18 +674,23 @@ window {
 }
 .topbar {
     background-color: rgba(12, 12, 16, 0.92);
-    padding: 12px 16px;
+    padding: 10px 14px;
+}
+.focusbar {
+    background-color: rgba(15, 18, 26, 0.94);
+    padding: 6px 14px;
+    border-top: 1px solid #1f2937;
 }
 .lensbar {
-    background-color: rgba(12, 12, 16, 0.92);
-    padding: 8px 16px 4px 16px;
+    background-color: rgba(12, 12, 16, 0.94);
+    padding: 8px 14px 4px 14px;
 }
 .lens-btn {
     background: #1f2937;
     color: #d1d5db;
     border: 1px solid #374151;
     border-radius: 18px;
-    padding: 8px 12px;
+    padding: 7px 11px;
     font-size: 13px;
     font-weight: 700;
 }
@@ -98,26 +699,46 @@ window {
     color: #ffffff;
     border: 1px solid #60a5fa;
 }
+.af-btn {
+    background: #1f2937;
+    color: #e5e7eb;
+    border: 1px solid #374151;
+    border-radius: 14px;
+    padding: 5px 10px;
+    font-size: 12px;
+    font-weight: 700;
+}
+.af-btn-active {
+    background: #059669;
+    color: #ffffff;
+    border: 1px solid #34d399;
+}
+.dist-lbl {
+    font-size: 12px;
+    font-weight: 700;
+    color: #93c5fd;
+    min-width: 52px;
+}
 .bottombar {
-    background-color: rgba(12, 12, 16, 0.95);
-    padding: 14px 24px 28px 24px;
+    background-color: rgba(12, 12, 16, 0.96);
+    padding: 12px 24px 24px 24px;
 }
 .cam-title {
-    font-size: 16px;
+    font-size: 15px;
     font-weight: 700;
     color: #ffffff;
 }
 .status-lbl {
-    font-size: 13px;
+    font-size: 12px;
     color: #93c5fd;
 }
 .tool-btn {
     background: #1f2937;
     color: #f9fafb;
     border: 1px solid #374151;
-    border-radius: 18px;
-    padding: 8px 14px;
-    font-size: 14px;
+    border-radius: 16px;
+    padding: 6px 11px;
+    font-size: 13px;
     font-weight: 600;
 }
 .tool-btn:active {
@@ -128,10 +749,10 @@ window {
     color: #ffffff;
     border: 1px solid #475569;
     border-radius: 26px;
-    padding: 14px 20px;
+    padding: 13px 18px;
     font-size: 15px;
     font-weight: 700;
-    min-width: 112px;
+    min-width: 108px;
 }
 .switch-btn:active {
     background: #334155;
@@ -140,9 +761,9 @@ window {
     background: #ffffff;
     color: #111827;
     border: 5px solid #9ca3af;
-    border-radius: 44px;
-    min-width: 84px;
-    min-height: 84px;
+    border-radius: 42px;
+    min-width: 80px;
+    min-height: 80px;
     font-size: 16px;
     font-weight: 800;
 }
@@ -170,9 +791,21 @@ class PistaCameraWindow(Gtk.Window):
         self.pipeline = None
         self.sink = None
         self.flip = None
+        self.frame_w = 1536
+        self.frame_h = 2048
         self.pictures_dir = os.path.expanduser("~/Pictures")
         os.makedirs(self.pictures_dir, exist_ok=True)
         self.photo_count = 0
+
+        # Autofocus state
+        self.af_calib = load_af_calibration()
+        self.vcm = VcmController()
+        self.af_engine = StockStyleAFEngine(self.vcm, self.on_af_update)
+        self._slider_updating = False
+        self.reticle_state = None   # None, "scanning", "locked", "fallback"
+        self.reticle_pos = (0.5, 0.5)
+        self.reticle_label = ""
+        self.reticle_until = 0.0
 
         root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         self.add(root)
@@ -201,11 +834,54 @@ class PistaCameraWindow(Gtk.Window):
         self.mirror_btn.connect("clicked", self.on_mirror)
         top.pack_end(self.mirror_btn, False, False, 0)
 
-        # Viewfinder container
+        # Viewfinder with tap-to-focus overlay
+        self.overlay = Gtk.Overlay()
         self.vf_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        root.pack_start(self.vf_box, True, True, 0)
+        self.overlay.add(self.vf_box)
 
-        # Lens selector bar (0.6x / 1x / 3x / Front)
+        self.reticle_area = Gtk.DrawingArea()
+        self.reticle_area.set_hexpand(True)
+        self.reticle_area.set_vexpand(True)
+        self.reticle_area.add_events(
+            Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.TOUCH_MASK
+        )
+        self.reticle_area.connect("draw", self.on_draw_reticle)
+        self.reticle_area.connect("button-press-event", self.on_tap_viewfinder)
+        self.reticle_area.connect("touch-event", self.on_touch_viewfinder)
+        self.overlay.add_overlay(self.reticle_area)
+        root.pack_start(self.overlay, True, True, 0)
+
+        # Focus control bar (shown for AF lenses: IMX906 & IMX882)
+        self.focusbar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.focusbar.get_style_context().add_class("focusbar")
+        root.pack_start(self.focusbar, False, False, 0)
+
+        self.af_mode_btn = Gtk.Button(label="CAF 自动")
+        self.af_mode_btn.get_style_context().add_class("af-btn")
+        self.af_mode_btn.get_style_context().add_class("af-btn-active")
+        self.af_mode_btn.connect("clicked", self.on_toggle_af_mode)
+        self.focusbar.pack_start(self.af_mode_btn, False, False, 0)
+
+        self.refocus_btn = Gtk.Button(label="◎ 对焦")
+        self.refocus_btn.get_style_context().add_class("af-btn")
+        self.refocus_btn.connect("clicked", self.on_refocus_clicked)
+        self.focusbar.pack_start(self.refocus_btn, False, False, 0)
+
+        inf_lbl = Gtk.Label(label="∞")
+        inf_lbl.get_style_context().add_class("dist-lbl")
+        self.focusbar.pack_start(inf_lbl, False, False, 0)
+
+        self.focus_scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 100, 980, 1)
+        self.focus_scale.set_draw_value(False)
+        self.focus_scale.set_hexpand(True)
+        self.focus_scale.connect("value-changed", self.on_focus_slider_changed)
+        self.focusbar.pack_start(self.focus_scale, True, True, 0)
+
+        self.dist_lbl = Gtk.Label(label="∞")
+        self.dist_lbl.get_style_context().add_class("dist-lbl")
+        self.focusbar.pack_start(self.dist_lbl, False, False, 0)
+
+        # Lens selector bar (1x / 0.6x / 3x / Front)
         lensbar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         lensbar.get_style_context().add_class("lensbar")
         lensbar.set_halign(Gtk.Align.CENTER)
@@ -240,14 +916,184 @@ class PistaCameraWindow(Gtk.Window):
 
         self.connect("destroy", self.on_destroy)
         self.show_all()
+        GLib.timeout_add(120, self._tick_reticle_fade)
         GLib.idle_add(self.start_camera)
 
     def current_cam(self):
         return CAMERAS[self.cam_idx]
 
+    def current_cal(self):
+        return self.af_calib.get(self.current_cam()["key"])
+
     def current_flip_method(self):
         c = self.current_cam()
         return FLIP_METHOD_MAP[(c["rot_deg"] % 360, bool(c["mirror"]))]
+
+    def _compute_video_rect(self, alloc_w, alloc_h):
+        """Return (ox, oy, rw, rh) of the aspect-fitted video inside the DrawingArea."""
+        if alloc_w <= 0 or alloc_h <= 0 or self.frame_w <= 0 or self.frame_h <= 0:
+            return 0.0, 0.0, float(alloc_w), float(alloc_h)
+        scale = min(alloc_w / float(self.frame_w), alloc_h / float(self.frame_h))
+        rw = self.frame_w * scale
+        rh = self.frame_h * scale
+        ox = (alloc_w - rw) * 0.5
+        oy = (alloc_h - rh) * 0.5
+        return ox, oy, rw, rh
+
+    def on_draw_reticle(self, widget, cr):
+        if not self.reticle_state:
+            return False
+        now = time.monotonic()
+        if self.reticle_state != "scanning" and now > self.reticle_until:
+            self.reticle_state = None
+            return False
+
+        alloc = widget.get_allocation()
+        ox, oy, rw, rh = self._compute_video_rect(alloc.width, alloc.height)
+        cx = ox + self.reticle_pos[0] * rw
+        cy = oy + self.reticle_pos[1] * rh
+
+        # Alpha fade in last 0.4s
+        alpha = 1.0
+        if self.reticle_state != "scanning":
+            rem = self.reticle_until - now
+            if rem < 0.4:
+                alpha = max(0.0, rem / 0.4)
+
+        if self.reticle_state == "scanning":
+            pulse = 1.0 + 0.08 * math.sin(now * 16.0)
+            size = 44.0 * pulse
+            cr.set_source_rgba(1.0, 0.82, 0.15, 0.95)
+        elif self.reticle_state == "locked":
+            size = 38.0
+            cr.set_source_rgba(0.18, 0.88, 0.45, alpha)
+        else:
+            size = 38.0
+            cr.set_source_rgba(0.95, 0.45, 0.25, alpha)
+
+        # Draw sleek corner brackets
+        cr.set_line_width(2.6)
+        b = 12.0
+        x0, y0 = cx - size, cy - size
+        x1, y1 = cx + size, cy + size
+        for px, py, dx, dy in [
+            (x0, y0, b, b),
+            (x1, y0, -b, b),
+            (x0, y1, b, -b),
+            (x1, y1, -b, -b),
+        ]:
+            cr.move_to(px, py + dy)
+            cr.line_to(px, py)
+            cr.line_to(px + dx, py)
+        cr.stroke()
+
+        # Center dot
+        cr.arc(cx, cy, 2.5, 0, 2 * math.pi)
+        cr.fill()
+
+        # Distance badge below reticle
+        if self.reticle_label:
+            cr.select_font_face("Sans", 0, 1)
+            cr.set_font_size(13)
+            ext = cr.text_extents(self.reticle_label)
+            tx = cx - ext.width * 0.5
+            ty = y1 + 18.0
+            cr.set_source_rgba(0.0, 0.0, 0.0, 0.65 * alpha)
+            cr.rectangle(tx - 6, ty - ext.height - 4, ext.width + 12, ext.height + 8)
+            cr.fill()
+            cr.set_source_rgba(1.0, 1.0, 1.0, 0.95 * alpha)
+            cr.move_to(tx, ty)
+            cr.show_text(self.reticle_label)
+        return False
+
+    def _tick_reticle_fade(self):
+        if self.reticle_state is not None:
+            self.reticle_area.queue_draw()
+        return True
+
+    def _trigger_tap_xy(self, widget, x: float, y: float):
+        if not self.vcm.is_open():
+            return False
+        alloc = widget.get_allocation()
+        ox, oy, rw, rh = self._compute_video_rect(alloc.width, alloc.height)
+        if rw <= 0 or rh <= 0:
+            return False
+        nx = (x - ox) / rw
+        ny = (y - oy) / rh
+        if 0.0 <= nx <= 1.0 and 0.0 <= ny <= 1.0:
+            # Switching back to AF if in MF when user taps viewfinder
+            self._set_af_button_state(True)
+            self.af_engine.caf_enabled = True
+            self.af_engine.trigger_af(nx, ny)
+            return True
+        return False
+
+    def on_tap_viewfinder(self, widget, event):
+        return self._trigger_tap_xy(widget, event.x, event.y)
+
+    def on_touch_viewfinder(self, widget, event):
+        if event.type == Gdk.EventType.TOUCH_BEGIN:
+            return self._trigger_tap_xy(widget, event.x, event.y)
+        return False
+
+    def _set_af_button_state(self, is_af: bool):
+        ctx = self.af_mode_btn.get_style_context()
+        if is_af:
+            self.af_mode_btn.set_label("CAF 自动")
+            ctx.add_class("af-btn-active")
+        else:
+            self.af_mode_btn.set_label("MF 手动")
+            ctx.remove_class("af-btn-active")
+
+    def on_af_update(self, status: str, dac: int, fv: float, roi_norm):
+        cal = self.current_cal()
+        dist = dac_to_distance_str(dac, cal)
+        self._slider_updating = True
+        self.focus_scale.set_value(dac)
+        self._slider_updating = False
+        self.dist_lbl.set_text(dist)
+
+        self.reticle_pos = roi_norm
+        if status == "scanning":
+            self.reticle_state = "scanning"
+            self.reticle_label = "对焦中..."
+            self.status_lbl.set_text(f"正在自动对焦 ({self.current_cam()['short']})...")
+        elif status == "locked":
+            self.reticle_state = "locked"
+            self.reticle_label = f"已合焦 {dist}"
+            self.reticle_until = time.monotonic() + 2.0
+            self.status_lbl.set_text(f"已合焦 · {dist} (DAC {dac}) · Adreno 830 GPU ISP")
+        elif status == "fallback":
+            self.reticle_state = "fallback"
+            self.reticle_label = f"超焦距 {dist}"
+            self.reticle_until = time.monotonic() + 2.0
+            self.status_lbl.set_text(f"低对比度 · 超焦距 {dist} (DAC {dac})")
+        elif status == "mf":
+            self.reticle_state = None
+            self.status_lbl.set_text(f"手动对焦 · {dist} (DAC {dac}) · Adreno 830 GPU ISP")
+        self.reticle_area.queue_draw()
+        return False
+
+    def on_toggle_af_mode(self, _btn):
+        if not self.vcm.is_open():
+            return
+        new_caf = not self.af_engine.caf_enabled
+        self._set_af_button_state(new_caf)
+        self.af_engine.set_caf_enabled(new_caf)
+
+    def on_refocus_clicked(self, _btn):
+        if not self.vcm.is_open():
+            return
+        self._set_af_button_state(True)
+        self.af_engine.caf_enabled = True
+        self.af_engine.trigger_af(0.5, 0.5)
+
+    def on_focus_slider_changed(self, scale):
+        if self._slider_updating or not self.vcm.is_open():
+            return
+        dac = int(round(scale.get_value()))
+        self._set_af_button_state(False)
+        self.af_engine.set_manual(dac)
 
     def update_header(self):
         c = self.current_cam()
@@ -264,19 +1110,64 @@ class PistaCameraWindow(Gtk.Window):
             else:
                 ctx.remove_class("lens-btn-active")
 
+    def _on_sink_buffer(self, pad, info):
+        """GStreamer pad probe on gtksink sink pad: feeds live frames to AF engine."""
+        if not self.vcm.is_open():
+            return Gst.PadProbeReturn.OK
+        buf = info.get_buffer()
+        caps = pad.get_current_caps()
+        if buf is None or caps is None:
+            return Gst.PadProbeReturn.OK
+        s = caps.get_structure(0)
+        w = s.get_value("width")
+        h = s.get_value("height")
+        self.frame_w = w
+        self.frame_h = h
+        ok, mi = buf.map(Gst.MapFlags.READ)
+        if ok:
+            try:
+                bpp = len(mi.data) // max(1, w * h)
+                if bpp >= 3 and len(mi.data) >= w * h * bpp:
+                    arr = np.frombuffer(mi.data, dtype=np.uint8, count=w * h * bpp).reshape((h, w, bpp))
+                    self.af_engine.process_frame(arr)
+            finally:
+                buf.unmap(mi)
+        return Gst.PadProbeReturn.OK
+
     def stop_camera(self):
+        self.reticle_state = None
         if self.pipeline is not None:
             self.pipeline.set_state(Gst.State.NULL)
             self.pipeline = None
         self.sink = None
         self.flip = None
+        self.vcm.close()
         for child in self.vf_box.get_children():
             self.vf_box.remove(child)
 
     def start_camera(self):
         self.stop_camera()
         c = self.current_cam()
+        cal = self.current_cal()
         self.update_header()
+
+        # Open VCM lens actuator if supported on this camera
+        has_vcm = False
+        if c.get("vcm_name") and cal:
+            has_vcm = self.vcm.open(c["vcm_name"], cal["dac_hyperfocal"])
+        if has_vcm:
+            self._slider_updating = True
+            self.focus_scale.set_range(cal["dac_min"], cal["dac_max"])
+            self.focus_scale.set_value(cal["dac_hyperfocal"])
+            self._slider_updating = False
+            self.dist_lbl.set_text(dac_to_distance_str(cal["dac_hyperfocal"], cal))
+            self._set_af_button_state(True)
+            self.af_engine.configure(cal, caf_enabled=True)
+            self.focusbar.show_all()
+        else:
+            self.af_engine.configure(None, caf_enabled=False)
+            self.focusbar.hide()
+
         method = self.current_flip_method()
         desc = (
             f'libcamerasrc camera-name="{c["path"]}" ! '
@@ -289,6 +1180,12 @@ class PistaCameraWindow(Gtk.Window):
             self.pipeline = Gst.parse_launch(desc)
             self.sink = self.pipeline.get_by_name("sink")
             self.flip = self.pipeline.get_by_name("flip")
+
+            # Attach AF buffer probe directly on gtksink's sink pad (post-rotation coords!)
+            sink_pad = self.sink.get_static_pad("sink")
+            if sink_pad and has_vcm:
+                sink_pad.add_probe(Gst.PadProbeType.BUFFER, self._on_sink_buffer)
+
             widget = self.sink.get_property("widget")
             widget.set_hexpand(True)
             widget.set_vexpand(True)
@@ -311,8 +1208,9 @@ class PistaCameraWindow(Gtk.Window):
             _old, new, _pending = msg.parse_state_changed()
             if new == Gst.State.PLAYING:
                 c = self.current_cam()
+                af_txt = " · 闭环自动对焦" if self.vcm.is_open() else " · 定焦"
                 self.status_lbl.set_text(
-                    f"实时预览 · {c['width']}×{c['height']} · Adreno 830 GPU ISP"
+                    f"实时预览 · {c['width']}×{c['height']}{af_txt}"
                 )
 
     def on_gst_error(self, _bus, msg):
@@ -379,5 +1277,8 @@ class PistaCameraWindow(Gtk.Window):
 
 
 if __name__ == "__main__":
+    if "--calibrate-eeprom" in sys.argv:
+        calibrate_eeprom_cli()
+        sys.exit(0)
     win = PistaCameraWindow()
     Gtk.main()
