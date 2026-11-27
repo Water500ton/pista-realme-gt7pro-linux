@@ -1,0 +1,737 @@
+#!/usr/bin/env python3
+"""Computational Photography Still-Capture ISP Engine for Realme GT7 Pro (SM8750 / pista).
+
+Ports core smartphone ISP stages using Realme GT7 Pro optical profiles & factory EEPROM data:
+  - Lucky-frame + FFT phase-correlation burst alignment
+  - Multi-Frame Noise Reduction (MFNR) with shot-noise-adaptive Tukey motion rejection
+  - Multi-Exposure Bracketing HDR via 4-level Laplacian Pyramid Mertens Exposure Fusion
+  - 17x13 RGB Lens Shading Correction (LSC) in linear light with SNR-adaptive corner cap
+  - Multi-scale Local Tone Mapping (LTM) + Filmic S-curve + Skin-safe Vibrance
+  - YCbCr edge-preserving chroma denoise + halo-free cored multi-scale sharpening (ASF)
+  - Standard smartphone EXIF embedding (Make/Model/Lens/FocalLength/FNumber/ISO/Exposure/Focus)
+"""
+
+import datetime
+import fcntl
+import glob
+import json
+import math
+import os
+import struct
+import subprocess
+import time
+
+import numpy as np
+from PIL import Image
+
+V4L2_CID_EXPOSURE = 0x00980911
+V4L2_CID_ANALOGUE_GAIN = 0x009E0903
+VIDIOC_G_CTRL = 0xC008561B
+VIDIOC_S_CTRL = 0xC008561C
+VIDIOC_QUERYCTRL = 0xC0445624
+
+ISP_PROFILE_PATHS = [
+    "/etc/pista-camera-isp.json",
+    "/usr/local/share/pista-camera/pista_isp_profiles.json",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "pista_isp_profiles.json"),
+]
+
+
+def load_isp_profiles():
+    merged = {}
+    # Load built-in/installed golden profiles first, then overlay per-unit EEPROM overrides
+    for path in reversed(ISP_PROFILE_PATHS):
+        if os.path.isfile(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                for k, v in data.items():
+                    if k not in merged:
+                        merged[k] = dict(v)
+                    else:
+                        merged[k].update(v)
+            except Exception:
+                pass
+    return merged
+
+
+def read_eeprom_lsc_17x13(bus: int, addr: int = 0x50, base_off: int = 0x00D0):
+    """Read Sunny/Oplus 17x13x4 10-bit packed LSC mesh via i2ctransfer.
+
+    Sunny GT24P128G packs 51 grid points (255 B) per 256-byte EEPROM page with
+    1 padding byte (0xFF) at offset 255 of each page: 4 * 51 + 17 = 221 points
+    spanning 0x00D0 .. 0x0524 (1109 bytes total).
+    Qualcomm CCI adapter max_read_len is 12 bytes, so read in 10-byte chunks.
+    Packing per grid point (5 bytes):
+      R  = ((b[4] & 0xC0) << 2) | b[0]
+      Gr = ((b[4] & 0x30) << 4) | b[1]
+      Gb = ((b[4] & 0x0C) << 6) | b[2]
+      B  = ((b[4] & 0x03) << 8) | b[3]
+    """
+    total_span = 4 * 256 + 17 * 5  # 1109 bytes (0x00D0 .. 0x0524)
+    raw = bytearray()
+    off = base_off
+    while len(raw) < total_span:
+        chunk = min(10, total_span - len(raw))
+        hi = (off >> 8) & 0xFF
+        lo = off & 0xFF
+        r = subprocess.run(
+            ["i2ctransfer", "-y", str(bus), f"w2@{hex(addr)}", hex(hi), hex(lo), f"r{chunk}"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        raw.extend(int(tok, 16) for tok in r.stdout.strip().split())
+        off += chunk
+
+    r_vals, g_vals, b_vals = [], [], []
+    for k in range(221):
+        pos = (k // 51) * 256 + (k % 51) * 5
+        b0, b1, b2, b3, b4 = raw[pos : pos + 5]
+        rv = ((b4 & 0xC0) << 2) | b0
+        gr = ((b4 & 0x30) << 4) | b1
+        gb = ((b4 & 0x0C) << 6) | b2
+        bv = ((b4 & 0x03) << 8) | b3
+        r_vals.append(max(1.0, float(rv)))
+        g_vals.append(max(1.0, 0.5 * (gr + gb)))
+        b_vals.append(max(1.0, float(bv)))
+
+    # EEPROM stores raw relative sensitivity (center bright, corners dark) -> invert to gain mesh!
+    rc, gc, bc = r_vals[110], g_vals[110], b_vals[110]
+    if rc < 200 or gc < 200 or bc < 200:
+        raise ValueError("Invalid EEPROM LSC center values")
+    r_gain = [round(max(0.85, min(6.5, rc / v)), 3) for v in r_vals]
+    g_gain = [round(max(0.85, min(6.5, gc / v)), 3) for v in g_vals]
+    b_gain = [round(max(0.85, min(6.5, bc / v)), 3) for v in b_vals]
+
+    # Sanity check: 4 corners must be symmetric & brighter gain than center
+    g_corners = [g_gain[0], g_gain[16], g_gain[204], g_gain[220]]
+    if min(g_corners) < 1.15 or (max(g_corners) / min(g_corners)) > 1.45:
+        raise ValueError(f"EEPROM LSC corners asymmetric: {g_corners}")
+    return r_gain, g_gain, b_gain
+
+
+def find_subdev_by_prefix(prefix: str):
+    if not prefix:
+        return None
+    for path in sorted(glob.glob("/sys/class/video4linux/v4l-subdev*/name")):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                if f.read().strip().startswith(prefix):
+                    return f"/dev/{os.path.basename(os.path.dirname(path))}"
+        except OSError:
+            continue
+    return None
+
+
+class SensorControlHelper:
+    """Reads/adjusts live V4L2 exposure & analogue gain for HDR bracketing and EXIF."""
+
+    def __init__(self, sensor_prefix: str):
+        self.dev_path = find_subdev_by_prefix(sensor_prefix)
+
+    def _get_ctrl(self, cid: int):
+        if not self.dev_path:
+            return None
+        try:
+            fd = os.open(self.dev_path, os.O_RDWR)
+            try:
+                buf = bytearray(struct.pack("Ii", cid, 0))
+                fcntl.ioctl(fd, VIDIOC_G_CTRL, buf)
+                _, val = struct.unpack("Ii", buf)
+                return val
+            finally:
+                os.close(fd)
+        except OSError:
+            return None
+
+    def _set_ctrl(self, cid: int, val: int) -> bool:
+        if not self.dev_path:
+            return False
+        try:
+            fd = os.open(self.dev_path, os.O_RDWR)
+            try:
+                fcntl.ioctl(fd, VIDIOC_S_CTRL, struct.pack("Ii", cid, int(val)))
+                return True
+            finally:
+                os.close(fd)
+        except OSError:
+            return False
+
+    def _query_range(self, cid: int):
+        if not self.dev_path:
+            return (4, 4000)
+        try:
+            fd = os.open(self.dev_path, os.O_RDWR)
+            try:
+                buf = bytearray(68)
+                struct.pack_into("I", buf, 0, cid)
+                fcntl.ioctl(fd, VIDIOC_QUERYCTRL, buf)
+                cmin, cmax = struct.unpack_from("ii", buf, 40)
+                return (cmin, cmax)
+            finally:
+                os.close(fd)
+        except OSError:
+            return (4, 4000)
+
+    def get_exposure(self):
+        return self._get_ctrl(V4L2_CID_EXPOSURE)
+
+    def get_gain(self):
+        return self._get_ctrl(V4L2_CID_ANALOGUE_GAIN)
+
+    def get_exposure_range(self):
+        return self._query_range(V4L2_CID_EXPOSURE)
+
+    def get_gain_range(self):
+        return self._query_range(V4L2_CID_ANALOGUE_GAIN)
+
+    def set_exposure(self, val: int) -> bool:
+        lo, hi = self.get_exposure_range()
+        return self._set_ctrl(V4L2_CID_EXPOSURE, max(lo, min(hi, int(val))))
+
+    def set_gain(self, val: int) -> bool:
+        lo, hi = self.get_gain_range()
+        return self._set_ctrl(V4L2_CID_ANALOGUE_GAIN, max(lo, min(hi, int(val))))
+
+    def set_exposure_and_gain(self, exp_val: int, gain_val: int):
+        if exp_val is not None:
+            self.set_exposure(exp_val)
+        if gain_val is not None:
+            self.set_gain(gain_val)
+
+    def compute_ev_bracket(self, sensor_key: str, orig_exp: int, orig_gain: int, mult: float):
+        """Compute (exp_lines, gain_code) for an EV multiplier, spilling into analog gain when shutter saturates."""
+        exp_lo, exp_hi = self.get_exposure_range()
+        g_lo, g_hi = self.get_gain_range()
+        base = 16384.0 if sensor_key in ("rear_main", "rear_tele") else 1024.0
+
+        tgt_exp_f = float(orig_exp) * float(mult)
+        tgt_exp = max(exp_lo, min(exp_hi, int(round(tgt_exp_f))))
+        rem_mult = tgt_exp_f / max(1.0, float(tgt_exp))
+
+        if orig_gain is None:
+            return (tgt_exp, None)
+
+        # Sony SMIA analog gain: G = base / (base - code)
+        cur_g = base / max(32.0, base - float(orig_gain))
+        tgt_g = max(1.0, cur_g * rem_mult)
+        tgt_code = int(round(base - (base / tgt_g)))
+        tgt_code = max(g_lo, min(g_hi, tgt_code))
+        return (tgt_exp, tgt_code)
+
+    def estimate_exif_params(self, sensor_key: str):
+        """Convert V4L2 exposure lines and Sony SMIA gain code to approximate shutter & ISO."""
+        exp_lines = self.get_exposure()
+        gain_code = self.get_gain()
+        # Approximate line time (us) per 30fps mode
+        line_us_map = {
+            "rear_main": 8.6,   # IMX906 ~3850 lines/33.3ms
+            "rear_tele": 8.6,   # IMX882 ~3850 lines/33.3ms
+            "rear_uw": 12.8,    # IMX355 ~2600 lines/33.3ms
+            "front": 14.5,      # IMX471 ~1150 lines/17.3ms
+        }
+        line_us = line_us_map.get(sensor_key, 10.0)
+        exp_sec = (exp_lines * line_us * 1e-6) if exp_lines and exp_lines > 0 else (1.0 / 60.0)
+        exp_sec = max(1e-4, min(0.5, exp_sec))
+
+        # Sony SMIA gain: G = 1024 / (1024 - code) for 10-bit, or 16384/(16384-code) for 14-bit
+        iso = 100
+        if gain_code is not None and gain_code >= 0:
+            if sensor_key in ("rear_main", "rear_tele"):
+                # 14-bit Sony IMX906/IMX882: base ISO 50
+                denom = max(256.0, 16384.0 - float(gain_code))
+                iso = int(round(50.0 * (16384.0 / denom)))
+            else:
+                denom = max(32.0, 1024.0 - float(gain_code))
+                iso = int(round(100.0 * (1024.0 / denom)))
+        iso = max(50, min(12800, iso))
+        return exp_sec, iso
+
+
+# ---------------------------------------------------------------------------
+# Fast Vectorized Image Primitives (Pure NumPy + Pillow, Zero OpenCV Needed)
+# ---------------------------------------------------------------------------
+
+def _box_blur_1d(arr: np.ndarray, radius: int, axis: int) -> np.ndarray:
+    if radius <= 0:
+        return arr
+    pad_w = [(0, 0)] * arr.ndim
+    pad_w[axis] = (radius, radius)
+    padded = np.pad(arr, pad_w, mode="edge")
+    cs = np.cumsum(padded, axis=axis, dtype=np.float32)
+    win = 2 * radius + 1
+    sl_hi = [slice(None)] * arr.ndim
+    sl_lo = [slice(None)] * arr.ndim
+    sl_hi[axis] = slice(win, None)
+    sl_lo[axis] = slice(None, -win)
+    # Prepend zeros along axis for exact cumsum difference
+    zshape = list(padded.shape)
+    zshape[axis] = 1
+    cs0 = np.concatenate([np.zeros(zshape, dtype=np.float32), cs], axis=axis)
+    return (cs0[tuple(sl_hi)] - cs0[tuple(sl_lo)]) / float(win)
+
+
+def _fast_gaussian_approx(arr: np.ndarray, radius: int) -> np.ndarray:
+    """2-pass separable box blur (~Gaussian) in pure NumPy."""
+    out = _box_blur_1d(arr, radius, axis=0)
+    out = _box_blur_1d(out, radius, axis=1)
+    out = _box_blur_1d(out, radius, axis=0)
+    out = _box_blur_1d(out, radius, axis=1)
+    return out
+
+
+def _resize_float_plane(plane: np.ndarray, out_w: int, out_h: int) -> np.ndarray:
+    im = Image.fromarray(plane.astype(np.float32), mode="F")
+    im = im.resize((out_w, out_h), Image.Resampling.BILINEAR)
+    return np.asarray(im, dtype=np.float32)
+
+
+def _downsample_2x(img: np.ndarray) -> np.ndarray:
+    h, w = img.shape[:2]
+    h2 = (h // 2) * 2
+    w2 = (w // 2) * 2
+    sub = img[:h2, :w2]
+    return 0.25 * (sub[0::2, 0::2] + sub[0::2, 1::2] + sub[1::2, 0::2] + sub[1::2, 1::2])
+
+
+def _upsample_to(img: np.ndarray, target_h: int, target_w: int) -> np.ndarray:
+    if img.ndim == 2:
+        return _resize_float_plane(img, target_w, target_h)
+    chans = [_resize_float_plane(img[:, :, c], target_w, target_h) for c in range(img.shape[2])]
+    return np.stack(chans, axis=2)
+
+
+def _frame_sharpness(rgb_u8: np.ndarray) -> float:
+    """Fast center-ROI Tenengrad sharpness for lucky-frame reference selection."""
+    h, w, _ = rgb_u8.shape
+    g = rgb_u8[h // 4 : (3 * h) // 4 : 4, w // 4 : (3 * w) // 4 : 4, 1].astype(np.float32)
+    gx = g[:, 2:] - g[:, :-2]
+    gy = g[2:, :] - g[:-2, :]
+    return float(np.mean(gx * gx) + np.mean(gy * gy))
+
+
+def align_shift_fft(ref_rgb: np.ndarray, mov_rgb: np.ndarray, max_shift: int = 44):
+    """Estimate integer (dy, dx) shift using gradient-based FFT phase correlation.
+
+    Using gradient magnitude makes alignment invariant to EV brightness differences
+    (works equally well for MFNR bursts and EV-bracketed HDR frames).
+    """
+    # 4x downsampled Green channel
+    r = ref_rgb[::4, ::4, 1].astype(np.float32)
+    m = mov_rgb[::4, ::4, 1].astype(np.float32)
+    # Gradient magnitude removes DC and exposure scaling
+    rg = np.abs(r[1:-1, 2:] - r[1:-1, :-2]) + np.abs(r[2:, 1:-1] - r[:-2, 1:-1])
+    mg = np.abs(m[1:-1, 2:] - m[1:-1, :-2]) + np.abs(m[2:, 1:-1] - m[:-2, 1:-1])
+    rg -= rg.mean()
+    mg -= mg.mean()
+
+    h, w = rg.shape
+    win = np.outer(np.hanning(h).astype(np.float32), np.hanning(w).astype(np.float32))
+    F1 = np.fft.rfft2(rg * win)
+    F2 = np.fft.rfft2(mg * win)
+    cross = F1 * np.conj(F2)
+    mag = np.abs(cross) + 1e-6
+    corr = np.fft.irfft2(cross / mag, s=(h, w))
+
+    # Restrict search window to +/- max_shift/4 in downsampled coords
+    lim = max(2, max_shift // 4)
+    # Roll so (0, 0) is at center (lim, lim)
+    c_shift = np.roll(np.roll(corr, lim, axis=0), lim, axis=1)[: 2 * lim + 1, : 2 * lim + 1]
+    iy, ix = np.unravel_index(int(np.argmax(c_shift)), c_shift.shape)
+    dy = (iy - lim) * 4
+    dx = (ix - lim) * 4
+    return int(dy), int(dx)
+
+
+def shift_image(img: np.ndarray, dy: int, dx: int) -> np.ndarray:
+    if dy == 0 and dx == 0:
+        return img
+    h, w = img.shape[:2]
+    out = np.empty_like(img)
+    # Clamp edge pixels instead of wrapping around
+    y_src0 = max(0, -dy)
+    y_src1 = min(h, h - dy)
+    y_dst0 = max(0, dy)
+    y_dst1 = min(h, h + dy)
+    x_src0 = max(0, -dx)
+    x_src1 = min(w, w - dx)
+    x_dst0 = max(0, dx)
+    x_dst1 = min(w, w + dx)
+    out[y_dst0:y_dst1, x_dst0:x_dst1] = img[y_src0:y_src1, x_src0:x_src1]
+    if y_dst0 > 0:
+        out[:y_dst0, :] = out[y_dst0 : y_dst0 + 1, :]
+    if y_dst1 < h:
+        out[y_dst1:, :] = out[y_dst1 - 1 : y_dst1, :]
+    if x_dst0 > 0:
+        out[:, :x_dst0] = out[:, x_dst0 : x_dst0 + 1]
+    if x_dst1 < w:
+        out[:, x_dst1:] = out[:, x_dst1 - 1 : x_dst1]
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Stage 1A: Multi-Frame Noise Reduction (MFNR — Qualcomm mf132 / HDR+ Style)
+# ---------------------------------------------------------------------------
+
+def merge_mfnr_linear(frames_u8: list) -> np.ndarray:
+    """Align & merge a burst of RGB uint8 frames in linear light with motion rejection."""
+    if len(frames_u8) == 1:
+        return np.power(frames_u8[0].astype(np.float32) * (1.0 / 255.0), 2.2)
+
+    # Lucky imaging: pick sharpest frame as reference
+    scores = [_frame_sharpness(f) for f in frames_u8]
+    ref_idx = int(np.argmax(scores))
+    ref_u8 = frames_u8[ref_idx]
+
+    # Convert reference to linear light [0..1]
+    inv255 = np.float32(1.0 / 255.0)
+    ref_srgb = ref_u8.astype(np.float32) * inv255
+    ref_lin = np.power(ref_srgb, 2.2)
+    ref_luma = 0.299 * ref_srgb[:, :, 0] + 0.587 * ref_srgb[:, :, 1] + 0.114 * ref_srgb[:, :, 2]
+
+    # Shot-noise-adaptive motion rejection threshold (stronger tolerance in dark shadows)
+    # In sRGB domain, noise std ~ 0.025..0.06
+    tau = np.clip(0.045 + 0.045 * (1.0 - ref_luma), 0.04, 0.095).astype(np.float32)
+    inv_tau2 = 1.0 / (tau * tau)
+
+    accum = ref_lin.copy()
+    wsum = np.ones(ref_luma.shape, dtype=np.float32)
+
+    for idx, f_u8 in enumerate(frames_u8):
+        if idx == ref_idx:
+            continue
+        dy, dx = align_shift_fft(ref_u8, f_u8)
+        aligned_u8 = shift_image(f_u8, dy, dx)
+        mov_srgb = aligned_u8.astype(np.float32) * inv255
+        # Smoothed per-pixel difference to reject moving objects without reacting to single-pixel noise
+        diff = np.mean(np.abs(mov_srgb - ref_srgb), axis=2)
+        diff_sm = _box_blur_1d(_box_blur_1d(diff, 2, 0), 2, 1)
+        # Smooth Gaussian/Huber temporal weight
+        w = np.exp(-0.5 * (diff_sm * diff_sm) * inv_tau2).astype(np.float32)
+        w = np.where(w < 0.08, 0.0, w)
+
+        mov_lin = np.power(mov_srgb, 2.2)
+        accum += mov_lin * w[:, :, None]
+        wsum += w
+
+    return accum / wsum[:, :, None]
+
+
+# ---------------------------------------------------------------------------
+# Stage 1B: Multi-Exposure Bracketing HDR (Laplacian Pyramid Mertens Fusion)
+# ---------------------------------------------------------------------------
+
+def merge_hdr_mertens_srgb(frames_u8: list) -> np.ndarray:
+    """Fuse aligned multi-exposure [EV-, EV0, EV+] frames via 4-level Mertens Laplacian pyramid."""
+    if len(frames_u8) == 1:
+        return frames_u8[0].astype(np.float32) * (1.0 / 255.0)
+
+    # Use middle (EV0) frame as geometric anchor
+    ref_idx = len(frames_u8) // 2
+    ref_u8 = frames_u8[ref_idx]
+    inv255 = np.float32(1.0 / 255.0)
+
+    imgs = []
+    for idx, f_u8 in enumerate(frames_u8):
+        if idx != ref_idx:
+            dy, dx = align_shift_fft(ref_u8, f_u8)
+            f_u8 = shift_image(f_u8, dy, dx)
+        imgs.append(f_u8.astype(np.float32) * inv255)
+
+    # Check actual luminance spread across captured hardware brackets.
+    # If the brightest bracket saturated at the sensor's max shutter+gain (e.g. dim room),
+    # synthesize a virtual +1.2 EV shadow-lifted bracket in linear light so Mertens fusion
+    # always recovers deep shadows cleanly.
+    if len(imgs) >= 3:
+        m_mid = float(imgs[ref_idx][::8, ::8].mean())
+        m_hi = float(imgs[-1][::8, ::8].mean())
+        if m_mid > 0.02 and m_hi < m_mid * 1.18:
+            lin_hi = np.power(np.clip(imgs[-1], 0.0, 1.0), 2.2)
+            # Smooth highlight-safe +1.2 EV gain (2.3x in shadows, rolls off before clipping)
+            boosted = np.clip((lin_hi * 2.3) / (1.0 + 0.45 * lin_hi), 0.0, 1.0)
+            imgs[-1] = np.power(boosted, 1.0 / 2.2).astype(np.float32)
+
+    weights = []
+    for im in imgs:
+        # Mertens quality metrics: Contrast * Saturation * Well-Exposedness
+        y = 0.299 * im[:, :, 0] + 0.587 * im[:, :, 1] + 0.114 * im[:, :, 2]
+        # Contrast (Laplacian magnitude)
+        yp = np.pad(y, 1, mode="edge")
+        lap = np.abs(4.0 * y - yp[:-2, 1:-1] - yp[2:, 1:-1] - yp[1:-1, :-2] - yp[1:-1, 2:])
+        # Saturation (RGB standard deviation)
+        mu = (im[:, :, 0] + im[:, :, 1] + im[:, :, 2]) * (1.0 / 3.0)
+        sat = np.sqrt(
+            ((im[:, :, 0] - mu) ** 2 + (im[:, :, 1] - mu) ** 2 + (im[:, :, 2] - mu) ** 2) * (1.0 / 3.0)
+            + 1e-6
+        )
+        # Well-exposedness (Gaussian around 0.5, sigma=0.22)
+        d0 = im[:, :, 0] - 0.5
+        d1 = im[:, :, 1] - 0.5
+        d2 = im[:, :, 2] - 0.5
+        exp_w = np.exp(-0.5 * (d0 * d0 + d1 * d1 + d2 * d2) / (0.22 * 0.22))
+
+        w = (lap + 0.02) * (sat + 0.05) * (exp_w + 1e-3)
+        weights.append(w.astype(np.float32))
+
+    # Normalize weights across exposures
+    w_tot = np.zeros_like(weights[0])
+    for w in weights:
+        w_tot += w
+    w_tot = np.maximum(w_tot, 1e-6)
+    weights = [w / w_tot for w in weights]
+
+    # 4-level Gaussian/Laplacian Pyramid blend (eliminates seam halos!)
+    levels = 4
+    n_exp = len(imgs)
+    g_imgs = [[im] for im in imgs]
+    g_wts = [[w] for w in weights]
+    for _ in range(levels - 1):
+        for k in range(n_exp):
+            g_imgs[k].append(_downsample_2x(g_imgs[k][-1]))
+            g_wts[k].append(_downsample_2x(g_wts[k][-1]))
+
+    # Blend coarsest level
+    fused = np.zeros_like(g_imgs[0][-1])
+    for k in range(n_exp):
+        fused += g_imgs[k][-1] * g_wts[k][-1][:, :, None]
+
+    # Reconstruct fine-to-coarse Laplacian levels
+    for lv in range(levels - 2, -1, -1):
+        th, tw = g_imgs[0][lv].shape[:2]
+        fused = _upsample_to(fused, th, tw)
+        for k in range(n_exp):
+            up_k = _upsample_to(g_imgs[k][lv + 1], th, tw)
+            lap_k = g_imgs[k][lv] - up_k
+            fused += lap_k * g_wts[k][lv][:, :, None]
+
+    return np.clip(fused, 0.0, 1.0)
+
+
+# ---------------------------------------------------------------------------
+# Stage 2: Stock 17x13 Lens Shading Correction (LSC) in Linear Light
+# ---------------------------------------------------------------------------
+
+def _transform_mesh(mesh_2d: np.ndarray, rot_deg: int, mirror: bool) -> np.ndarray:
+    """Apply the exact same clockwise rotation + horizontal flip as GStreamer videoflip."""
+    k_ccw = (-int(rot_deg // 90)) % 4  # np.rot90 rotates CCW
+    out = np.rot90(mesh_2d, k=k_ccw)
+    if mirror:
+        out = np.fliplr(out)
+    return out
+
+
+def apply_lsc_linear(lin_rgb: np.ndarray, profile: dict, rot_deg: int, mirror: bool) -> np.ndarray:
+    if not profile or "lsc_r" not in profile:
+        return lin_rgb
+    h, w, _ = lin_rgb.shape
+    lw = int(profile.get("lsc_w", 17))
+    lh = int(profile.get("lsc_h", 13))
+    base_strength = float(profile.get("lsc_strength", 0.60))
+
+    # Adapt LSC strength slightly downward in very dark scenes to avoid boosting corner shadow noise
+    mean_lin = float(np.mean(lin_rgb))
+    if mean_lin < 0.04:
+        strength = base_strength * 0.65
+    elif mean_lin < 0.10:
+        strength = base_strength * 0.82
+    else:
+        strength = base_strength
+
+    # Build transformed 17x13 -> (h, w) RGB gain map
+    gains = []
+    for key in ("lsc_r", "lsc_g", "lsc_b"):
+        m = np.asarray(profile[key], dtype=np.float32).reshape((lh, lw))
+        m = _transform_mesh(m, rot_deg, mirror)
+        # Dampen corner boost: gain_eff = 1 + strength * (gain - 1), capped cleanly at 2.6x
+        m_eff = np.clip(1.0 + strength * (m - 1.0), 0.90, 2.60)
+        gains.append(_resize_float_plane(m_eff, w, h))
+    gain_map = np.stack(gains, axis=2)
+
+    # Highlight-preserving knee: fade LSC boost smoothly on near-clipped highlights (>0.75 linear)
+    peak_c = np.max(lin_rgb, axis=2, keepdims=True)
+    hl_protect = np.clip((1.0 - peak_c) * 4.0, 0.25, 1.0)
+    eff_gain = 1.0 + (gain_map - 1.0) * hl_protect
+    return np.clip(lin_rgb * eff_gain, 0.0, 1.4)
+
+
+# ---------------------------------------------------------------------------
+# Stage 3: Stock-Inspired Local Tone Mapping (LTM) + Filmic S-Curve + Vibrance
+# ---------------------------------------------------------------------------
+
+def apply_ltm_and_filmic(lin_rgb: np.ndarray, profile: dict) -> np.ndarray:
+    ltm_str = float(profile.get("ltm_strength", 0.32)) if profile else 0.32
+    vibrance = float(profile.get("vibrance", 0.12)) if profile else 0.12
+
+    # Compute linear luma and smooth low-frequency illumination envelope (8x downsampled)
+    y = np.maximum(1e-4, 0.2126 * lin_rgb[:, :, 0] + 0.7152 * lin_rgb[:, :, 1] + 0.0722 * lin_rgb[:, :, 2])
+    h, w = y.shape
+    log_y = np.log2(y + 0.005)
+    # Fast coarse envelope (downsample 8x, Gaussian blur, upsample)
+    ds = _downsample_2x(_downsample_2x(_downsample_2x(log_y)))
+    env_ds = _fast_gaussian_approx(ds, 6)
+    env = _resize_float_plane(env_ds, w, h)
+
+    # Local Tone Mapping: lift dark regions (env < -2.2), gently compress bright highlights (env > -0.5)
+    target_mid = -1.65
+    delta = (target_mid - env) * ltm_str
+    # Limit shadow lift to +0.85 EV and highlight compression to -0.55 EV for natural look
+    delta = np.clip(delta, -0.55, 0.85)
+    gain_ltm = np.power(2.0, delta).astype(np.float32)
+    mapped = lin_rgb * gain_ltm[:, :, None]
+
+    # Filmic highlight shoulder (Reinhard-extended soft rolloff prevents harsh clipping)
+    white_pt = 1.35
+    mapped = (mapped * (1.0 + mapped / (white_pt * white_pt))) / (1.0 + mapped)
+    mapped = np.clip(mapped, 0.0, 1.0)
+
+    # Linear -> sRGB gamma
+    srgb = np.power(mapped, 1.0 / 2.2)
+
+    # Subtle Filmic S-curve contrast in sRGB (deepens blacks slightly, pops midtones)
+    # s(x) = x + c * x * (1 - x) * (x - 0.5)
+    srgb = np.clip(srgb + 0.28 * srgb * (1.0 - srgb) * (srgb - 0.48), 0.0, 1.0)
+
+    # Smart Vibrance (boosts muted colors more than already-vivid skin/reds)
+    if vibrance > 0.0:
+        mx = np.max(srgb, axis=2, keepdims=True)
+        mn = np.min(srgb, axis=2, keepdims=True)
+        sat = (mx - mn) / (mx + 1e-4)
+        luma = (0.299 * srgb[:, :, 0:1] + 0.587 * srgb[:, :, 1:2] + 0.114 * srgb[:, :, 2:3])
+        boost = 1.0 + vibrance * (1.0 - sat) * np.clip(luma * 2.5, 0.0, 1.0)
+        srgb = np.clip(luma + (srgb - luma) * boost, 0.0, 1.0)
+
+    return srgb
+
+
+# ---------------------------------------------------------------------------
+# Stage 4: YCbCr Edge-Preserving Chroma Denoise + Halo-Free Multi-Scale ASF
+# ---------------------------------------------------------------------------
+
+def apply_denoise_and_asf(srgb: np.ndarray, profile: dict, is_night: bool = False) -> np.ndarray:
+    sharpen = float(profile.get("sharpen", 0.42)) if profile else 0.42
+    if is_night:
+        sharpen *= 0.80  # gentler sharpening in night mode
+
+    r, g, b = srgb[:, :, 0], srgb[:, :, 1], srgb[:, :, 2]
+    # BT.709 / sRGB YCbCr
+    y = 0.299 * r + 0.587 * g + 0.114 * b
+    cb = -0.168736 * r - 0.331264 * g + 0.5 * b
+    cr = 0.5 * r - 0.418688 * g - 0.081312 * b
+
+    # 1. Edge-preserving Chroma Denoise (eliminates color blotches in shadows!)
+    yp = np.pad(y, 1, mode="edge")
+    grad = np.abs(yp[1:-1, 2:] - yp[1:-1, :-2]) + np.abs(yp[2:, 1:-1] - yp[:-2, 1:-1])
+    edge_mask = np.clip(grad * 9.0, 0.0, 1.0)  # 0 on flat noisy areas, 1 on crisp edges
+    c_rad = 4 if is_night else 3
+    cb_sm = _fast_gaussian_approx(cb, c_rad)
+    cr_sm = _fast_gaussian_approx(cr, c_rad)
+    # Apply stronger chroma smoothing in dark regions where chroma noise lives
+    dark_w = np.clip(1.15 - y * 0.9, 0.35, 1.0)
+    blend = (1.0 - edge_mask) * dark_w
+    cb = cb * (1.0 - blend) + cb_sm * blend
+    cr = cr * (1.0 - blend) + cr_sm * blend
+
+    # 2. Multi-Scale Halo-Free Sharpening (Qualcomm ASF352 style with noise coring + clamp)
+    y_fine = _box_blur_1d(_box_blur_1d(y, 1, 0), 1, 1)
+    y_med = _box_blur_1d(_box_blur_1d(y, 3, 0), 3, 1)
+    det_fine = y - y_fine
+    det_med = y_fine - y_med
+
+    # Adaptive noise coring (dead-zone rejects sensor grain in flat shadows)
+    core_thr = 0.018 if is_night else 0.012
+    det_fine_c = np.sign(det_fine) * np.maximum(0.0, np.abs(det_fine) - core_thr)
+    det_med_c = np.sign(det_med) * np.maximum(0.0, np.abs(det_med) - core_thr * 0.7)
+
+    # Overshoot clamp prevents harsh white halos on high-contrast silhouettes
+    detail = np.clip(sharpen * det_fine_c + (sharpen * 0.45) * det_med_c, -0.085, 0.085)
+    y = np.clip(y + detail, 0.0, 1.0)
+
+    # YCbCr -> sRGB
+    ro = np.clip(y + 1.402 * cr, 0.0, 1.0)
+    go = np.clip(y - 0.344136 * cb - 0.714136 * cr, 0.0, 1.0)
+    bo = np.clip(y + 1.772 * cb, 0.0, 1.0)
+    return np.stack([ro, go, bo], axis=2)
+
+
+# ---------------------------------------------------------------------------
+# Stage 5: Real Smartphone EXIF Builder + Top-Level Develop Entrypoint
+# ---------------------------------------------------------------------------
+
+def build_exif_bytes(profile: dict, exp_sec: float = None, iso: int = None, focus_dist_m: float = None, mode_tag: str = "MFNR"):
+    exif = Image.Exif()
+    now_str = datetime.datetime.now().strftime("%Y:%m:%d %H:%M:%S")
+    # IFD0 standard tags
+    exif[271] = "realme"                                  # Make
+    exif[272] = "RMX5010"                                 # Model (Realme GT7 Pro)
+    exif[305] = f"Pista Mainline Linux ISP ({mode_tag})"  # Software
+    exif[306] = now_str                                   # DateTime
+
+    # ExifIFD (0x8769) photography tags
+    exif_ifd = exif.get_ifd(0x8769)
+    exif_ifd[36867] = now_str                             # DateTimeOriginal
+    exif_ifd[36868] = now_str                             # DateTimeDigitized
+
+    if profile:
+        if "lens_model" in profile:
+            exif_ifd[42036] = str(profile["lens_model"])  # LensModel
+        if "focal_mm" in profile:
+            exif_ifd[37386] = (int(round(profile["focal_mm"] * 100)), 100)  # FocalLength
+        if "focal_35mm" in profile:
+            exif_ifd[41989] = int(profile["focal_35mm"])  # FocalLengthIn35mmFilm
+        if "f_number" in profile:
+            exif_ifd[33437] = (int(round(profile["f_number"] * 100)), 100)  # FNumber
+
+    if exp_sec and exp_sec > 0:
+        if exp_sec < 1.0:
+            exif_ifd[33434] = (1, max(1, int(round(1.0 / exp_sec))))        # ExposureTime
+        else:
+            exif_ifd[33434] = (int(round(exp_sec * 100)), 100)
+    if iso and iso > 0:
+        exif_ifd[34855] = int(iso)                        # ISOSpeedRatings
+    if focus_dist_m and focus_dist_m > 0:
+        exif_ifd[37382] = (int(round(focus_dist_m * 100)), 100)             # SubjectDistance
+
+    return exif.tobytes()
+
+
+def develop_photo(
+    frames_u8: list,
+    mode: str,
+    profile: dict,
+    rot_deg: int,
+    mirror: bool,
+    exp_sec: float = None,
+    iso: int = None,
+    focus_dist_m: float = None,
+):
+    """Run the full computational photography pipeline and return (PIL.Image, exif_bytes, stats)."""
+    t0 = time.monotonic()
+
+    if mode == "raw":
+        out_img = Image.fromarray(frames_u8[-1], mode="RGB")
+        exif_b = build_exif_bytes(profile, exp_sec, iso, focus_dist_m, mode_tag="RAW-Preview")
+        return out_img, exif_b, {"ms": (time.monotonic() - t0) * 1000.0, "n": 1}
+
+    if mode == "hdr":
+        srgb = merge_hdr_mertens_srgb(frames_u8)
+        lin = np.power(srgb, 2.2)
+        lin = apply_lsc_linear(lin, profile, rot_deg, mirror)
+        # Lighter LTM in HDR mode since Mertens already compressed extreme dynamic range
+        hdr_prof = dict(profile or {})
+        hdr_prof["ltm_strength"] = float(hdr_prof.get("ltm_strength", 0.35)) * 0.45
+        srgb = apply_ltm_and_filmic(lin, hdr_prof)
+        srgb = apply_denoise_and_asf(srgb, hdr_prof, is_night=False)
+        tag = f"HDR-{len(frames_u8)}f"
+    else:
+        is_night = (mode == "night")
+        lin = merge_mfnr_linear(frames_u8)
+        lin = apply_lsc_linear(lin, profile, rot_deg, mirror)
+        srgb = apply_ltm_and_filmic(lin, profile)
+        srgb = apply_denoise_and_asf(srgb, profile, is_night=is_night)
+        tag = f"{'Night' if is_night else 'Std'}-MFNR-{len(frames_u8)}f"
+
+    out_u8 = np.clip(srgb * 255.0 + 0.5, 0.0, 255.0).astype(np.uint8)
+    out_img = Image.fromarray(out_u8, mode="RGB")
+    exif_b = build_exif_bytes(profile, exp_sec, iso, focus_dist_m, mode_tag=tag)
+    return out_img, exif_b, {"ms": (time.monotonic() - t0) * 1000.0, "n": len(frames_u8)}

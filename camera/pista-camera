@@ -23,11 +23,24 @@ gi.require_version("Gst", "1.0")
 from gi.repository import Gdk, GLib, Gst, Gtk
 from PIL import Image
 
+for _p in (os.path.dirname(os.path.abspath(__file__)), "/usr/local/share/pista-camera"):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+import pista_photo_isp as photo_isp
+
 Gst.init(None)
 
 AF_CALIB_PATH = "/etc/pista-camera-af.json"
+ISP_CALIB_PATH = "/etc/pista-camera-isp.json"
 V4L2_CID_FOCUS_ABSOLUTE = 0x009A090A
 VIDIOC_S_CTRL = 0xC008561C
+
+PHOTO_MODES = [
+    ("std", "标准 3帧"),
+    ("night", "夜景 6帧"),
+    ("hdr", "HDR 融合"),
+    ("raw", "直出"),
+]
 
 # Fallback defaults derived from Realme GT7 Pro Sunny IMX906 / IMX882 EEPROMs
 DEFAULT_AF_CALIB = {
@@ -69,6 +82,7 @@ CAMERAS = [
         "label": "后置 50MP 主摄 (IMX906)",
         "short": "1× 主摄",
         "path": "/base/soc@0/cci@ac7b000/i2c-bus@1/camera@1a",
+        "sensor_prefix": "imx906",
         "vcm_name": "ak7375 3-000c",
         "width": 2048,
         "height": 1536,
@@ -80,6 +94,7 @@ CAMERAS = [
         "label": "后置 8MP 超广角 (IMX355)",
         "short": "0.6× 广角",
         "path": "/base/soc@0/cci@ac7b000/i2c-bus@0/camera@1a",
+        "sensor_prefix": "imx355",
         "vcm_name": None,
         "width": 1640,
         "height": 1232,
@@ -91,6 +106,7 @@ CAMERAS = [
         "label": "后置 50MP 3×潜望长焦 (IMX882)",
         "short": "3× 长焦",
         "path": "/base/soc@0/cci@ac7c000/i2c-bus@0/camera@1a",
+        "sensor_prefix": "imx882",
         "vcm_name": "ak7375 4-002d",
         "width": 2048,
         "height": 1536,
@@ -102,6 +118,7 @@ CAMERAS = [
         "label": "前置 16MP 自拍 (IMX471)",
         "short": "前置自拍",
         "path": "/base/soc@0/geniqup@8c0000/i2c@884000/camera@10",
+        "sensor_prefix": "imx471",
         "vcm_name": None,
         "width": 1920,
         "height": 1088,
@@ -152,8 +169,10 @@ def load_af_calibration():
 
 
 def calibrate_eeprom_cli():
-    """Read factory GT24P128G AF calibration (0x0092..0x0097) from hardware (run as root)."""
+    """Read factory GT24P128G AF (0x0092..0x0097) & 17x13 LSC (0x00d0..0x0521) calibration (run as root)."""
     calib = load_af_calibration()
+    isp_profs = photo_isp.load_isp_profiles()
+    isp_overrides = {}
     for key, spec in [
         ("rear_main", ("ak7375 3-000c", 3, 500, 50, 10)),
         ("rear_tele", ("ak7375 4-002d", 4, 5300, 130, 65)),
@@ -183,7 +202,6 @@ def calibrate_eeprom_cli():
                     dac_mid = round(mid_12 / 4.0) if inf_12 < mid_12 < macro_12 else (dac_inf + dac_macro) // 2
                     dac_min = max(20, dac_inf - 45)
                     dac_max = min(1000, dac_macro + 45)
-                    # Hyperfocal ~ 1.5m (main) / 3.5m (tele)
                     d_inf = 100.0 / dist_inf
                     d_mac = 100.0 / dist_macro
                     d_hyp = 100.0 / (150.0 if key == "rear_main" else 350.0)
@@ -197,7 +215,15 @@ def calibrate_eeprom_cli():
                         "dac_max": dac_max,
                         "dac_hyperfocal": max(dac_min, min(dac_max, dac_hyp)),
                     })
-                    print(f"[{key}] EEPROM OK: inf={dac_inf}, mid={dac_mid}, macro={dac_macro}, hyp={dac_hyp}")
+                    print(f"[{key}] EEPROM AF OK: inf={dac_inf}, mid={dac_mid}, macro={dac_macro}, hyp={dac_hyp}")
+            try:
+                r_g, g_g, b_g = photo_isp.read_eeprom_lsc_17x13(bus, 0x50, 0x00D0)
+                base_p = dict(isp_profs.get(key, {}))
+                base_p.update({"lsc_w": 17, "lsc_h": 13, "lsc_r": r_g, "lsc_g": g_g, "lsc_b": b_g, "lsc_source": "eeprom"})
+                isp_overrides[key] = base_p
+                print(f"[{key}] EEPROM LSC 17x13 OK: TL=({r_g[0]},{g_g[0]},{b_g[0]}) BR=({r_g[220]},{g_g[220]},{b_g[220]})")
+            except Exception as lsc_exc:
+                print(f"[{key}] EEPROM LSC skipped (using golden profile): {lsc_exc}")
         except Exception as exc:
             print(f"[{key}] EEPROM read failed: {exc}")
         finally:
@@ -205,7 +231,12 @@ def calibrate_eeprom_cli():
     with open(AF_CALIB_PATH, "w", encoding="utf-8") as f:
         json.dump(calib, f, indent=2)
     os.chmod(AF_CALIB_PATH, 0o644)
-    print(f"Saved calibration to {AF_CALIB_PATH}")
+    print(f"Saved AF calibration to {AF_CALIB_PATH}")
+    if isp_overrides:
+        with open(ISP_CALIB_PATH, "w", encoding="utf-8") as f:
+            json.dump(isp_overrides, f, separators=(",", ":"))
+        os.chmod(ISP_CALIB_PATH, 0o644)
+        print(f"Saved per-unit EEPROM LSC to {ISP_CALIB_PATH}")
 
 
 def dac_to_distance_str(dac: int, cal: dict) -> str:
@@ -699,6 +730,24 @@ window {
     color: #ffffff;
     border: 1px solid #60a5fa;
 }
+.modebar {
+    background-color: rgba(12, 12, 16, 0.94);
+    padding: 5px 14px 2px 14px;
+}
+.mode-btn {
+    background: #111827;
+    color: #9ca3af;
+    border: 1px solid #1f2937;
+    border-radius: 14px;
+    padding: 4px 10px;
+    font-size: 12px;
+    font-weight: 700;
+}
+.mode-btn-active {
+    background: #d97706;
+    color: #ffffff;
+    border: 1px solid #fbbf24;
+}
 .af-btn {
     background: #1f2937;
     color: #e5e7eb;
@@ -797,8 +846,21 @@ class PistaCameraWindow(Gtk.Window):
         os.makedirs(self.pictures_dir, exist_ok=True)
         self.photo_count = 0
 
-        # Autofocus state
+        # Autofocus & Computational Photography ISP state
         self.af_calib = load_af_calibration()
+        self.isp_profiles = photo_isp.load_isp_profiles()
+        self.photo_mode = "std"     # "std" (3f MFNR), "night" (6f MFNR), "hdr" (3-EV), "raw"
+        self.sensor_ctrl = None
+        self._burst_lock = threading.Lock()
+        self._burst_active = False
+        self._burst_mode = "std"
+        self._burst_target = 0
+        self._burst_frames = []
+        self._hdr_brackets = []
+        self._hdr_orig_exp = None
+        self._hdr_wait = 0
+        self._developing = False
+
         self.vcm = VcmController()
         self.af_engine = StockStyleAFEngine(self.vcm, self.on_af_update)
         self._slider_updating = False
@@ -880,6 +942,20 @@ class PistaCameraWindow(Gtk.Window):
         self.dist_lbl = Gtk.Label(label="∞")
         self.dist_lbl.get_style_context().add_class("dist-lbl")
         self.focusbar.pack_start(self.dist_lbl, False, False, 0)
+
+        # Photo ISP mode selector bar (Std 3f / Night 6f / HDR / Raw)
+        modebar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        modebar.get_style_context().add_class("modebar")
+        modebar.set_halign(Gtk.Align.CENTER)
+        root.pack_start(modebar, False, False, 0)
+        self.mode_btns = {}
+        for mkey, mlabel in PHOTO_MODES:
+            mbtn = Gtk.Button(label=mlabel)
+            mbtn.get_style_context().add_class("mode-btn")
+            mbtn.connect("clicked", self.on_select_photo_mode, mkey)
+            modebar.pack_start(mbtn, False, False, 0)
+            self.mode_btns[mkey] = mbtn
+        self._update_mode_buttons()
 
         # Lens selector bar (1x / 0.6x / 3x / Front)
         lensbar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
@@ -1110,10 +1186,22 @@ class PistaCameraWindow(Gtk.Window):
             else:
                 ctx.remove_class("lens-btn-active")
 
+    def _update_mode_buttons(self):
+        for mkey, btn in self.mode_btns.items():
+            ctx = btn.get_style_context()
+            if mkey == self.photo_mode:
+                ctx.add_class("mode-btn-active")
+            else:
+                ctx.remove_class("mode-btn-active")
+
+    def on_select_photo_mode(self, _btn, mode_key):
+        self.photo_mode = mode_key
+        self._update_mode_buttons()
+        names = {"std": "标准 3帧超清 (MFNR+LSC+LTM)", "night": "夜景 6帧降噪 (MFNR+彩噪抑制)", "hdr": "HDR 3帧包围曝光融合", "raw": "单帧直出"}
+        self.status_lbl.set_text(f"拍照模式: {names.get(mode_key, mode_key)}")
+
     def _on_sink_buffer(self, pad, info):
-        """GStreamer pad probe on gtksink sink pad: feeds live frames to AF engine."""
-        if not self.vcm.is_open():
-            return Gst.PadProbeReturn.OK
+        """GStreamer pad probe on gtksink sink pad: feeds live frames to AF engine and burst/HDR collector."""
         buf = info.get_buffer()
         caps = pad.get_current_caps()
         if buf is None or caps is None:
@@ -1121,26 +1209,88 @@ class PistaCameraWindow(Gtk.Window):
         s = caps.get_structure(0)
         w = s.get_value("width")
         h = s.get_value("height")
+        fmt = s.get_value("format")
         self.frame_w = w
         self.frame_h = h
+
+        need_burst = False
+        with self._burst_lock:
+            need_burst = self._burst_active
+
+        if not need_burst and not self.vcm.is_open():
+            return Gst.PadProbeReturn.OK
+
         ok, mi = buf.map(Gst.MapFlags.READ)
         if ok:
             try:
                 bpp = len(mi.data) // max(1, w * h)
                 if bpp >= 3 and len(mi.data) >= w * h * bpp:
                     arr = np.frombuffer(mi.data, dtype=np.uint8, count=w * h * bpp).reshape((h, w, bpp))
-                    self.af_engine.process_frame(arr)
+                    if need_burst:
+                        self._handle_burst_frame(arr, fmt)
+                    elif self.vcm.is_open():
+                        self.af_engine.process_frame(arr)
             finally:
                 buf.unmap(mi)
         return Gst.PadProbeReturn.OK
 
+    def _extract_rgb_copy(self, arr: np.ndarray, fmt: str) -> np.ndarray:
+        if fmt in ("BGRx", "BGRA", "BGR"):
+            return arr[:, :, [2, 1, 0]].copy()
+        return arr[:, :, :3].copy()
+
+    def _handle_burst_frame(self, arr: np.ndarray, fmt: str):
+        done_payload = None
+        with self._burst_lock:
+            if not self._burst_active:
+                return
+            if self._burst_mode == "hdr":
+                if self._hdr_wait > 0:
+                    self._hdr_wait -= 1
+                    # Re-apply current target bracket each wait frame so libcamera Agc cannot overwrite it
+                    cur_idx = len(self._burst_frames)
+                    if self.sensor_ctrl and cur_idx < len(self._hdr_brackets):
+                        exp_v, gain_v = self._hdr_brackets[cur_idx]
+                        self.sensor_ctrl.set_exposure_and_gain(exp_v, gain_v)
+                    return
+                self._burst_frames.append(self._extract_rgb_copy(arr, fmt))
+                idx = len(self._burst_frames)
+                if idx < len(self._hdr_brackets):
+                    if self.sensor_ctrl:
+                        exp_v, gain_v = self._hdr_brackets[idx]
+                        self.sensor_ctrl.set_exposure_and_gain(exp_v, gain_v)
+                    self._hdr_wait = 3  # wait 3 frames (2-frame pipeline delay + 1 margin)
+                    GLib.idle_add(self.status_lbl.set_text, f"HDR 包围曝光采集中 ({idx}/{len(self._hdr_brackets)})...")
+                    return
+                # Restore original sensor exposure + analog gain
+                if self.sensor_ctrl and self._hdr_orig_exp is not None:
+                    self.sensor_ctrl.set_exposure_and_gain(self._hdr_orig_exp, getattr(self, "_hdr_orig_gain", None))
+                self._burst_active = False
+                done_payload = (list(self._burst_frames), self._burst_mode)
+            else:
+                self._burst_frames.append(self._extract_rgb_copy(arr, fmt))
+                idx = len(self._burst_frames)
+                if idx < self._burst_target:
+                    GLib.idle_add(self.status_lbl.set_text, f"多帧连拍中 ({idx}/{self._burst_target})...")
+                    return
+                self._burst_active = False
+                done_payload = (list(self._burst_frames), self._burst_mode)
+
+        if done_payload is not None:
+            frames, mode = done_payload
+            self._launch_develop_thread(frames, mode)
+
     def stop_camera(self):
+        with self._burst_lock:
+            self._burst_active = False
+            self._burst_frames = []
         self.reticle_state = None
         if self.pipeline is not None:
             self.pipeline.set_state(Gst.State.NULL)
             self.pipeline = None
         self.sink = None
         self.flip = None
+        self.sensor_ctrl = None
         self.vcm.close()
         for child in self.vf_box.get_children():
             self.vf_box.remove(child)
@@ -1149,6 +1299,7 @@ class PistaCameraWindow(Gtk.Window):
         self.stop_camera()
         c = self.current_cam()
         cal = self.current_cal()
+        self.sensor_ctrl = photo_isp.SensorControlHelper(c.get("sensor_prefix", ""))
         self.update_header()
 
         # Open VCM lens actuator if supported on this camera
@@ -1181,9 +1332,9 @@ class PistaCameraWindow(Gtk.Window):
             self.sink = self.pipeline.get_by_name("sink")
             self.flip = self.pipeline.get_by_name("flip")
 
-            # Attach AF buffer probe directly on gtksink's sink pad (post-rotation coords!)
+            # Attach pad probe on ALL cameras for AF + MFNR/HDR burst frame capture
             sink_pad = self.sink.get_static_pad("sink")
-            if sink_pad and has_vcm:
+            if sink_pad:
                 sink_pad.add_probe(Gst.PadProbeType.BUFFER, self._on_sink_buffer)
 
             widget = self.sink.get_property("widget")
@@ -1239,34 +1390,105 @@ class PistaCameraWindow(Gtk.Window):
     def on_capture(self, _btn):
         if self.sink is None:
             return
-        sample = self.sink.get_property("last-sample")
-        if sample is None:
-            self.status_lbl.set_text("尚未收到画面帧，请稍候")
-            return
-        caps = sample.get_caps()
-        s = caps.get_structure(0)
-        w = s.get_value("width")
-        h = s.get_value("height")
-        buf = sample.get_buffer()
-        ok, mapinfo = buf.map(Gst.MapFlags.READ)
-        if not ok:
-            self.status_lbl.set_text("读取帧缓冲失败")
-            return
-        try:
-            fmt = s.get_value("format")
-            raw_mode = "BGRX" if fmt in ("BGRx", "BGRA") else "RGBX"
-            img = Image.frombytes("RGB", (w, h), bytes(mapinfo.data), "raw", raw_mode)
-            ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            cam_tag = self.current_cam()["key"]
-            out_path = os.path.join(self.pictures_dir, f"IMG_{ts}_{cam_tag}.jpg")
-            img.save(out_path, quality=95)
-            self.photo_count += 1
-            self.gallery_btn.set_label(f"相册 ({self.photo_count})")
-            self.status_lbl.set_text(f"已保存: {os.path.basename(out_path)} ({w}×{h})")
-        except Exception as exc:
-            self.status_lbl.set_text(f"保存失败: {exc}")
-        finally:
-            buf.unmap(mapinfo)
+        with self._burst_lock:
+            if self._burst_active or self._developing:
+                self.status_lbl.set_text("正在合成上一张照片，请稍候...")
+                return
+            mode = self.photo_mode
+            self._burst_mode = mode
+            self._burst_frames = []
+            if mode == "raw":
+                self._burst_target = 1
+                self._burst_active = True
+                self.status_lbl.set_text("正在拍摄直出照片...")
+            elif mode == "hdr":
+                orig_exp = self.sensor_ctrl.get_exposure() if self.sensor_ctrl else None
+                orig_gain = self.sensor_ctrl.get_gain() if self.sensor_ctrl else None
+                if orig_exp and orig_exp >= 12:
+                    skey = self.current_cam()["key"]
+                    b_lo = self.sensor_ctrl.compute_ev_bracket(skey, orig_exp, orig_gain, 0.30)
+                    b_mid = (orig_exp, orig_gain)
+                    b_hi = self.sensor_ctrl.compute_ev_bracket(skey, orig_exp, orig_gain, 2.80)
+                    self._hdr_orig_exp = orig_exp
+                    self._hdr_orig_gain = orig_gain
+                    self._hdr_brackets = [b_lo, b_mid, b_hi]
+                    self.sensor_ctrl.set_exposure_and_gain(*b_lo)
+                    self._hdr_wait = 3
+                    self._burst_target = 3
+                    self._burst_active = True
+                    self.status_lbl.set_text("HDR 包围曝光采集中 (0/3)...")
+                else:
+                    # Fallback to 3-frame MFNR+LTM if exposure control unavailable
+                    self._burst_mode = "std"
+                    self._burst_target = 3
+                    self._burst_active = True
+                    self.status_lbl.set_text("多帧连拍中 (0/3)...")
+            elif mode == "night":
+                self._burst_target = 6
+                self._burst_active = True
+                self.status_lbl.set_text("夜景 6 帧连拍中，请握稳手机...")
+            else:
+                self._burst_target = 3
+                self._burst_active = True
+                self.status_lbl.set_text("标准 3 帧超清连拍中...")
+
+    def _launch_develop_thread(self, frames: list, mode: str):
+        c = dict(self.current_cam())
+        cal = self.current_cal()
+        prof = self.isp_profiles.get(c["key"])
+        exp_sec, iso = (None, None)
+        if self.sensor_ctrl:
+            exp_sec, iso = self.sensor_ctrl.estimate_exif_params(c["key"])
+        focus_m = None
+        if cal and self.vcm.is_open():
+            d_str = dac_to_distance_str(self.vcm.cur_dac, cal)
+            if d_str.endswith("cm"):
+                focus_m = float(d_str[:-2]) / 100.0
+            elif d_str.endswith("m"):
+                focus_m = float(d_str[:-1])
+
+        with self._burst_lock:
+            self._developing = True
+        mode_lbl = {"std": "标准超清", "night": "夜景 MFNR", "hdr": "HDR 融合", "raw": "直出"}.get(mode, mode)
+        GLib.idle_add(self.status_lbl.set_text, f"正在后台 ISP 合成 ({mode_lbl})...")
+
+        def worker():
+            try:
+                img, exif_b, st = photo_isp.develop_photo(
+                    frames,
+                    mode=mode,
+                    profile=prof,
+                    rot_deg=c["rot_deg"],
+                    mirror=bool(c["mirror"]),
+                    exp_sec=exp_sec,
+                    iso=iso,
+                    focus_dist_m=focus_m,
+                )
+                ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                out_path = os.path.join(self.pictures_dir, f"IMG_{ts}_{c['key']}_{mode}.jpg")
+                img.save(out_path, format="JPEG", quality=95, subsampling=0, exif=exif_b)
+                w, h = img.size
+                GLib.idle_add(
+                    self._on_photo_saved,
+                    os.path.basename(out_path),
+                    w,
+                    h,
+                    mode_lbl,
+                    st["ms"],
+                )
+            except Exception as exc:
+                GLib.idle_add(self.status_lbl.set_text, f"ISP 合成失败: {exc}")
+            finally:
+                with self._burst_lock:
+                    self._developing = False
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_photo_saved(self, fname: str, w: int, h: int, mode_lbl: str, ms: float):
+        self.photo_count += 1
+        self.gallery_btn.set_label(f"相册 ({self.photo_count})")
+        self.status_lbl.set_text(f"已保存 {mode_lbl}: {fname} ({w}×{h}, {ms:.0f}ms)")
+        return False
 
     def on_open_gallery(self, _btn):
         subprocess.Popen(["xdg-open", self.pictures_dir])
