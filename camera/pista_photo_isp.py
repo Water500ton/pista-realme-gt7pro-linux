@@ -25,6 +25,7 @@ import numpy as np
 from PIL import Image
 
 V4L2_CID_EXPOSURE = 0x00980911
+V4L2_CID_VBLANK = 0x009E0901
 V4L2_CID_ANALOGUE_GAIN = 0x009E0903
 VIDIOC_G_CTRL = 0xC008561B
 VIDIOC_S_CTRL = 0xC008561C
@@ -194,31 +195,214 @@ class SensorControlHelper:
         lo, hi = self.get_gain_range()
         return self._set_ctrl(V4L2_CID_ANALOGUE_GAIN, max(lo, min(hi, int(val))))
 
+    def set_vblank(self, val: int) -> bool:
+        lo, hi = self._query_range(V4L2_CID_VBLANK)
+        return self._set_ctrl(V4L2_CID_VBLANK, max(lo, min(hi, int(val))))
+
+    def ensure_30fps_vblank(self, sensor_key: str):
+        """Raise VBLANK on 60fps-default sensors (IMX355/IMX471) to unlock 33ms (~30fps) max shutter."""
+        # IMX355 (1632x1224) defaults to max_exp=1296 (~16ms); vblank=1400 unlocks ~2600 lines (~33ms, +1 EV).
+        # IMX471 (1920x1080) defaults to max_exp=1290 (~18ms); vblank=1400 unlocks ~2470 lines (~33ms, +1 EV).
+        if sensor_key in ("rear_uw", "front"):
+            _lo, hi = self.get_exposure_range()
+            if hi < 2000:
+                self.set_vblank(1400)
+
     def set_exposure_and_gain(self, exp_val: int, gain_val: int):
         if exp_val is not None:
             self.set_exposure(exp_val)
         if gain_val is not None:
             self.set_gain(gain_val)
 
-    def compute_ev_bracket(self, sensor_key: str, orig_exp: int, orig_gain: int, mult: float):
-        """Compute (exp_lines, gain_code) for an EV multiplier, spilling into analog gain when shutter saturates."""
+    @staticmethod
+    def smia_base(sensor_key: str) -> float:
+        return 16384.0 if sensor_key in ("rear_main", "rear_tele") else 1024.0
+
+    def gain_code_to_lin(self, sensor_key: str, code: int) -> float:
+        base = self.smia_base(sensor_key)
+        min_denom = 256.0 if base > 2048.0 else 32.0
+        return base / max(min_denom, base - float(code))
+
+    def gain_lin_to_code(self, sensor_key: str, gain_lin: float) -> int:
+        base = self.smia_base(sensor_key)
+        g_lo, g_hi = self.get_gain_range()
+        g = max(1.0, float(gain_lin))
+        code = int(round(base - (base / g)))
+        return max(g_lo, min(g_hi, code))
+
+    def total_ev_to_regs(self, sensor_key: str, total_ev: float, max_gain_lin: float = None):
+        """Decompose total linear exposure (exp_lines * gain_lin) into optimal (exp_lines, gain_code).
+
+        Shutter-priority: uses full exposure up to 1/30s (exp_hi) at 1.0x gain before raising
+        analog gain, minimizing sensor read noise and preventing unnecessary high-ISO clipping.
+        """
         exp_lo, exp_hi = self.get_exposure_range()
         g_lo, g_hi = self.get_gain_range()
-        base = 16384.0 if sensor_key in ("rear_main", "rear_tele") else 1024.0
+        max_g = self.gain_code_to_lin(sensor_key, g_hi)
+        if max_gain_lin is not None:
+            max_g = min(max_g, float(max_gain_lin))
+        total_ev = max(float(exp_lo), min(float(exp_hi) * max_g, float(total_ev)))
+        if total_ev <= float(exp_hi):
+            return (max(exp_lo, int(round(total_ev))), g_lo)
+        req_g = total_ev / float(exp_hi)
+        return (exp_hi, self.gain_lin_to_code(sensor_key, req_g))
 
-        tgt_exp_f = float(orig_exp) * float(mult)
-        tgt_exp = max(exp_lo, min(exp_hi, int(round(tgt_exp_f))))
-        rem_mult = tgt_exp_f / max(1.0, float(tgt_exp))
+    def compute_ev_bracket(self, sensor_key: str, orig_exp: int, orig_gain: int, mult: float):
+        """Compute (exp_lines, gain_code) for an EV multiplier using true Sony SMIA total exposure."""
+        cur_g = self.gain_code_to_lin(sensor_key, orig_gain) if orig_gain is not None else 1.0
+        total = float(orig_exp) * cur_g * float(mult)
+        return self.total_ev_to_regs(sensor_key, total)
 
-        if orig_gain is None:
-            return (tgt_exp, None)
 
-        # Sony SMIA analog gain: G = base / (base - code)
-        cur_g = base / max(32.0, base - float(orig_gain))
-        tgt_g = max(1.0, cur_g * rem_mult)
-        tgt_code = int(round(base - (base / tgt_g)))
-        tgt_code = max(g_lo, min(g_hi, tgt_code))
-        return (tgt_exp, tgt_code)
+class SmartAEController:
+    """Sony-SMIA closed-loop highlight-protected Auto Exposure controller for pista-camera.
+
+    Replaces libcamera SoftISP's naive linear-gain Agc (which lacks Sony CameraSensorHelpers,
+    causing IMX906 screen blowouts and IMX355/IMX882 sluggish underexposure).
+    """
+
+    def __init__(self):
+        self.sensor_key = None
+        self.sc = None
+        self.roi = (0.5, 0.5)   # normalized (cx, cy), updated by Tap-to-Focus/Meter
+        self.ev_bias = 0.0      # EV compensation in stops
+        self.wait_frames = 0
+        self.cur_exp = None
+        self.cur_gain = None
+        self.initialized = False
+        self.vblank_checked = False
+
+    def configure(self, sensor_key: str, sensor_ctrl: SensorControlHelper):
+        self.sensor_key = sensor_key
+        self.sc = sensor_ctrl
+        self.roi = (0.5, 0.5)
+        self.ev_bias = 0.0
+        self.wait_frames = 2
+        self.cur_exp = None
+        self.cur_gain = None
+        self.initialized = False
+        self.vblank_checked = False
+
+    def set_metering_point(self, nx: float, ny: float):
+        self.roi = (max(0.15, min(0.85, float(nx))), max(0.15, min(0.85, float(ny))))
+        self.wait_frames = 0  # respond immediately to tap-to-meter
+
+    def reset_metering_point(self):
+        self.roi = (0.5, 0.5)
+
+    def _init_reasonable_start(self):
+        if not self.sc or not self.sensor_key:
+            return
+        if not self.vblank_checked:
+            self.sc.ensure_30fps_vblank(self.sensor_key)
+            self.vblank_checked = True
+        exp_lo, exp_hi = self.sc.get_exposure_range()
+        # Start near mid-shutter, moderate 2x gain so neither bright screens nor dim rooms start extreme
+        init_exp = max(exp_lo, min(exp_hi, int(exp_hi * 0.45)))
+        init_gain = self.sc.gain_lin_to_code(self.sensor_key, 2.0)
+        self.sc.set_exposure_and_gain(init_exp, init_gain)
+        self.cur_exp, self.cur_gain = init_exp, init_gain
+        self.initialized = True
+        self.wait_frames = 2
+
+    def process_frame(self, arr_u8: np.ndarray, fmt: str):
+        """Run one highlight-protected AE tick on a preview frame (<0.3 ms CPU)."""
+        if not self.sc or not self.sensor_key:
+            return
+        if not self.initialized:
+            self._init_reasonable_start()
+            return
+        if self.wait_frames > 0:
+            self.wait_frames -= 1
+            # Re-apply current (exp, gain) each frame so libcamera DelayedControls never replays stale values
+            if self.cur_exp is not None:
+                self.sc.set_exposure_and_gain(self.cur_exp, self.cur_gain)
+            return
+
+        # Subsample 16x for ultra-fast metering (~120x90 grid)
+        sub = arr_u8[::16, ::16, :3]
+        if fmt in ("BGRA", "BGRx", "BGR"):
+            r = sub[:, :, 2].astype(np.float32)
+            g = sub[:, :, 1].astype(np.float32)
+            b = sub[:, :, 0].astype(np.float32)
+        else:
+            r = sub[:, :, 0].astype(np.float32)
+            g = sub[:, :, 1].astype(np.float32)
+            b = sub[:, :, 2].astype(np.float32)
+
+        # Luminance & max-channel highlight map (max channel catches single-color screen clipping)
+        luma = 0.299 * r + 0.587 * g + 0.114 * b
+        peak = np.maximum(np.maximum(r, g), b)
+        sh, sw = luma.shape
+        if sh < 8 or sw < 8:
+            return
+
+        # Metering ROI (36% box around center or tapped point)
+        cx = int(self.roi[0] * sw)
+        cy = int(self.roi[1] * sh)
+        rx = max(4, int(sw * 0.18))
+        ry = max(4, int(sh * 0.18))
+        y0, y1 = max(0, cy - ry), min(sh, cy + ry)
+        x0, x1 = max(0, cx - rx), min(sw, cx + rx)
+
+        roi_luma = luma[y0:y1, x0:x1]
+        roi_peak = peak[y0:y1, x0:x1]
+
+        # Weighted scene luminance: 65% ROI + 35% global
+        w_luma = 0.65 * float(np.mean(roi_luma)) + 0.35 * float(np.mean(luma))
+        roi_p96 = float(np.percentile(roi_peak, 96))
+        clip_frac = float(np.mean(roi_peak >= 246.0))
+        global_clip = float(np.mean(peak >= 248.0))
+
+        # Target middle gray in sRGB (~108/255, comfortable natural exposure without washed-out highlights)
+        target = 108.0 * (2.0 ** (self.ev_bias * 0.45))
+
+        # 1. Base exposure ratio (convert sRGB luminance ratio to linear light via gamma ~1.9)
+        meas = max(4.0, w_luma)
+        ratio = (target / meas) ** 1.85
+
+        # 2. Highlight / Screen Protection:
+        # If bright screen/light in ROI or frame is clipping while scene isn't pitch-black,
+        # pull exposure down so screens stay crisp & legible instead of blowing out to solid white.
+        if (clip_frac > 0.035 or global_clip > 0.08 or roi_p96 > 244.0) and w_luma > 34.0:
+            hl_ratio = (224.0 / max(224.0, roi_p96)) ** 2.1
+            if clip_frac > 0.12:
+                hl_ratio = min(hl_ratio, 0.55)
+            elif clip_frac > 0.05:
+                hl_ratio = min(hl_ratio, 0.72)
+            # Don't crush overall scene darker than luma ~42 just for a tiny specular lamp
+            min_safe_ratio = max(0.20, (42.0 / max(10.0, w_luma)) ** 1.85)
+            ratio = min(ratio, max(hl_ratio, min_safe_ratio))
+
+        # Deadband: avoid micro-hunting / flicker when already well-exposed
+        if 0.89 <= ratio <= 1.12:
+            if self.cur_exp is not None:
+                self.sc.set_exposure_and_gain(self.cur_exp, self.cur_gain)
+            return
+
+        # Damped step in log-exposure space for smooth, rapid convergence (3-5 frames)
+        log_step = math.log2(max(0.18, min(5.5, ratio)))
+        damped_mult = 2.0 ** (log_step * 0.58)
+
+        # Read current hardware regs (or use cached)
+        exp_now = self.cur_exp if self.cur_exp is not None else self.sc.get_exposure()
+        gain_now = self.cur_gain if self.cur_gain is not None else self.sc.get_gain()
+        if exp_now is None or gain_now is None:
+            return
+
+        cur_g_lin = self.sc.gain_code_to_lin(self.sensor_key, gain_now)
+        cur_total = float(exp_now) * cur_g_lin
+        new_total = cur_total * damped_mult
+
+        # Cap max analog gain per sensor to keep indoor shadows clean
+        max_g_cap = {"rear_main": 24.0, "rear_tele": 28.0, "rear_uw": 15.0, "front": 4.57}.get(self.sensor_key, 16.0)
+        new_exp, new_gain = self.sc.total_ev_to_regs(self.sensor_key, new_total, max_gain_lin=max_g_cap)
+
+        self.sc.set_exposure_and_gain(new_exp, new_gain)
+        if new_exp != exp_now or new_gain != gain_now:
+            self.cur_exp, self.cur_gain = new_exp, new_gain
+            # Wait 2 frames for sensor+SoftISP pipeline latency before next measurement
+            self.wait_frames = 2
 
     def estimate_exif_params(self, sensor_key: str):
         """Convert V4L2 exposure lines and Sony SMIA gain code to approximate shutter & ISO."""
@@ -439,6 +623,10 @@ def merge_hdr_mertens_srgb(frames_u8: list) -> np.ndarray:
             f_u8 = shift_image(f_u8, dy, dx)
         imgs.append(f_u8.astype(np.float32) * inv255)
 
+    # Sort brackets darkest -> brightest so EV- highlight rescue and EV+ shadow lift are always ordered
+    imgs.sort(key=lambda im: float(im[::16, ::16].mean()))
+    ref_idx = len(imgs) // 2
+
     # Check actual luminance spread across captured hardware brackets.
     # If the brightest bracket saturated at the sensor's max shutter+gain (e.g. dim room),
     # synthesize a virtual +1.2 EV shadow-lifted bracket in linear light so Mertens fusion
@@ -453,7 +641,12 @@ def merge_hdr_mertens_srgb(frames_u8: list) -> np.ndarray:
             imgs[-1] = np.power(boosted, 1.0 / 2.2).astype(np.float32)
 
     weights = []
-    for im in imgs:
+    # Highlight clipping map of the EV0 reference frame: wherever EV0 is near/at clipping
+    # (e.g. bright monitor/phone screen in a dark room), heavily suppress clipped EV0/EV+
+    # frames and pull detail cleanly from the EV- dark bracket.
+    ref_peak = np.max(imgs[ref_idx], axis=2) if len(imgs) >= 3 else None
+
+    for idx, im in enumerate(imgs):
         # Mertens quality metrics: Contrast * Saturation * Well-Exposedness
         y = 0.299 * im[:, :, 0] + 0.587 * im[:, :, 1] + 0.114 * im[:, :, 2]
         # Contrast (Laplacian magnitude)
@@ -465,13 +658,25 @@ def merge_hdr_mertens_srgb(frames_u8: list) -> np.ndarray:
             ((im[:, :, 0] - mu) ** 2 + (im[:, :, 1] - mu) ** 2 + (im[:, :, 2] - mu) ** 2) * (1.0 / 3.0)
             + 1e-6
         )
-        # Well-exposedness (Gaussian around 0.5, sigma=0.22)
-        d0 = im[:, :, 0] - 0.5
-        d1 = im[:, :, 1] - 0.5
-        d2 = im[:, :, 2] - 0.5
-        exp_w = np.exp(-0.5 * (d0 * d0 + d1 * d1 + d2 * d2) / (0.22 * 0.22))
+        # Well-exposedness (Gaussian around 0.48, tighter sigma=0.20 rejects clipped 0.95+ hard)
+        d0 = im[:, :, 0] - 0.48
+        d1 = im[:, :, 1] - 0.48
+        d2 = im[:, :, 2] - 0.48
+        exp_w = np.exp(-0.5 * (d0 * d0 + d1 * d1 + d2 * d2) / (0.20 * 0.20))
 
-        w = (lap + 0.02) * (sat + 0.05) * (exp_w + 1e-3)
+        # Strongly penalize individually clipped pixels (>0.94) so screens never blow out
+        pk = np.max(im, axis=2)
+        clip_pen = np.clip((0.99 - pk) * 14.0, 0.01, 1.0)
+        w = (lap + 0.025) * (sat + 0.06) * (exp_w + 1e-3) * clip_pen
+
+        if ref_peak is not None:
+            hl_mask = np.clip((ref_peak - 0.80) * 6.0, 0.0, 1.0)
+            if idx == 0:
+                # Boost EV- dark bracket strongly on clipped highlights
+                w = w * (1.0 + 12.0 * hl_mask)
+            elif idx == len(imgs) - 1:
+                # Suppress EV+ bright bracket on already-bright areas
+                w = w * (1.0 - 0.92 * hl_mask)
         weights.append(w.astype(np.float32))
 
     # Normalize weights across exposures
@@ -543,23 +748,64 @@ def apply_lsc_linear(lin_rgb: np.ndarray, profile: dict, rot_deg: int, mirror: b
     for key in ("lsc_r", "lsc_g", "lsc_b"):
         m = np.asarray(profile[key], dtype=np.float32).reshape((lh, lw))
         m = _transform_mesh(m, rot_deg, mirror)
-        # Dampen corner boost: gain_eff = 1 + strength * (gain - 1), capped cleanly at 2.6x
-        m_eff = np.clip(1.0 + strength * (m - 1.0), 0.90, 2.60)
+        # Dampen corner boost: gain_eff = 1 + strength * (gain - 1), capped cleanly at 1.95x
+        m_eff = np.clip(1.0 + strength * (m - 1.0), 0.92, 1.95)
         gains.append(_resize_float_plane(m_eff, w, h))
     gain_map = np.stack(gains, axis=2)
 
-    # Highlight-preserving knee: fade LSC boost smoothly on near-clipped highlights (>0.75 linear)
+    # Strict highlight-preserving knee: fade LSC completely to 1.0 above 0.45 linear so bright
+    # screens and white light sources near corners NEVER get pushed into clipping.
     peak_c = np.max(lin_rgb, axis=2, keepdims=True)
-    hl_protect = np.clip((1.0 - peak_c) * 4.0, 0.25, 1.0)
+    hl_protect = np.clip((0.72 - peak_c) / 0.35, 0.0, 1.0)
     eff_gain = 1.0 + (gain_map - 1.0) * hl_protect
-    return np.clip(lin_rgb * eff_gain, 0.0, 1.4)
+    return np.clip(lin_rgb * eff_gain, 0.0, 1.15)
+
+
+# ---------------------------------------------------------------------------
+# Stage 2B: Highlight-Safe Neutral White-Balance / Green-Cast Guard
+# ---------------------------------------------------------------------------
+
+def apply_awb_green_guard(lin_rgb: np.ndarray) -> np.ndarray:
+    """Correct residual green cast caused when bright white lamps fool Gray-World AWB.
+
+    Measures only non-clipped, non-black neutral-ish midtones so vivid foliage/objects
+    are never over-corrected, while white light sources & skin stay clean and neutral.
+    """
+    sub = lin_rgb[::8, ::8, :]
+    r, g, b = sub[:, :, 0], sub[:, :, 1], sub[:, :, 2]
+    y = 0.2126 * r + 0.7152 * g + 0.0722 * b
+    mx = np.maximum(np.maximum(r, g), b)
+    mn = np.minimum(np.minimum(r, g), b)
+    chroma = (mx - mn) / (mx + 1e-4)
+
+    # Select midtone, near-neutral pixels (exclude clipped highlights and black shadows)
+    mask = (y > 0.04) & (y < 0.68) & (chroma < 0.38)
+    if int(np.count_nonzero(mask)) < 80:
+        return lin_rgb
+
+    rm = float(np.mean(r[mask]))
+    gm = float(np.mean(g[mask]))
+    bm = float(np.mean(b[mask]))
+    rb_avg = 0.5 * (rm + bm)
+    if rb_avg <= 1e-4 or gm <= 1e-4:
+        return lin_rgb
+
+    # Only pull down genuine green excess (>5% over R/B mean), smoothly capped at -14%
+    g_ratio = gm / rb_avg
+    if g_ratio <= 1.05:
+        return lin_rgb
+
+    corr = max(0.86, min(1.0, 1.04 / g_ratio))
+    out = lin_rgb.copy()
+    out[:, :, 1] *= corr
+    return out
 
 
 # ---------------------------------------------------------------------------
 # Stage 3: Stock-Inspired Local Tone Mapping (LTM) + Filmic S-Curve + Vibrance
 # ---------------------------------------------------------------------------
 
-def apply_ltm_and_filmic(lin_rgb: np.ndarray, profile: dict) -> np.ndarray:
+def apply_ltm_and_filmic(lin_rgb: np.ndarray, profile: dict, is_hdr: bool = False) -> np.ndarray:
     ltm_str = float(profile.get("ltm_strength", 0.32)) if profile else 0.32
     vibrance = float(profile.get("vibrance", 0.12)) if profile else 0.12
 
@@ -572,16 +818,20 @@ def apply_ltm_and_filmic(lin_rgb: np.ndarray, profile: dict) -> np.ndarray:
     env_ds = _fast_gaussian_approx(ds, 6)
     env = _resize_float_plane(env_ds, w, h)
 
-    # Local Tone Mapping: lift dark regions (env < -2.2), gently compress bright highlights (env > -0.5)
-    target_mid = -1.65
+    # Local Tone Mapping: lift dark regions (env < -1.8), compress highlights (env > -0.8)
+    # CRITICAL: gate positive shadow lift by per-pixel luminance (1 - smoothstep(0.18..0.45))
+    # so a bright screen surrounded by a dark room NEVER inherits the dark room's +EV lift!
+    target_mid = -1.75
     delta = (target_mid - env) * ltm_str
-    # Limit shadow lift to +0.85 EV and highlight compression to -0.55 EV for natural look
-    delta = np.clip(delta, -0.55, 0.85)
+    max_lift = 0.25 if is_hdr else 0.70
+    delta = np.clip(delta, -0.55, max_lift)
+    pixel_shadow_gate = np.clip((0.45 - y) / 0.27, 0.0, 1.0)
+    delta = np.where(delta > 0.0, delta * pixel_shadow_gate, delta)
     gain_ltm = np.power(2.0, delta).astype(np.float32)
     mapped = lin_rgb * gain_ltm[:, :, None]
 
     # Filmic highlight shoulder (Reinhard-extended soft rolloff prevents harsh clipping)
-    white_pt = 1.35
+    white_pt = 1.25 if is_hdr else 1.35
     mapped = (mapped * (1.0 + mapped / (white_pt * white_pt))) / (1.0 + mapped)
     mapped = np.clip(mapped, 0.0, 1.0)
 
@@ -717,17 +967,19 @@ def develop_photo(
         srgb = merge_hdr_mertens_srgb(frames_u8)
         lin = np.power(srgb, 2.2)
         lin = apply_lsc_linear(lin, profile, rot_deg, mirror)
-        # Lighter LTM in HDR mode since Mertens already compressed extreme dynamic range
+        lin = apply_awb_green_guard(lin)
+        # Lighter highlight-safe LTM in HDR mode since Mertens already fused dynamic range
         hdr_prof = dict(profile or {})
-        hdr_prof["ltm_strength"] = float(hdr_prof.get("ltm_strength", 0.35)) * 0.45
-        srgb = apply_ltm_and_filmic(lin, hdr_prof)
+        hdr_prof["ltm_strength"] = float(hdr_prof.get("ltm_strength", 0.35)) * 0.35
+        srgb = apply_ltm_and_filmic(lin, hdr_prof, is_hdr=True)
         srgb = apply_denoise_and_asf(srgb, hdr_prof, is_night=False)
         tag = f"HDR-{len(frames_u8)}f"
     else:
         is_night = (mode == "night")
         lin = merge_mfnr_linear(frames_u8)
         lin = apply_lsc_linear(lin, profile, rot_deg, mirror)
-        srgb = apply_ltm_and_filmic(lin, profile)
+        lin = apply_awb_green_guard(lin)
+        srgb = apply_ltm_and_filmic(lin, profile, is_hdr=False)
         srgb = apply_denoise_and_asf(srgb, profile, is_night=is_night)
         tag = f"{'Night' if is_night else 'Std'}-MFNR-{len(frames_u8)}f"
 

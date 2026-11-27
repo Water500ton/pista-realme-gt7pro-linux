@@ -28,6 +28,17 @@ for _p in (os.path.dirname(os.path.abspath(__file__)), "/usr/local/share/pista-c
         sys.path.insert(0, _p)
 import pista_photo_isp as photo_isp
 
+# Use pista-camera's private libcamera IPA tuning dir (auto BlackLevel + damped CCM, no Agc)
+# BEFORE Gst.init() so libcamera never fights our Sony-SMIA SmartAEController or HDR bracketing.
+if "LIBCAMERA_IPA_CONFIG_PATH" not in os.environ:
+    for _ipa_dir in (
+        "/usr/local/share/pista-camera/ipa",
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "ipa_pista"),
+    ):
+        if os.path.isdir(os.path.join(_ipa_dir, "simple")):
+            os.environ["LIBCAMERA_IPA_CONFIG_PATH"] = _ipa_dir
+            break
+
 Gst.init(None)
 
 AF_CALIB_PATH = "/etc/pista-camera-af.json"
@@ -863,6 +874,7 @@ class PistaCameraWindow(Gtk.Window):
 
         self.vcm = VcmController()
         self.af_engine = StockStyleAFEngine(self.vcm, self.on_af_update)
+        self.ae_ctrl = photo_isp.SmartAEController()
         self._slider_updating = False
         self.reticle_state = None   # None, "scanning", "locked", "fallback"
         self.reticle_pos = (0.5, 0.5)
@@ -1088,8 +1100,6 @@ class PistaCameraWindow(Gtk.Window):
         return True
 
     def _trigger_tap_xy(self, widget, x: float, y: float):
-        if not self.vcm.is_open():
-            return False
         alloc = widget.get_allocation()
         ox, oy, rw, rh = self._compute_video_rect(alloc.width, alloc.height)
         if rw <= 0 or rh <= 0:
@@ -1097,10 +1107,19 @@ class PistaCameraWindow(Gtk.Window):
         nx = (x - ox) / rw
         ny = (y - oy) / rh
         if 0.0 <= nx <= 1.0 and 0.0 <= ny <= 1.0:
-            # Switching back to AF if in MF when user taps viewfinder
-            self._set_af_button_state(True)
-            self.af_engine.caf_enabled = True
-            self.af_engine.trigger_af(nx, ny)
+            # Always update AE metering ROI (Tap-to-Meter works on ALL 4 cameras!)
+            self.ae_ctrl.set_metering_point(nx, ny)
+            if self.vcm.is_open():
+                # Switching back to AF if in MF when user taps viewfinder
+                self._set_af_button_state(True)
+                self.af_engine.caf_enabled = True
+                self.af_engine.trigger_af(nx, ny)
+            else:
+                self.reticle_pos = (nx, ny)
+                self.reticle_state = "locked"
+                self.reticle_label = "已测光"
+                self.reticle_until = time.monotonic() + 1.6
+                self.reticle_area.queue_draw()
             return True
         return False
 
@@ -1217,9 +1236,6 @@ class PistaCameraWindow(Gtk.Window):
         with self._burst_lock:
             need_burst = self._burst_active
 
-        if not need_burst and not self.vcm.is_open():
-            return Gst.PadProbeReturn.OK
-
         ok, mi = buf.map(Gst.MapFlags.READ)
         if ok:
             try:
@@ -1228,8 +1244,10 @@ class PistaCameraWindow(Gtk.Window):
                     arr = np.frombuffer(mi.data, dtype=np.uint8, count=w * h * bpp).reshape((h, w, bpp))
                     if need_burst:
                         self._handle_burst_frame(arr, fmt)
-                    elif self.vcm.is_open():
-                        self.af_engine.process_frame(arr)
+                    else:
+                        self.ae_ctrl.process_frame(arr, fmt)
+                        if self.vcm.is_open():
+                            self.af_engine.process_frame(arr)
             finally:
                 buf.unmap(mi)
         return Gst.PadProbeReturn.OK
@@ -1262,12 +1280,20 @@ class PistaCameraWindow(Gtk.Window):
                     self._hdr_wait = 3  # wait 3 frames (2-frame pipeline delay + 1 margin)
                     GLib.idle_add(self.status_lbl.set_text, f"HDR 包围曝光采集中 ({idx}/{len(self._hdr_brackets)})...")
                     return
-                # Restore original sensor exposure + analog gain
+                # Restore original sensor exposure + analog gain and sync SmartAE
                 if self.sensor_ctrl and self._hdr_orig_exp is not None:
-                    self.sensor_ctrl.set_exposure_and_gain(self._hdr_orig_exp, getattr(self, "_hdr_orig_gain", None))
+                    og = getattr(self, "_hdr_orig_gain", None)
+                    self.sensor_ctrl.set_exposure_and_gain(self._hdr_orig_exp, og)
+                    self.ae_ctrl.cur_exp = self._hdr_orig_exp
+                    if og is not None:
+                        self.ae_ctrl.cur_gain = og
+                    self.ae_ctrl.wait_frames = 3
                 self._burst_active = False
                 done_payload = (list(self._burst_frames), self._burst_mode)
             else:
+                # Hold SmartAE exposure steady across MFNR burst frames
+                if self.sensor_ctrl and self.ae_ctrl.cur_exp is not None:
+                    self.sensor_ctrl.set_exposure_and_gain(self.ae_ctrl.cur_exp, self.ae_ctrl.cur_gain)
                 self._burst_frames.append(self._extract_rgb_copy(arr, fmt))
                 idx = len(self._burst_frames)
                 if idx < self._burst_target:
@@ -1300,6 +1326,7 @@ class PistaCameraWindow(Gtk.Window):
         c = self.current_cam()
         cal = self.current_cal()
         self.sensor_ctrl = photo_isp.SensorControlHelper(c.get("sensor_prefix", ""))
+        self.ae_ctrl.configure(c["key"], self.sensor_ctrl)
         self.update_header()
 
         # Open VCM lens actuator if supported on this camera
@@ -1402,13 +1429,18 @@ class PistaCameraWindow(Gtk.Window):
                 self._burst_active = True
                 self.status_lbl.set_text("正在拍摄直出照片...")
             elif mode == "hdr":
-                orig_exp = self.sensor_ctrl.get_exposure() if self.sensor_ctrl else None
-                orig_gain = self.sensor_ctrl.get_gain() if self.sensor_ctrl else None
-                if orig_exp and orig_exp >= 12:
+                orig_exp = self.ae_ctrl.cur_exp if self.ae_ctrl.cur_exp is not None else (
+                    self.sensor_ctrl.get_exposure() if self.sensor_ctrl else None
+                )
+                orig_gain = self.ae_ctrl.cur_gain if self.ae_ctrl.cur_gain is not None else (
+                    self.sensor_ctrl.get_gain() if self.sensor_ctrl else None
+                )
+                if orig_exp and orig_exp >= 4:
                     skey = self.current_cam()["key"]
-                    b_lo = self.sensor_ctrl.compute_ev_bracket(skey, orig_exp, orig_gain, 0.30)
+                    # Wider -3.0 EV dark bracket prevents bright screen clipping in HDR mode
+                    b_lo = self.sensor_ctrl.compute_ev_bracket(skey, orig_exp, orig_gain, 0.12)
                     b_mid = (orig_exp, orig_gain)
-                    b_hi = self.sensor_ctrl.compute_ev_bracket(skey, orig_exp, orig_gain, 2.80)
+                    b_hi = self.sensor_ctrl.compute_ev_bracket(skey, orig_exp, orig_gain, 2.50)
                     self._hdr_orig_exp = orig_exp
                     self._hdr_orig_gain = orig_gain
                     self._hdr_brackets = [b_lo, b_mid, b_hi]

@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: CC0-1.0
+# Calibrated libcamera Simple SoftISP tuning for Realme GT7 Pro (pista)
+# Rear 50MP 1x Main Wide — Sony IMX906
+# Auto BlackLevel (avoids IMX355 12/255 AWB underflow) + damped stock CCM (alpha=0.30)
+%YAML 1.1
+---
+version: 1
+algorithms:
+  - BlackLevel:
+  - Awb:
+  - Ccm:
+      ccms:
+        - ct: 2800
+          ccm: [  1.1679, -0.1828,  0.0149,
+                 -0.0692,  1.0262,  0.0430,
+                 -0.0173, -0.2623,  1.2796 ]
+        - ct: 4000
+          ccm: [  1.1203, -0.1273,  0.0070,
+                 -0.0429,  1.0248,  0.0181,
+                  0.0087, -0.2198,  1.2111 ]
+        - ct: 5300
+          ccm: [  1.1372, -0.1259, -0.0113,
+                 -0.0594,  1.0746, -0.0152,
+                  0.0016, -0.1935,  1.1919 ]
+        - ct: 6500
+          ccm: [  1.1739, -0.1665, -0.0074,
+                 -0.0470,  1.1041, -0.0571,
+                  0.0045, -0.1768,  1.1723 ]
+  - Adjust:
+...
