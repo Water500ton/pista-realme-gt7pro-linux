@@ -838,25 +838,32 @@ def apply_ltm_and_filmic(lin_rgb: np.ndarray, profile: dict, is_hdr: bool = Fals
     gain_ltm = np.power(2.0, delta).astype(np.float32)
     mapped = lin_rgb * gain_ltm[:, :, None]
 
-    # Filmic highlight shoulder (Reinhard-extended soft rolloff prevents harsh clipping)
-    white_pt = 1.25 if is_hdr else 1.35
-    mapped = (mapped * (1.0 + mapped / (white_pt * white_pt))) / (1.0 + mapped)
+    # Highlight-preserving soft-knee shoulder (leaves 0..0.72 linear 1:1 so clean whites stay
+    # bright and punchy instead of dull gray, while smoothly rolling off speculars >0.72 -> 1.0)
+    knee = 0.70 if is_hdr else 0.74
+    over = np.maximum(0.0, mapped - knee)
+    headroom = 1.0 - knee
+    mapped = np.where(
+        mapped <= knee,
+        mapped,
+        knee + headroom * (over / (over + headroom * 0.85)),
+    )
     mapped = np.clip(mapped, 0.0, 1.0)
 
     # Linear -> sRGB gamma
     srgb = np.power(mapped, 1.0 / 2.2)
 
-    # Subtle Filmic S-curve contrast in sRGB (deepens blacks slightly, pops midtones)
-    # s(x) = x + c * x * (1 - x) * (x - 0.5)
-    srgb = np.clip(srgb + 0.28 * srgb * (1.0 - srgb) * (srgb - 0.48), 0.0, 1.0)
+    # Subtle Filmic S-curve contrast in sRGB (crisp blacks + clean bright midtones)
+    srgb = np.clip(srgb + 0.36 * srgb * (1.0 - srgb) * (srgb - 0.44), 0.0, 1.0)
 
     # Smart Vibrance (boosts muted colors more than already-vivid skin/reds)
-    if vibrance > 0.0:
+    eff_vib = vibrance + 0.06
+    if eff_vib > 0.0:
         mx = np.max(srgb, axis=2, keepdims=True)
         mn = np.min(srgb, axis=2, keepdims=True)
         sat = (mx - mn) / (mx + 1e-4)
         luma = (0.299 * srgb[:, :, 0:1] + 0.587 * srgb[:, :, 1:2] + 0.114 * srgb[:, :, 2:3])
-        boost = 1.0 + vibrance * (1.0 - sat) * np.clip(luma * 2.5, 0.0, 1.0)
+        boost = 1.0 + eff_vib * (1.0 - sat) * np.clip(luma * 2.5, 0.0, 1.0)
         srgb = np.clip(luma + (srgb - luma) * boost, 0.0, 1.0)
 
     return srgb
@@ -901,12 +908,12 @@ def apply_denoise_and_asf(srgb: np.ndarray, profile: dict, is_night: bool = Fals
     det_med = y_fine - y_med
 
     # Adaptive noise coring (dead-zone rejects sensor grain in flat shadows)
-    core_thr = 0.018 if is_night else 0.012
+    core_thr = 0.016 if is_night else 0.010
     det_fine_c = np.sign(det_fine) * np.maximum(0.0, np.abs(det_fine) - core_thr)
     det_med_c = np.sign(det_med) * np.maximum(0.0, np.abs(det_med) - core_thr * 0.7)
 
     # Overshoot clamp prevents harsh white halos on high-contrast silhouettes
-    detail = np.clip(sharpen * det_fine_c + (sharpen * 0.45) * det_med_c, -0.085, 0.085)
+    detail = np.clip((sharpen * 1.18) * det_fine_c + (sharpen * 0.52) * det_med_c, -0.095, 0.095)
     y = np.clip(y + detail, 0.0, 1.0)
 
     # YCbCr -> sRGB
