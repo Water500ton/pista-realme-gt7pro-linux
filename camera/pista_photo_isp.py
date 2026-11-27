@@ -314,9 +314,6 @@ class SmartAEController:
             return
         if self.wait_frames > 0:
             self.wait_frames -= 1
-            # Re-apply current (exp, gain) each frame so libcamera DelayedControls never replays stale values
-            if self.cur_exp is not None:
-                self.sc.set_exposure_and_gain(self.cur_exp, self.cur_gain)
             return
 
         # Subsample 16x for ultra-fast metering (~120x90 grid)
@@ -374,10 +371,9 @@ class SmartAEController:
             min_safe_ratio = max(0.20, (42.0 / max(10.0, w_luma)) ** 1.85)
             ratio = min(ratio, max(hl_ratio, min_safe_ratio))
 
-        # Deadband: avoid micro-hunting / flicker when already well-exposed
+        # Deadband: avoid micro-hunting / unnecessary I2C writes when already well-exposed
+        # (libpista_ae_guard.so prevents libcamera DelayedControls from overwriting our regs)
         if 0.89 <= ratio <= 1.12:
-            if self.cur_exp is not None:
-                self.sc.set_exposure_and_gain(self.cur_exp, self.cur_gain)
             return
 
         # Damped step in log-exposure space for smooth, rapid convergence (3-5 frames)
@@ -398,8 +394,8 @@ class SmartAEController:
         max_g_cap = {"rear_main": 24.0, "rear_tele": 28.0, "rear_uw": 15.0, "front": 4.57}.get(self.sensor_key, 16.0)
         new_exp, new_gain = self.sc.total_ev_to_regs(self.sensor_key, new_total, max_gain_lin=max_g_cap)
 
-        self.sc.set_exposure_and_gain(new_exp, new_gain)
         if new_exp != exp_now or new_gain != gain_now:
+            self.sc.set_exposure_and_gain(new_exp, new_gain)
             self.cur_exp, self.cur_gain = new_exp, new_gain
             # Wait 2 frames for sensor+SoftISP pipeline latency before next measurement
             self.wait_frames = 2
