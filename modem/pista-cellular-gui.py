@@ -136,7 +136,8 @@ def signal_bars(rsrp: int | None) -> str:
 class CellularWindow(Gtk.Window):
     def __init__(self):
         super().__init__(title="5G 蜂窝网络 · Realme GT7 Pro")
-        self.set_default_size(460, 740)
+        self.set_icon_name("smartphone")
+        self.set_default_size(460, 860)
         self.set_border_width(14)
 
         provider = Gtk.CssProvider()
