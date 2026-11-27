@@ -17,8 +17,38 @@
 #include <dlfcn.h>
 #include <linux/videodev2.h>
 #include <stdarg.h>
+#include <stddef.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* Fast 3-channel per-pixel LUT transform for real-time highlight-immune AWB guard (<1ms @ 1080p) */
+void pista_apply_lut_4ch(const uint8_t *restrict src, uint8_t *restrict dst,
+                         size_t n_pixels,
+                         const uint8_t *restrict lut0,
+                         const uint8_t *restrict lut1,
+                         const uint8_t *restrict lut2) {
+    for (size_t i = 0; i < n_pixels; i++) {
+        size_t o = i * 4;
+        dst[o + 0] = lut0[src[o + 0]];
+        dst[o + 1] = lut1[src[o + 1]];
+        dst[o + 2] = lut2[src[o + 2]];
+        dst[o + 3] = src[o + 3];
+    }
+}
+
+void pista_apply_lut_3ch(const uint8_t *restrict src, uint8_t *restrict dst,
+                         size_t n_pixels,
+                         const uint8_t *restrict lut0,
+                         const uint8_t *restrict lut1,
+                         const uint8_t *restrict lut2) {
+    for (size_t i = 0; i < n_pixels; i++) {
+        size_t o = i * 3;
+        dst[o + 0] = lut0[src[o + 0]];
+        dst[o + 1] = lut1[src[o + 1]];
+        dst[o + 2] = lut2[src[o + 2]];
+    }
+}
 
 typedef int (*real_ioctl_fn)(int, unsigned long, ...);
 

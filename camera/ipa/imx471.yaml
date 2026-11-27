@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: CC0-1.0
 # Calibrated libcamera Simple SoftISP tuning for Realme GT7 Pro (pista)
 # Front 16MP Selfie — Sony IMX471 / IMX480
-# Auto BlackLevel (avoids IMX355 12/255 AWB underflow) + damped stock CCM (alpha=0.20)
+# Calibrated BlackLevel 3840 (15/255; raw floor 65/1023) + damped stock CCM (alpha=0.20)
 %YAML 1.1
 ---
 version: 1
 algorithms:
   - BlackLevel:
+      blackLevel: 3840
   - Awb:
   - Ccm:
       ccms:

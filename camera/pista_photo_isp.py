@@ -11,6 +11,7 @@ Ports core smartphone ISP stages using Realme GT7 Pro optical profiles & factory
   - Standard smartphone EXIF embedding (Make/Model/Lens/FocalLength/FNumber/ISO/Exposure/Focus)
 """
 
+import ctypes
 import datetime
 import fcntl
 import glob
@@ -348,7 +349,10 @@ class SmartAEController:
         # Weighted scene luminance: 65% ROI + 35% global
         w_luma = 0.65 * float(np.mean(roi_luma)) + 0.35 * float(np.mean(luma))
         roi_p96 = float(np.percentile(roi_peak, 96))
-        global_p97 = float(np.percentile(peak, 97))
+        # Use p94 (6% area) for non-ROI global highlights so a small corner ceiling bulb
+        # (2-5% of frame) never drags a selfie/indoor scene dark, while large bright screens
+        # (>6% of frame or inside the center ROI) still receive full highlight protection.
+        global_p94 = float(np.percentile(peak, 94))
         clip_frac = float(np.mean(roi_peak >= 246.0))
         global_clip = float(np.mean(peak >= 248.0))
 
@@ -362,16 +366,15 @@ class SmartAEController:
         # 2. Continuous, Hysteresis-Free Highlight Ceiling (ZERO breathing/pumping!):
         # Always compute a smooth monotonic upper bound from eff_p96 toward 242/255 so AE
         # glides smoothly to the highlight ceiling and stops dead inside the deadband,
-        # while keeping overall indoor brightness >= 82 (prevents UW from looking dark
-        # when a bright monitor or lamp sits inside its wide 112-deg field of view).
-        eff_p96 = max(roi_p96, global_p97 * 0.90)
+        # while keeping overall indoor brightness >= 88.
+        eff_p96 = max(roi_p96, global_p94 * 0.90)
         if w_luma > 38.0 and eff_p96 > 205.0:
             hl_target = 242.0
             hl_ratio = (hl_target / eff_p96) ** 1.85
             if clip_frac > 0.16 or global_clip > 0.18:
                 hl_ratio = min(hl_ratio, 0.80)
-            # Never drag overall scene below a natural bright floor (~82 luma)
-            min_safe_ratio = max(0.35, (82.0 / max(10.0, w_luma)) ** 1.85)
+            # Never drag overall scene below a natural bright floor (~88 luma)
+            min_safe_ratio = max(0.35, (88.0 / max(10.0, w_luma)) ** 1.85)
             ratio = min(ratio, max(hl_ratio, min_safe_ratio))
 
         # Deadband: lock rock-solid once within ~14% of target/ceiling (eliminates micro-pumping)
@@ -429,6 +432,163 @@ class SmartAEController:
                 iso = int(round(100.0 * (1024.0 / denom)))
         iso = max(50, min(12800, iso))
         return exp_sec, iso
+
+
+_SRGB_U8_TO_LIN = ((np.arange(256, dtype=np.float32) / 255.0) ** 2.2).astype(np.float32)
+
+
+class SmartAWBGuard:
+    """Real-time highlight-immune AWB green-cast guard for live preview & burst capture.
+
+    libcamera v0.7.2 IPASoftAwb computes Gray-World gains across ALL pixels including
+    saturated (1023,1023,1023) light sources. When a bright lamp, ceiling light, or sun
+    clips even 1-5% of the frame, its 1:1:1 raw sum drags gainR and gainB down toward 1.0,
+    turning unclipped white ceilings, walls, and skin tones green.
+
+    This strictly feedforward guard measures ONLY unclipped, non-black neutral-axis pixels
+    from libcamera's output, computes linear-light R/B restoration gains (with G=1.0 so
+    clipped white lamps stay pure (255,255,255) white and never turn magenta), and applies
+    precomputed 256-byte LUTs in <1ms via libpista_ae_guard.so.
+    """
+
+    def __init__(self):
+        self.gain_r = 1.0
+        self.gain_b = 1.0
+        self._lut_r = np.arange(256, dtype=np.uint8)
+        self._lut_g = np.arange(256, dtype=np.uint8)
+        self._lut_b = np.arange(256, dtype=np.uint8)
+        self._built_gains = (1.0, 1.0)
+        self._fn_4ch = None
+        self._fn_3ch = None
+        self._load_c_helper()
+
+    def _load_c_helper(self):
+        c_u8p = ctypes.c_void_p
+        for lib_path in (None, "/usr/local/lib/libpista_ae_guard.so"):
+            try:
+                lib = ctypes.CDLL(lib_path)
+                fn4 = lib.pista_apply_lut_4ch
+                fn4.argtypes = [c_u8p, c_u8p, ctypes.c_size_t, c_u8p, c_u8p, c_u8p]
+                fn4.restype = None
+                fn3 = lib.pista_apply_lut_3ch
+                fn3.argtypes = [c_u8p, c_u8p, ctypes.c_size_t, c_u8p, c_u8p, c_u8p]
+                fn3.restype = None
+                self._fn_4ch = fn4
+                self._fn_3ch = fn3
+                return
+            except Exception:
+                continue
+
+    def reset(self):
+        self.gain_r = 1.0
+        self.gain_b = 1.0
+        self._built_gains = (1.0, 1.0)
+        self._lut_r = np.arange(256, dtype=np.uint8)
+        self._lut_b = np.arange(256, dtype=np.uint8)
+
+    def _rebuild_luts(self):
+        if abs(self.gain_r - self._built_gains[0]) < 0.004 and abs(self.gain_b - self._built_gains[1]) < 0.004:
+            return
+        r_lin = np.clip(_SRGB_U8_TO_LIN * self.gain_r, 0.0, 1.0)
+        b_lin = np.clip(_SRGB_U8_TO_LIN * self.gain_b, 0.0, 1.0)
+        self._lut_r = np.clip(np.round((r_lin ** (1.0 / 2.2)) * 255.0), 0, 255).astype(np.uint8)
+        self._lut_b = np.clip(np.round((b_lin ** (1.0 / 2.2)) * 255.0), 0, 255).astype(np.uint8)
+        self._built_gains = (self.gain_r, self.gain_b)
+
+    def analyze_frame(self, arr_u8: np.ndarray, fmt: str):
+        """Measure unclipped midtones from pre-LUT frame and smoothly update R/B restoration gains."""
+        sub = arr_u8[::16, ::16, :3]
+        if sub.shape[0] < 8 or sub.shape[1] < 8:
+            return
+        if fmt in ("BGRA", "BGRx", "BGR"):
+            r_u8 = sub[:, :, 2]
+            g_u8 = sub[:, :, 1]
+            b_u8 = sub[:, :, 0]
+        else:
+            r_u8 = sub[:, :, 0]
+            g_u8 = sub[:, :, 1]
+            b_u8 = sub[:, :, 2]
+
+        peak_u8 = np.maximum(np.maximum(r_u8, g_u8), b_u8)
+        clip_frac = float(np.mean(peak_u8 >= 242))
+
+        r_lin = _SRGB_U8_TO_LIN[r_u8]
+        g_lin = _SRGB_U8_TO_LIN[g_u8]
+        b_lin = _SRGB_U8_TO_LIN[b_u8]
+
+        rb_spread = np.abs(r_lin - b_lin) / (g_lin + 1e-4)
+        if clip_frac >= 0.002:
+            # Saturated light source present: IPASoftAwb is physically poisoned toward green.
+            # Measure all unclipped, non-black neutral-axis pixels (both R and B depressed together).
+            mask = (peak_u8 >= 22) & (peak_u8 <= 238) & (rb_spread < 0.48)
+            min_thresh = 1.04
+            strength = 0.94
+            max_gain = 2.15
+        else:
+            # No clipped highlight: only gently correct clear neutral-white green casts (avoid touching plants).
+            mx = np.maximum(np.maximum(r_lin, g_lin), b_lin)
+            mn = np.minimum(np.minimum(r_lin, g_lin), b_lin)
+            chroma = (mx - mn) / (mx + 1e-4)
+            mask = (peak_u8 >= 28) & (peak_u8 <= 236) & (rb_spread < 0.24) & (chroma < 0.36)
+            min_thresh = 1.08
+            strength = 0.78
+            max_gain = 1.35
+
+        target_r = 1.0
+        target_b = 1.0
+        if int(np.count_nonzero(mask)) >= 40:
+            rm = float(np.mean(r_lin[mask]))
+            gm = float(np.mean(g_lin[mask]))
+            bm = float(np.mean(b_lin[mask]))
+            if rm > 1e-4 and gm > 1e-4 and bm > 1e-4:
+                need_r = gm / rm
+                need_b = gm / bm
+                common = min(need_r, need_b)
+                if common > min_thresh:
+                    # Restore common green-cast depression in full, plus partial R/B balance
+                    base = 1.0 + strength * (common - 1.0)
+                    tr = base * ((need_r / common) ** 0.65)
+                    tb = base * ((need_b / common) ** 0.65)
+                    target_r = max(1.0, min(max_gain, tr))
+                    target_b = max(1.0, min(max_gain, tb))
+
+        # Smooth exponential moving average (fast initial snap, rock-solid steady state)
+        alpha = 0.35 if abs(target_r - self.gain_r) > 0.12 or abs(target_b - self.gain_b) > 0.12 else 0.20
+        self.gain_r += alpha * (target_r - self.gain_r)
+        self.gain_b += alpha * (target_b - self.gain_b)
+        if self.gain_r < 1.015 and self.gain_b < 1.015:
+            self.gain_r = 1.0
+            self.gain_b = 1.0
+        self._rebuild_luts()
+
+    def is_active(self) -> bool:
+        return self.gain_r > 1.015 or self.gain_b > 1.015
+
+    def apply_to_arrays(self, src: np.ndarray, dst: np.ndarray, fmt: str):
+        """Apply R/B restoration LUT from src to dst in <1ms via C helper (or NumPy fallback)."""
+        h, w, bpp = src.shape
+        if fmt in ("BGRA", "BGRx", "BGR"):
+            l0, l1, l2 = self._lut_b, self._lut_g, self._lut_r
+        else:
+            l0, l1, l2 = self._lut_r, self._lut_g, self._lut_b
+
+        if bpp == 4 and self._fn_4ch is not None:
+            self._fn_4ch(
+                src.ctypes.data, dst.ctypes.data, h * w,
+                l0.ctypes.data, l1.ctypes.data, l2.ctypes.data,
+            )
+            return
+        if bpp == 3 and self._fn_3ch is not None:
+            self._fn_3ch(
+                src.ctypes.data, dst.ctypes.data, h * w,
+                l0.ctypes.data, l1.ctypes.data, l2.ctypes.data,
+            )
+            return
+        dst[:, :, 0] = l0[src[:, :, 0]]
+        dst[:, :, 1] = l1[src[:, :, 1]]
+        dst[:, :, 2] = l2[src[:, :, 2]]
+        if bpp == 4:
+            dst[:, :, 3] = src[:, :, 3]
 
 
 # ---------------------------------------------------------------------------
@@ -801,8 +961,8 @@ def apply_lsc_linear(lin_rgb: np.ndarray, profile: dict, rot_deg: int, mirror: b
 def apply_awb_green_guard(lin_rgb: np.ndarray) -> np.ndarray:
     """Correct residual green cast caused when bright white lamps fool Gray-World AWB.
 
-    Measures only non-clipped, non-black neutral-ish midtones so vivid foliage/objects
-    are never over-corrected, while white light sources & skin stay clean and neutral.
+    Measures only non-clipped, non-black neutral-axis midtones so vivid foliage/objects
+    are never over-corrected, while white light sources, ceilings, & skin stay neutral.
     """
     sub = lin_rgb[::8, ::8, :]
     r, g, b = sub[:, :, 0], sub[:, :, 1], sub[:, :, 2]
@@ -810,10 +970,15 @@ def apply_awb_green_guard(lin_rgb: np.ndarray) -> np.ndarray:
     mx = np.maximum(np.maximum(r, g), b)
     mn = np.minimum(np.minimum(r, g), b)
     chroma = (mx - mn) / (mx + 1e-4)
+    rb_spread = np.abs(r - b) / (g + 1e-4)
+    has_clip = float(np.mean(mx >= 0.90)) >= 0.002
 
     # Select midtone, near-neutral pixels (exclude clipped highlights and black shadows)
-    mask = (y > 0.04) & (y < 0.68) & (chroma < 0.38)
-    if int(np.count_nonzero(mask)) < 80:
+    if has_clip:
+        mask = (y > 0.015) & (mx < 0.85) & (rb_spread < 0.48)
+    else:
+        mask = (y > 0.03) & (y < 0.68) & (chroma < 0.38)
+    if int(np.count_nonzero(mask)) < 60:
         return lin_rgb
 
     rm = float(np.mean(r[mask]))
@@ -823,14 +988,19 @@ def apply_awb_green_guard(lin_rgb: np.ndarray) -> np.ndarray:
     if rb_avg <= 1e-4 or gm <= 1e-4:
         return lin_rgb
 
-    # Neutralize genuine green excess (>5% over R/B mean) or red excess (>7% over G/B mean)
+    # Neutralize genuine green excess (boost R/B up so clipped white lamps stay white!)
     out = lin_rgb
-    g_ratio = gm / rb_avg
+    common_g = min(gm / max(1e-4, rm), gm / max(1e-4, bm))
     r_ratio = rm / max(1e-4, 0.5 * (gm + bm))
-    if g_ratio > 1.05:
-        corr_g = max(0.86, min(1.0, 1.04 / g_ratio))
+    if common_g > 1.04:
+        max_g = 2.05 if has_clip else 1.25
+        strength = 0.92 if has_clip else 0.78
+        base = 1.0 + strength * (common_g - 1.0)
+        gr = min(max_g, base * (((gm / max(1e-4, rm)) / common_g) ** 0.60))
+        gb = min(max_g, base * (((gm / max(1e-4, bm)) / common_g) ** 0.60))
         out = out.copy()
-        out[:, :, 1] *= corr_g
+        out[:, :, 0] *= gr
+        out[:, :, 2] *= gb
     elif r_ratio > 1.07:
         corr_r = max(0.88, min(1.0, 1.05 / r_ratio))
         out = out.copy()

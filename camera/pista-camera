@@ -891,6 +891,7 @@ class PistaCameraWindow(Gtk.Window):
         self.vcm = VcmController()
         self.af_engine = StockStyleAFEngine(self.vcm, self.on_af_update)
         self.ae_ctrl = photo_isp.SmartAEController()
+        self.awb_guard = photo_isp.SmartAWBGuard()
         self._slider_updating = False
         self.reticle_state = None   # None, "scanning", "locked", "fallback"
         self.reticle_pos = (0.5, 0.5)
@@ -1259,20 +1260,44 @@ class PistaCameraWindow(Gtk.Window):
         with self._burst_lock:
             need_burst = self._burst_active
 
+        out_buf = None
         ok, mi = buf.map(Gst.MapFlags.READ)
         if ok:
+            out_mi = None
             try:
                 bpp = len(mi.data) // max(1, w * h)
                 if bpp >= 3 and len(mi.data) >= w * h * bpp:
                     arr = np.frombuffer(mi.data, dtype=np.uint8, count=w * h * bpp).reshape((h, w, bpp))
+                    if not need_burst:
+                        self.awb_guard.analyze_frame(arr, fmt)
+
+                    active_arr = arr
+                    if self.awb_guard.is_active():
+                        cand_buf = Gst.Buffer.new_allocate(None, len(mi.data), None)
+                        cand_buf.pts = buf.pts
+                        cand_buf.dts = buf.dts
+                        cand_buf.duration = buf.duration
+                        cand_buf.offset = buf.offset
+                        ok2, cand_mi = cand_buf.map(Gst.MapFlags.WRITE)
+                        if ok2:
+                            out_buf = cand_buf
+                            out_mi = cand_mi
+                            out_arr = np.frombuffer(out_mi.data, dtype=np.uint8, count=w * h * bpp).reshape((h, w, bpp))
+                            self.awb_guard.apply_to_arrays(arr, out_arr, fmt)
+                            active_arr = out_arr
+
                     if need_burst:
-                        self._handle_burst_frame(arr, fmt)
+                        self._handle_burst_frame(active_arr, fmt)
                     else:
-                        self.ae_ctrl.process_frame(arr, fmt)
+                        self.ae_ctrl.process_frame(active_arr, fmt)
                         if self.vcm.is_open():
-                            self.af_engine.process_frame(arr)
+                            self.af_engine.process_frame(active_arr)
             finally:
+                if out_buf is not None and out_mi is not None:
+                    out_buf.unmap(out_mi)
                 buf.unmap(mi)
+        if out_buf is not None:
+            info.set_buffer(out_buf)
         return Gst.PadProbeReturn.OK
 
     def _extract_rgb_copy(self, arr: np.ndarray, fmt: str) -> np.ndarray:
@@ -1350,6 +1375,7 @@ class PistaCameraWindow(Gtk.Window):
         cal = self.current_cal()
         self.sensor_ctrl = photo_isp.SensorControlHelper(c.get("sensor_prefix", ""))
         self.ae_ctrl.configure(c["key"], self.sensor_ctrl)
+        self.awb_guard.reset()
         self.update_header()
 
         # Open VCM lens actuator if supported on this camera
