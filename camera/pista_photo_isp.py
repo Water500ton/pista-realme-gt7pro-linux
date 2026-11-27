@@ -849,6 +849,13 @@ def apply_ltm_and_filmic(lin_rgb: np.ndarray, profile: dict, is_hdr: bool = Fals
     # Linear -> sRGB gamma
     srgb = np.power(mapped, 1.0 / 2.2)
 
+    # Gentle anti-haze black-point anchor (clears periscope / backlight veiling flare when
+    # darkest 2% of image sits washed-out above 0.14 sRGB, without crushing true shadows)
+    p02 = float(np.percentile(srgb[::16, ::16], 2))
+    if p02 > 0.14:
+        bp = min(0.08, (p02 - 0.12) * 0.55)
+        srgb = np.clip((srgb - bp) / (1.0 - bp), 0.0, 1.0)
+
     # Subtle Filmic S-curve contrast in sRGB (crisp blacks + clean bright midtones)
     srgb = np.clip(srgb + 0.36 * srgb * (1.0 - srgb) * (srgb - 0.44), 0.0, 1.0)
 

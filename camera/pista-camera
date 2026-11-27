@@ -98,7 +98,7 @@ DEFAULT_AF_CALIB = {
         "dac_macro": 851,
         "dist_macro_cm": 65,
         "dac_min": 240,
-        "dac_max": 910,
+        "dac_max": 985,
         "dac_hyperfocal": 400,
     },
 }
@@ -137,8 +137,8 @@ CAMERAS = [
         "vcm_name": "ak7375 4-002d",
         "width": 2048,
         "height": 1536,
-        "rot_deg": 270,
-        "mirror": False,
+        "rot_deg": 90,    # periscope prism adds 1 mirror reflection -> 90° CW + H-flip (upper-left-diagonal)
+        "mirror": True,
     },
     {
         "key": "front",
@@ -228,7 +228,7 @@ def calibrate_eeprom_cli():
                     dac_macro = round(macro_12 / 4.0)
                     dac_mid = round(mid_12 / 4.0) if inf_12 < mid_12 < macro_12 else (dac_inf + dac_macro) // 2
                     dac_min = max(20, dac_inf - 45)
-                    dac_max = min(1000, dac_macro + 45)
+                    dac_max = min(1000, max(985 if key == "rear_tele" else 960, dac_macro + 45))
                     d_inf = 100.0 / dist_inf
                     d_mac = 100.0 / dist_macro
                     d_hyp = 100.0 / (150.0 if key == "rear_main" else 350.0)
