@@ -14,6 +14,22 @@ import sys
 import threading
 import time
 
+# Auto-enable zero-flicker AE guard (stops libcamera DelayedControls from overwriting
+# SmartAEController / HDR bracketing on SOF) before libcamera.so is loaded via Gst.
+_AE_GUARD_SO = "/usr/local/lib/libpista_ae_guard.so"
+if (
+    "--calibrate-eeprom" not in sys.argv
+    and os.path.isfile(_AE_GUARD_SO)
+    and _AE_GUARD_SO not in os.environ.get("LD_PRELOAD", "")
+):
+    _env = os.environ.copy()
+    _prev = _env.get("LD_PRELOAD", "").strip()
+    _env["LD_PRELOAD"] = f"{_AE_GUARD_SO}:{_prev}" if _prev else _AE_GUARD_SO
+    _env["PISTA_AE_GUARD"] = "1"
+    os.execve(sys.executable, [sys.executable] + sys.argv, _env)
+if _AE_GUARD_SO in os.environ.get("LD_PRELOAD", ""):
+    os.environ["PISTA_AE_GUARD"] = "1"
+
 import gi
 import numpy as np
 

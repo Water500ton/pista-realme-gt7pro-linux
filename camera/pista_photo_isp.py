@@ -744,10 +744,14 @@ def apply_lsc_linear(lin_rgb: np.ndarray, profile: dict, rot_deg: int, mirror: b
         strength = base_strength
 
     # Build transformed 17x13 -> (h, w) RGB gain map
+    # Blend R/B meshes 50% toward G luminance mesh so optical vignetting is fixed cleanly
+    # without introducing global red/magenta tint (e.g. IMX355 golden R/G=1.10).
+    mg_raw = _transform_mesh(np.asarray(profile["lsc_g"], dtype=np.float32).reshape((lh, lw)), rot_deg, mirror)
     gains = []
     for key in ("lsc_r", "lsc_g", "lsc_b"):
-        m = np.asarray(profile[key], dtype=np.float32).reshape((lh, lw))
-        m = _transform_mesh(m, rot_deg, mirror)
+        m = _transform_mesh(np.asarray(profile[key], dtype=np.float32).reshape((lh, lw)), rot_deg, mirror)
+        if key != "lsc_g":
+            m = 0.50 * m + 0.50 * mg_raw
         # Dampen corner boost: gain_eff = 1 + strength * (gain - 1), capped cleanly at 1.95x
         m_eff = np.clip(1.0 + strength * (m - 1.0), 0.92, 1.95)
         gains.append(_resize_float_plane(m_eff, w, h))
@@ -790,14 +794,18 @@ def apply_awb_green_guard(lin_rgb: np.ndarray) -> np.ndarray:
     if rb_avg <= 1e-4 or gm <= 1e-4:
         return lin_rgb
 
-    # Only pull down genuine green excess (>5% over R/B mean), smoothly capped at -14%
+    # Neutralize genuine green excess (>5% over R/B mean) or red excess (>7% over G/B mean)
+    out = lin_rgb
     g_ratio = gm / rb_avg
-    if g_ratio <= 1.05:
-        return lin_rgb
-
-    corr = max(0.86, min(1.0, 1.04 / g_ratio))
-    out = lin_rgb.copy()
-    out[:, :, 1] *= corr
+    r_ratio = rm / max(1e-4, 0.5 * (gm + bm))
+    if g_ratio > 1.05:
+        corr_g = max(0.86, min(1.0, 1.04 / g_ratio))
+        out = out.copy()
+        out[:, :, 1] *= corr_g
+    elif r_ratio > 1.07:
+        corr_r = max(0.88, min(1.0, 1.05 / r_ratio))
+        out = out.copy()
+        out[:, :, 0] *= corr_r
     return out
 
 

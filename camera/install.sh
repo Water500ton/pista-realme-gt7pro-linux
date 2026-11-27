@@ -10,12 +10,15 @@ DEBIAN_FRONTEND=noninteractive apt-get install -y \
     gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-tools \
     python3-gi python3-gst-1.0 python3-pil python3-numpy gir1.2-gtk-3.0
 
-install -d /usr/local/share/pista-camera/ipa/simple /usr/share/libcamera/ipa/simple
+install -d /usr/local/share/pista-camera/ipa/simple /usr/share/libcamera/ipa/simple /usr/local/lib
 install -m 0755 "$SCRIPT_DIR/pista-camera" /usr/local/bin/pista-camera
 install -m 0644 "$SCRIPT_DIR/pista_photo_isp.py" /usr/local/share/pista-camera/pista_photo_isp.py
 install -m 0644 "$SCRIPT_DIR/pista_isp_profiles.json" /usr/local/share/pista-camera/pista_isp_profiles.json
 install -m 0644 "$SCRIPT_DIR/ipa/"*.yaml /usr/share/libcamera/ipa/simple/
 install -m 0644 "$SCRIPT_DIR/ipa_pista/simple/"*.yaml /usr/local/share/pista-camera/ipa/simple/
+if command -v gcc >/dev/null 2>&1 && [ -f "$SCRIPT_DIR/pista_ae_guard.c" ]; then
+    gcc -O2 -shared -fPIC "$SCRIPT_DIR/pista_ae_guard.c" -o /usr/local/lib/libpista_ae_guard.so -ldl
+fi
 install -m 0644 "$SCRIPT_DIR/pista-camera.desktop" /usr/share/applications/pista-camera.desktop
 install -m 0644 "$SCRIPT_DIR/99-pista-camera.rules" /etc/udev/rules.d/99-pista-camera.rules
 
