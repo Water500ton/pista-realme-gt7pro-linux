@@ -354,8 +354,8 @@ class SmartAEController:
         clip_frac = float(np.mean(roi_peak >= 246.0))
         global_clip = float(np.mean(peak >= 248.0))
 
-        # Target middle gray in sRGB (~108/255, comfortable natural exposure without washed-out highlights)
-        target = 108.0 * (2.0 ** (self.ev_bias * 0.45))
+        # Target middle gray in sRGB (~120/255: crisp, bright indoor exposure with highlight guard)
+        target = 120.0 * (2.0 ** (self.ev_bias * 0.45))
 
         # 1. Base exposure ratio (convert sRGB luminance ratio to linear light via gamma ~1.9)
         meas = max(4.0, w_luma)
@@ -889,6 +889,10 @@ def apply_denoise_and_asf(srgb: np.ndarray, profile: dict, is_night: bool = Fals
     blend = (1.0 - edge_mask) * dark_w
     cb = cb * (1.0 - blend) + cb_sm * blend
     cr = cr * (1.0 - blend) + cr_sm * blend
+    # Gently desaturate ultra-dark shadow floor (y < 0.10) to keep blacks clean & neutral
+    shadow_sat = np.clip((y - 0.015) / 0.095, 0.35, 1.0)
+    cb *= shadow_sat
+    cr *= shadow_sat
 
     # 2. Multi-Scale Halo-Free Sharpening (Qualcomm ASF352 style with noise coring + clamp)
     y_fine = _box_blur_1d(_box_blur_1d(y, 1, 0), 1, 1)

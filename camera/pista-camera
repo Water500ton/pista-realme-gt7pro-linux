@@ -924,6 +924,13 @@ class PistaCameraWindow(Gtk.Window):
         self.mirror_btn.connect("clicked", self.on_mirror)
         top.pack_end(self.mirror_btn, False, False, 0)
 
+        self.flash_levels = [0, 65, 165]
+        self.flash_idx = 0
+        self.flash_btn = Gtk.Button(label="⚡ 关")
+        self.flash_btn.get_style_context().add_class("tool-btn")
+        self.flash_btn.connect("clicked", self.on_toggle_flash)
+        top.pack_end(self.flash_btn, False, False, 0)
+
         # Viewfinder with tap-to-focus overlay
         self.overlay = Gtk.Overlay()
         self.vf_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
@@ -1411,6 +1418,30 @@ class PistaCameraWindow(Gtk.Window):
         err, _dbg = msg.parse_error()
         self.status_lbl.set_text(f"流错误: {err.message}")
 
+    def _set_flash_idx(self, idx: int):
+        self.flash_idx = idx % len(self.flash_levels)
+        val = self.flash_levels[self.flash_idx]
+        labels = ["⚡ 关", "⚡ 柔光", "⚡ 强光"]
+        try:
+            with open("/sys/class/leds/white:flash/brightness", "w", encoding="utf-8") as f:
+                f.write(str(val))
+        except OSError:
+            self.flash_idx = 0
+            val = 0
+        self.flash_btn.set_label(labels[self.flash_idx])
+        ctx = self.flash_btn.get_style_context()
+        if val > 0:
+            ctx.add_class("af-btn-active")
+        else:
+            ctx.remove_class("af-btn-active")
+
+    def on_toggle_flash(self, _btn):
+        if self.current_cam()["key"] == "front":
+            self._set_flash_idx(0)
+            self.status_lbl.set_text("前置摄像头不支持后置闪光灯")
+            return
+        self._set_flash_idx(self.flash_idx + 1)
+
     def on_rotate(self, _btn):
         c = self.current_cam()
         c["rot_deg"] = (c["rot_deg"] + 90) % 360
@@ -1424,10 +1455,14 @@ class PistaCameraWindow(Gtk.Window):
     def on_select_camera(self, _btn, idx):
         if idx != self.cam_idx:
             self.cam_idx = idx
+            if self.current_cam()["key"] == "front":
+                self._set_flash_idx(0)
             self.start_camera()
 
     def on_switch_camera(self, _btn):
         self.cam_idx = (self.cam_idx + 1) % len(CAMERAS)
+        if self.current_cam()["key"] == "front":
+            self._set_flash_idx(0)
         self.start_camera()
 
     def on_capture(self, _btn):
@@ -1542,6 +1577,7 @@ class PistaCameraWindow(Gtk.Window):
         subprocess.Popen(["xdg-open", self.pictures_dir])
 
     def on_destroy(self, _win):
+        self._set_flash_idx(0)
         self.stop_camera()
         Gtk.main_quit()
 
