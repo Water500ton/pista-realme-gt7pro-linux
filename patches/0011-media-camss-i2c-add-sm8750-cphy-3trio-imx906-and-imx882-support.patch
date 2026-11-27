@@ -1,0 +1,2892 @@
+From: pista-linux contributors <noreply@github.com>
+Subject: [PATCH 11/11] media: camss, i2c: add SM8750 MIPI C-PHY 3-trio, Sony IMX906, and Sony IMX882 support
+
+Add native SM8750 CSIPHY v2.3.0 3-trio MIPI C-PHY support and CSID 980
+C-PHY RX selection to qcom-camss, and add V4L2 subdev drivers for the
+Realme GT7 Pro rear 50MP main wide (Sony IMX906) and rear 50MP 3x
+periscope telephoto (Sony IMX882 / LYT-600) C-PHY sensors.
+
+Signed-off-by: pista-linux contributors <noreply@github.com>
+---
+diff --git a/drivers/media/platform/qcom/camss/camss-csiphy.h b/drivers/media/platform/qcom/camss/camss-csiphy.h
+--- a/drivers/media/platform/qcom/camss/camss-csiphy.h
++++ b/drivers/media/platform/qcom/camss/camss-csiphy.h
+@@ -42,6 +42,7 @@
+ 
+ struct csiphy_csi2_cfg {
+ 	struct csiphy_lanes_cfg lane_cfg;
++	bool is_cphy;
+ };
+ 
+ struct csiphy_config {
+diff --git a/drivers/media/platform/qcom/camss/camss-csid.h b/drivers/media/platform/qcom/camss/camss-csid.h
+--- a/drivers/media/platform/qcom/camss/camss-csid.h
++++ b/drivers/media/platform/qcom/camss/camss-csid.h
+@@ -70,6 +70,7 @@
+ 	u32 lane_assign;
+ 	u32 en_vc;
+ 	u8 need_vc_update;
++	bool is_cphy;
+ };
+ 
+ struct csid_device;
+diff --git a/drivers/media/platform/qcom/camss/camss.c b/drivers/media/platform/qcom/camss/camss.c
+--- a/drivers/media/platform/qcom/camss/camss.c
++++ b/drivers/media/platform/qcom/camss/camss.c
+@@ -5102,20 +5102,23 @@
+ 	if (ret)
+ 		return ret;
+ 
+-	/*
+-	 * Most SoCs support both D-PHY and C-PHY standards, but currently only
+-	 * D-PHY is supported in the driver.
+-	 */
+-	if (vep.bus_type != V4L2_MBUS_CSI2_DPHY) {
++	if (vep.bus_type != V4L2_MBUS_CSI2_DPHY &&
++	    vep.bus_type != V4L2_MBUS_CSI2_CPHY) {
+ 		dev_err(dev, "Unsupported bus type %d\n", vep.bus_type);
+ 		return -EINVAL;
+ 	}
+ 
+ 	csd->interface.csiphy_id = vep.base.port;
++	csd->interface.csi2.is_cphy = (vep.bus_type == V4L2_MBUS_CSI2_CPHY);
+ 
+ 	mipi_csi2 = &vep.bus.mipi_csi2;
+-	lncfg->clk.pos = mipi_csi2->clock_lane;
+-	lncfg->clk.pol = mipi_csi2->lane_polarities[0];
++	if (!csd->interface.csi2.is_cphy) {
++		lncfg->clk.pos = mipi_csi2->clock_lane;
++		lncfg->clk.pol = mipi_csi2->lane_polarities[0];
++	} else {
++		lncfg->clk.pos = 0;
++		lncfg->clk.pol = 0;
++	}
+ 	lncfg->num_data = mipi_csi2->num_data_lanes;
+ 
+ 	lncfg->data = devm_kcalloc(dev,
+@@ -5126,7 +5129,9 @@
+ 
+ 	for (i = 0; i < lncfg->num_data; i++) {
+ 		lncfg->data[i].pos = mipi_csi2->data_lanes[i];
+-		lncfg->data[i].pol = mipi_csi2->lane_polarities[i + 1];
++		lncfg->data[i].pol = csd->interface.csi2.is_cphy ?
++				     mipi_csi2->lane_polarities[i] :
++				     mipi_csi2->lane_polarities[i + 1];
+ 	}
+ 
+ 	return 0;
+diff --git a/drivers/media/platform/qcom/camss/camss-csid.c b/drivers/media/platform/qcom/camss/camss-csid.c
+--- a/drivers/media/platform/qcom/camss/camss-csid.c
++++ b/drivers/media/platform/qcom/camss/camss-csid.c
+@@ -1273,6 +1273,7 @@
+ 			csid->phy.lane_cnt = tpg->res->lane_cnt;
+ 			csid->phy.csiphy_id = tpg->id;
+ 			csid->phy.lane_assign = csid_get_lane_assign(NULL, csid->phy.lane_cnt);
++			csid->phy.is_cphy = false;
+ 			csid->tpg_linked = true;
+ 		} else {
+ 			csiphy = v4l2_get_subdevdata(sd);
+@@ -1287,6 +1288,7 @@
+ 			lane_cfg = &csiphy->cfg.csi2->lane_cfg;
+ 			csid->phy.lane_cnt = lane_cfg->num_data;
+ 			csid->phy.lane_assign = csid_get_lane_assign(lane_cfg, lane_cfg->num_data);
++			csid->phy.is_cphy = csiphy->cfg.csi2->is_cphy;
+ 			csid->tpg_linked = false;
+ 		}
+ 	}
+diff --git a/drivers/media/platform/qcom/camss/camss-csid-980.c b/drivers/media/platform/qcom/camss/camss-csid-980.c
+--- a/drivers/media/platform/qcom/camss/camss-csid-980.c
++++ b/drivers/media/platform/qcom/camss/camss-csid-980.c
+@@ -57,6 +57,7 @@
+ #define		CSI2_RX_CFG0_PHY_SEL_BASE_IDX		1
+ #define		CSI2_RX_CFG0_DL0_INPUT_SEL		4
+ #define		CSI2_RX_CFG0_PHY_NUM_SEL		20
++#define		CSI2_RX_CFG0_PHY_TYPE_SEL		24
+ #define CSID_CSI2_RX_CFG1			(csid_is_lite(csid) ? 0x204 : 0x404)
+ #define		CSI2_RX_CFG1_ECC_CORRECTION_EN		BIT(0)
+ #define		CSI2_RX_CFG1_VC_MODE			BIT(2)
+@@ -184,6 +185,8 @@
+ 	val |= phy->lane_assign << CSI2_RX_CFG0_DL0_INPUT_SEL;
+ 	val |= (phy->csiphy_id + CSI2_RX_CFG0_PHY_SEL_BASE_IDX)
+ 	       << CSI2_RX_CFG0_PHY_NUM_SEL;
++	if (phy->is_cphy)
++		val |= BIT(CSI2_RX_CFG0_PHY_TYPE_SEL);
+ 	writel(val, csid->base + CSID_CSI2_RX_CFG0);
+ 
+ 	val = CSI2_RX_CFG1_ECC_CORRECTION_EN;
+diff --git a/drivers/media/platform/qcom/camss/camss-csiphy.c b/drivers/media/platform/qcom/camss/camss-csiphy.c
+--- a/drivers/media/platform/qcom/camss/camss-csiphy.c
++++ b/drivers/media/platform/qcom/camss/camss-csiphy.c
+@@ -163,9 +163,13 @@
+ 					break;
+ 
+ 			if (j == clock->nfreqs) {
+-				dev_err(dev,
+-					"Pixel clock is too high for CSIPHY\n");
+-				return -EINVAL;
++				if (csiphy->cfg.csi2->is_cphy) {
++					j = clock->nfreqs - 1;
++				} else {
++					dev_err(dev,
++						"Pixel clock is too high for CSIPHY\n");
++					return -EINVAL;
++				}
+ 			}
+ 
+ 			/* if sensor pixel clock is not available */
+diff --git a/drivers/media/platform/qcom/camss/camss-csiphy-3ph-1-0.c b/drivers/media/platform/qcom/camss/camss-csiphy-3ph-1-0.c
+--- a/drivers/media/platform/qcom/camss/camss-csiphy-3ph-1-0.c
++++ b/drivers/media/platform/qcom/camss/camss-csiphy-3ph-1-0.c
+@@ -921,6 +921,137 @@
+ 	{0x0E10, 0x52, 0x00, CSIPHY_DEFAULT_PARAMS},
+ };
+ 
++/* GEN2 2.3.0 3PH 3-trio C-PHY mode for SM8750 */
++static const struct
++csiphy_lane_regs lane_regs_sm8750_cphy[] = {
++	/* Trio 0 (LN 1) init */
++	{0x0294, 0x0D, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x02F4, 0x00, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x02F8, 0x00, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x02FC, 0x00, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x02F0, 0xEF, 0xD3, CSIPHY_DEFAULT_PARAMS},
++
++	/* Trio 1 (LN 3) init */
++	{0x0694, 0x0D, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x06F4, 0x00, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x06F8, 0x00, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x06FC, 0x00, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x06F0, 0xEF, 0xD3, CSIPHY_DEFAULT_PARAMS},
++
++	/* Trio 2 (LN 5) init */
++	{0x0A94, 0x0D, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x0AF4, 0x00, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x0AF8, 0x00, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x0AFC, 0x00, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x0AF0, 0xEF, 0xD3, CSIPHY_DEFAULT_PARAMS},
++
++	/* Trio 0 (LN 1) config */
++	{0x0204, 0x00, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x02E4, 0x00, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x02E8, 0x7F, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x02EC, 0x7F, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x0218, 0x3E, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x021C, 0x41, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x0220, 0x41, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x0224, 0x7F, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x0228, 0x00, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x022C, 0x00, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x0264, 0x01, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x0244, 0xB2, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x0310, 0x35, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x02BC, 0xD0, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x0254, 0x00, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x0240, 0x00, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x0260, 0xA8, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x0284, 0x00, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x0290, 0x02, 0x00, CSIPHY_DEFAULT_PARAMS},
++
++	/* Trio 1 (LN 3) config */
++	{0x0604, 0x00, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x06E4, 0x00, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x06E8, 0x7F, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x06EC, 0x7F, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x0618, 0x3E, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x061C, 0x41, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x0620, 0x41, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x0624, 0x7F, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x0628, 0x00, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x062C, 0x00, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x0664, 0x01, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x0644, 0xB2, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x0710, 0x35, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x06BC, 0xD0, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x0654, 0x00, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x0640, 0x00, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x0660, 0xA8, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x0684, 0x00, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x0690, 0x02, 0x00, CSIPHY_DEFAULT_PARAMS},
++
++	/* Trio 2 (LN 5) config */
++	{0x0A04, 0x00, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x0AE4, 0x00, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x0AE8, 0x7F, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x0AEC, 0x7F, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x0A18, 0x3E, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x0A1C, 0x41, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x0A20, 0x41, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x0A24, 0x7F, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x0A28, 0x00, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x0A2C, 0x00, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x0A64, 0x01, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x0A44, 0xB2, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x0B10, 0x35, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x0ABC, 0xD0, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x0A54, 0x00, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x0A40, 0x00, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x0A60, 0xA8, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x0A84, 0x00, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x0A90, 0x02, 0x00, CSIPHY_DEFAULT_PARAMS},
++
++	/* Per-trio CDR / data-rate (1.5-2.0 Gsps) & settle timing */
++	{0x0268, 0xF1, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x026C, 0x1D, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x0270, 0x00, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x0274, 0x00, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x0278, 0x26, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x0288, 0x00, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x028C, 0x75, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x0290, 0x02, 0x00, CSIPHY_DEFAULT_PARAMS},
++
++	{0x0668, 0xF1, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x066C, 0x1D, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x0670, 0x00, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x0674, 0x00, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x0678, 0x26, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x0688, 0x00, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x068C, 0x75, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x0690, 0x02, 0x00, CSIPHY_DEFAULT_PARAMS},
++
++	{0x0A68, 0xF1, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x0A6C, 0x1D, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x0A70, 0x00, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x0A74, 0x00, 0x0A, CSIPHY_DEFAULT_PARAMS},
++	{0x0A78, 0x26, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x0A88, 0x00, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x0A8C, 0x75, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x0A90, 0x02, 0x00, CSIPHY_DEFAULT_PARAMS},
++
++	{0x020C, 0x2A, 0x00, CSIPHY_SETTLE_CNT_LOWER_BYTE},
++	{0x0208, 0x00, 0x00, CSIPHY_SETTLE_CNT_HIGHER_BYTE},
++	{0x0210, 0x00, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x0214, 0x09, 0x00, CSIPHY_DEFAULT_PARAMS},
++
++	{0x060C, 0x2A, 0x00, CSIPHY_SETTLE_CNT_LOWER_BYTE},
++	{0x0608, 0x00, 0x00, CSIPHY_SETTLE_CNT_HIGHER_BYTE},
++	{0x0610, 0x00, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x0614, 0x09, 0x00, CSIPHY_DEFAULT_PARAMS},
++
++	{0x0A0C, 0x2A, 0x00, CSIPHY_SETTLE_CNT_LOWER_BYTE},
++	{0x0A08, 0x00, 0x00, CSIPHY_SETTLE_CNT_HIGHER_BYTE},
++	{0x0A10, 0x00, 0x00, CSIPHY_DEFAULT_PARAMS},
++	{0x0A14, 0x09, 0x00, CSIPHY_DEFAULT_PARAMS},
++};
++
+ /* 4nm 2PH v 2.1.2 2p5Gbps 4 lane DPHY mode */
+ static const struct
+ csiphy_lane_regs lane_regs_x1e80100[] = {
+@@ -1201,11 +1332,11 @@
+ 	writel_relaxed(val, csiphy->base + CSIPHY_3PH_LNn_MISC1(l));
+ }
+ 
+-static void csiphy_gen2_config_lanes(struct csiphy_device *csiphy,
+-				     u8 settle_cnt)
++static void csiphy_gen2_write_regs(struct csiphy_device *csiphy,
++				   const struct csiphy_lane_regs *r,
++				   int array_size, u8 settle_cnt)
+ {
+-	const struct csiphy_lane_regs *r = csiphy->regs->lane_regs;
+-	int i, array_size = csiphy->regs->lane_array_size;
++	int i;
+ 	u32 val;
+ 
+ 	for (i = 0; i < array_size; i++, r++) {
+@@ -1213,6 +1344,9 @@
+ 		case CSIPHY_SETTLE_CNT_LOWER_BYTE:
+ 			val = settle_cnt & 0xff;
+ 			break;
++		case CSIPHY_SETTLE_CNT_HIGHER_BYTE:
++			val = 0;
++			break;
+ 		case CSIPHY_SKEW_CAL:
+ 			/* TODO: support application of skew from dt flag */
+ 			continue;
+@@ -1228,6 +1362,13 @@
+ 	}
+ }
+ 
++static void csiphy_gen2_config_lanes(struct csiphy_device *csiphy,
++				     u8 settle_cnt)
++{
++	csiphy_gen2_write_regs(csiphy, csiphy->regs->lane_regs,
++			       csiphy->regs->lane_array_size, settle_cnt);
++}
++
+ static u8 csiphy_get_lane_mask(struct csiphy_lanes_cfg *lane_cfg)
+ {
+ 	u8 lane_mask;
+@@ -1276,6 +1417,61 @@
+ 	u8 val;
+ 	int i;
+ 
++	if (csiphy->camss->res->version == CAMSS_8750 && cfg->csi2->is_cphy) {
++		/* SM8750 CSIPHY v2.3.0 3-trio C-PHY mode */
++		settle_cnt = csiphy->timer_clk_rate ?
++			     (u8)div_u64(42ULL * csiphy->timer_clk_rate, 400000000ULL) :
++			     0x2a;
++
++		/* reset_enter */
++		writel_relaxed(0x01, csiphy->base +
++			       CSIPHY_3PH_CMN_CSI_COMMON_CTRLn(regs->offset, 0));
++		udelay(1);
++
++		/* common_reg_2_3_0 (3PH) */
++		writel_relaxed(0x00, csiphy->base +
++			       CSIPHY_3PH_CMN_CSI_COMMON_CTRLn(regs->offset, 33));
++		writel_relaxed(0x0e, csiphy->base +
++			       CSIPHY_3PH_CMN_CSI_COMMON_CTRLn(regs->offset, 35));
++		udelay(1);
++
++		writel_relaxed(0x7a, csiphy->base +
++			       CSIPHY_3PH_CMN_CSI_COMMON_CTRLn(regs->offset, 7));
++		writel_relaxed(CSIPHY_3PH_CMN_CSI_COMMON_CTRL6_COMMON_PWRDN_B,
++			       csiphy->base +
++			       CSIPHY_3PH_CMN_CSI_COMMON_CTRLn(regs->offset, 6));
++
++		/* lane_en_reg_2_3_0 (trios 0,1,2 -> 0x2a) */
++		val = 0;
++		for (i = 0; i < c->num_data; i++)
++			val |= BIT(c->data[i].pos * 2 + 1);
++		writel_relaxed(val, csiphy->base +
++			       CSIPHY_3PH_CMN_CSI_COMMON_CTRLn(regs->offset, 5));
++
++		csiphy_gen2_write_regs(csiphy, lane_regs_sm8750_cphy,
++				       ARRAY_SIZE(lane_regs_sm8750_cphy),
++				       settle_cnt);
++
++		/* reset_exit_reg_2_3_0 (3PH: 0x1000 = 0x0e, delay 3048us) */
++		writel_relaxed(0x0e, csiphy->base +
++			       CSIPHY_3PH_CMN_CSI_COMMON_CTRLn(regs->offset, 0));
++		usleep_range(3050, 3500);
++
++		for (i = 11; i < 22; i++) {
++			writel_relaxed(0, csiphy->base +
++				       CSIPHY_3PH_CMN_CSI_COMMON_CTRLn(regs->offset, i));
++		}
++		return;
++	}
++
++	if (csiphy->camss->res->version == CAMSS_8750) {
++		writel_relaxed(0x00, csiphy->base +
++			       CSIPHY_3PH_CMN_CSI_COMMON_CTRLn(regs->offset, 33));
++		writel_relaxed(0x00, csiphy->base +
++			       CSIPHY_3PH_CMN_CSI_COMMON_CTRLn(regs->offset, 35));
++		udelay(1);
++	}
++
+ 	settle_cnt = csiphy_settle_cnt_calc(link_freq, csiphy->timer_clk_rate);
+ 
+ 	val = CSIPHY_3PH_CMN_CSI_COMMON_CTRL5_CLK_ENABLE;
+@@ -1319,6 +1515,10 @@
+ 
+ 	writel_relaxed(0, csiphy->base +
+ 			  CSIPHY_3PH_CMN_CSI_COMMON_CTRLn(regs->offset, 6));
++
++	if (csiphy->camss->res->version == CAMSS_8750)
++		writel_relaxed(0, csiphy->base +
++			       CSIPHY_3PH_CMN_CSI_COMMON_CTRLn(regs->offset, 35));
+ }
+ 
+ static int csiphy_init(struct csiphy_device *csiphy)
+diff --git a/drivers/media/i2c/Kconfig b/drivers/media/i2c/Kconfig
+--- a/drivers/media/i2c/Kconfig
++++ b/drivers/media/i2c/Kconfig
+@@ -310,6 +310,28 @@
+ 	  To compile this driver as a module, choose M here: the
+ 	  module will be called imx678.
+ 
++config VIDEO_IMX882
++	tristate "Sony IMX882 sensor support"
++	depends on GPIOLIB
++	select V4L2_CCI_I2C
++	help
++	  This is a Video4Linux2 sensor driver for the Sony
++	  IMX882 (LYT-600) camera.
++
++	  To compile this driver as a module, choose M here: the
++	  module will be called imx882.
++
++config VIDEO_IMX906
++	tristate "Sony IMX906 sensor support"
++	depends on GPIOLIB
++	select V4L2_CCI_I2C
++	help
++	  This is a Video4Linux2 sensor driver for the Sony
++	  IMX906 camera.
++
++	  To compile this driver as a module, choose M here: the
++	  module will be called imx906.
++
+ config VIDEO_MAX9271_LIB
+ 	tristate
+ 
+diff --git a/drivers/media/i2c/Makefile b/drivers/media/i2c/Makefile
+--- a/drivers/media/i2c/Makefile
++++ b/drivers/media/i2c/Makefile
+@@ -63,6 +63,8 @@
+ obj-$(CONFIG_VIDEO_IMX415) += imx415.o
+ obj-$(CONFIG_VIDEO_IMX678) += imx678.o
+ obj-$(CONFIG_VIDEO_IMX471) += imx471.o
++obj-$(CONFIG_VIDEO_IMX882) += imx882.o
++obj-$(CONFIG_VIDEO_IMX906) += imx906.o
+ obj-$(CONFIG_VIDEO_IR_I2C) += ir-kbd-i2c.o
+ obj-$(CONFIG_VIDEO_ISL7998X) += isl7998x.o
+ obj-$(CONFIG_VIDEO_KS0127) += ks0127.o
+diff --git a/drivers/media/i2c/imx906.c b/drivers/media/i2c/imx906.c
+new file mode 100644
+--- /dev/null
++++ b/drivers/media/i2c/imx906.c
+@@ -0,0 +1,887 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Sony IMX906 CMOS image sensor driver (MIPI CSI-2 C-PHY 3-trio)
++ */
++
++#include <linux/clk.h>
++#include <linux/delay.h>
++#include <linux/gpio/consumer.h>
++#include <linux/i2c.h>
++#include <linux/module.h>
++#include <linux/pm_runtime.h>
++#include <linux/regulator/consumer.h>
++#include <media/v4l2-cci.h>
++#include <media/v4l2-ctrls.h>
++#include <media/v4l2-fwnode.h>
++#include <media/v4l2-subdev.h>
++
++#define IMX906_REG_CHIP_ID		CCI_REG16(0x0016)
++#define IMX906_CHIP_ID			0x0906
++
++#define IMX906_REG_MODE_SELECT		CCI_REG8(0x0100)
++#define IMX906_MODE_STANDBY		0x00
++#define IMX906_MODE_STREAMING		0x01
++
++#define IMX906_REG_ORIENTATION		CCI_REG8(0x0101)
++
++#define IMX906_REG_EXPOSURE		CCI_REG16(0x0202)
++#define IMX906_EXPOSURE_MIN		4
++#define IMX906_EXPOSURE_STEP		1
++#define IMX906_EXPOSURE_DEFAULT	0x03e8
++#define IMX906_EXPOSURE_MARGIN		48
++
++#define IMX906_REG_ANALOG_GAIN		CCI_REG16(0x0204)
++#define IMX906_ANA_GAIN_MIN		0
++#define IMX906_ANA_GAIN_MAX		0x3f00
++#define IMX906_ANA_GAIN_STEP		1
++#define IMX906_ANA_GAIN_DEFAULT	0x1334
++
++#define IMX906_REG_FLL			CCI_REG16(0x0340)
++#define IMX906_FLL_MAX			0xffff
++
++#define IMX906_REG_TEST_PATTERN	CCI_REG16(0x0600)
++
++#define IMX906_EXT_CLK			19200000
++#define IMX906_LINK_FREQ_DEFAULT	1634400000LL
++#define IMX906_PIXEL_RATE		2195200000ULL
++
++#define IMX906_NATIVE_WIDTH		8192
++#define IMX906_NATIVE_HEIGHT		6144
++
++#define to_imx906(_sd) container_of_const(_sd, struct imx906, sd)
++
++static const char * const imx906_supply_names[] = {
++	"vana",
++	"vdig",
++	"vio",
++	"vcustom1",
++};
++
++struct imx906_mode {
++	u32 width;
++	u32 height;
++	u32 fll_def;
++	u32 fll_min;
++	u32 llp;
++	const struct cci_reg_sequence *regs;
++	unsigned int num_regs;
++};
++
++struct imx906 {
++	struct v4l2_subdev sd;
++	struct media_pad pad;
++
++	struct v4l2_ctrl_handler ctrl_handler;
++	struct v4l2_ctrl *vblank;
++	struct v4l2_ctrl *hblank;
++	struct v4l2_ctrl *exposure;
++	struct v4l2_ctrl *vflip;
++	struct v4l2_ctrl *hflip;
++
++	struct gpio_desc *reset_gpio;
++	struct regulator_bulk_data supplies[ARRAY_SIZE(imx906_supply_names)];
++	struct clk *img_clk;
++
++	struct device *dev;
++	struct regmap *regmap;
++};
++
++static const struct cci_reg_sequence imx906_init_regs[] = {
++	{ CCI_REG8(0x0136), 0x13 },
++	{ CCI_REG8(0x0137), 0x33 },
++	{ CCI_REG8(0x3304), 0x00 },
++	{ CCI_REG8(0x33f0), 0x04 },
++	{ CCI_REG8(0x33f1), 0x06 },
++	{ CCI_REG8(0x0111), 0x03 },
++	{ CCI_REG8(0x4815), 0x0f },
++	{ CCI_REG8(0x614d), 0x00 },
++	{ CCI_REG8(0x614f), 0x00 },
++	{ CCI_REG8(0x6188), 0x09 },
++	{ CCI_REG8(0x6189), 0x09 },
++	{ CCI_REG8(0x6190), 0x09 },
++	{ CCI_REG8(0x6191), 0x09 },
++	{ CCI_REG8(0x6356), 0x13 },
++	{ CCI_REG8(0x6358), 0x13 },
++	{ CCI_REG8(0x6366), 0x13 },
++	{ CCI_REG8(0x6367), 0x13 },
++	{ CCI_REG8(0x90e7), 0x01 },
++	{ CCI_REG8(0x9200), 0x90 },
++	{ CCI_REG8(0x9202), 0xd4 },
++	{ CCI_REG8(0x9203), 0xda },
++	{ CCI_REG8(0x9204), 0x90 },
++	{ CCI_REG8(0x9206), 0xd4 },
++	{ CCI_REG8(0x9207), 0xd7 },
++	{ CCI_REG8(0x9208), 0x90 },
++	{ CCI_REG8(0x920a), 0x7a },
++	{ CCI_REG8(0x920b), 0x96 },
++	{ CCI_REG8(0xa3f8), 0x0c },
++	{ CCI_REG8(0xa429), 0x40 },
++	{ CCI_REG8(0xb148), 0x01 },
++	{ CCI_REG8(0xb149), 0x61 },
++	{ CCI_REG8(0xb14a), 0x01 },
++	{ CCI_REG8(0xb14b), 0xdf },
++	{ CCI_REG8(0xb14c), 0x02 },
++	{ CCI_REG8(0xb14d), 0xd0 },
++	{ CCI_REG8(0xb14e), 0x01 },
++	{ CCI_REG8(0xb14f), 0x61 },
++	{ CCI_REG8(0xb150), 0x01 },
++	{ CCI_REG8(0xb151), 0xdf },
++	{ CCI_REG8(0xb152), 0x02 },
++	{ CCI_REG8(0xb153), 0xd0 },
++	{ CCI_REG8(0xb154), 0x01 },
++	{ CCI_REG8(0xb155), 0x61 },
++	{ CCI_REG8(0xb156), 0x01 },
++	{ CCI_REG8(0xb157), 0xdf },
++	{ CCI_REG8(0xb158), 0x02 },
++	{ CCI_REG8(0xb159), 0xd0 },
++	{ CCI_REG8(0xb15a), 0x01 },
++	{ CCI_REG8(0xb15b), 0x61 },
++	{ CCI_REG8(0xb15c), 0x01 },
++	{ CCI_REG8(0xb15d), 0xdf },
++	{ CCI_REG8(0xb15e), 0x02 },
++	{ CCI_REG8(0xb15f), 0xd0 },
++	{ CCI_REG8(0x2433), 0x01 },
++	{ CCI_REG8(0xd566), 0x13 },
++	{ CCI_REG8(0xd567), 0x13 },
++	{ CCI_REG8(0xd556), 0x13 },
++	{ CCI_REG8(0xd558), 0x13 },
++	{ CCI_REG8(0x2433), 0x00 },
++	{ CCI_REG8(0x31a7), 0x06 },
++	{ CCI_REG8(0x0101), 0x03 },
++	{ CCI_REG8(0x0106), 0x01 },
++};
++
++static const struct cci_reg_sequence imx906_4096x3072_regs[] = {
++	{ CCI_REG8(0x0112), 0x0a },
++	{ CCI_REG8(0x0113), 0x0a },
++	{ CCI_REG8(0x0114), 0x02 },
++	{ CCI_REG8(0x3239), 0x00 },
++	{ CCI_REG8(0x0342), 0x25 },
++	{ CCI_REG8(0x0343), 0xd0 },
++	{ CCI_REG8(0x3750), 0x00 },
++	{ CCI_REG8(0x3751), 0x55 },
++	{ CCI_REG8(0x0340), 0x1d },
++	{ CCI_REG8(0x0341), 0x68 },
++	{ CCI_REG8(0x0344), 0x00 },
++	{ CCI_REG8(0x0345), 0x00 },
++	{ CCI_REG8(0x0346), 0x00 },
++	{ CCI_REG8(0x0347), 0x00 },
++	{ CCI_REG8(0x0348), 0x1f },
++	{ CCI_REG8(0x0349), 0xff },
++	{ CCI_REG8(0x034a), 0x17 },
++	{ CCI_REG8(0x034b), 0xff },
++	{ CCI_REG8(0x0900), 0x01 },
++	{ CCI_REG8(0x0901), 0x22 },
++	{ CCI_REG8(0x0902), 0x00 },
++	{ CCI_REG8(0x3005), 0x02 },
++	{ CCI_REG8(0x3144), 0x00 },
++	{ CCI_REG8(0x3148), 0x04 },
++	{ CCI_REG8(0x3149), 0x01 },
++	{ CCI_REG8(0x31c0), 0x41 },
++	{ CCI_REG8(0x31c1), 0x41 },
++	{ CCI_REG8(0x0408), 0x00 },
++	{ CCI_REG8(0x0409), 0x00 },
++	{ CCI_REG8(0x040a), 0x00 },
++	{ CCI_REG8(0x040b), 0x00 },
++	{ CCI_REG8(0x040c), 0x10 },
++	{ CCI_REG8(0x040d), 0x00 },
++	{ CCI_REG8(0x040e), 0x0c },
++	{ CCI_REG8(0x040f), 0x00 },
++	{ CCI_REG8(0x034c), 0x10 },
++	{ CCI_REG8(0x034d), 0x00 },
++	{ CCI_REG8(0x034e), 0x0c },
++	{ CCI_REG8(0x034f), 0x00 },
++	{ CCI_REG8(0x0301), 0x08 },
++	{ CCI_REG8(0x0303), 0x02 },
++	{ CCI_REG8(0x0305), 0x03 },
++	{ CCI_REG8(0x0306), 0x01 },
++	{ CCI_REG8(0x0307), 0x57 },
++	{ CCI_REG8(0x030b), 0x01 },
++	{ CCI_REG8(0x030d), 0x08 },
++	{ CCI_REG8(0x030e), 0x05 },
++	{ CCI_REG8(0x030f), 0x52 },
++	{ CCI_REG8(0x3205), 0x00 },
++	{ CCI_REG8(0x3206), 0x00 },
++	{ CCI_REG8(0x3213), 0x01 },
++	{ CCI_REG8(0x324c), 0x01 },
++	{ CCI_REG8(0x3700), 0x01 },
++	{ CCI_REG8(0x3701), 0x02 },
++	{ CCI_REG8(0x3702), 0x01 },
++	{ CCI_REG8(0x37a0), 0x00 },
++	{ CCI_REG8(0x37a1), 0x82 },
++	{ CCI_REG8(0x37a8), 0x00 },
++	{ CCI_REG8(0x37a9), 0x00 },
++	{ CCI_REG8(0x37a2), 0x00 },
++	{ CCI_REG8(0x37a3), 0x00 },
++	{ CCI_REG8(0x37aa), 0x00 },
++	{ CCI_REG8(0x37ab), 0x00 },
++	{ CCI_REG8(0x37d0), 0x00 },
++	{ CCI_REG8(0x37d1), 0x28 },
++	{ CCI_REG8(0x37d2), 0x02 },
++	{ CCI_REG8(0x37d3), 0x6c },
++	{ CCI_REG8(0x3a00), 0x00 },
++	{ CCI_REG8(0x3a01), 0x00 },
++	{ CCI_REG8(0x3a06), 0x00 },
++	{ CCI_REG8(0x3a07), 0x00 },
++	{ CCI_REG8(0x0202), 0x03 },
++	{ CCI_REG8(0x0203), 0xe8 },
++	{ CCI_REG8(0x0224), 0x01 },
++	{ CCI_REG8(0x0225), 0xf4 },
++	{ CCI_REG8(0x3172), 0x01 },
++	{ CCI_REG8(0x3173), 0xf4 },
++	{ CCI_REG8(0x317a), 0x01 },
++	{ CCI_REG8(0x317b), 0xf4 },
++	{ CCI_REG8(0x0204), 0x13 },
++	{ CCI_REG8(0x0205), 0x34 },
++	{ CCI_REG8(0x020e), 0x01 },
++	{ CCI_REG8(0x020f), 0x00 },
++	{ CCI_REG8(0x0216), 0x00 },
++	{ CCI_REG8(0x0217), 0x00 },
++	{ CCI_REG8(0x0218), 0x01 },
++	{ CCI_REG8(0x0219), 0x00 },
++	{ CCI_REG8(0x3174), 0x00 },
++	{ CCI_REG8(0x3175), 0x00 },
++	{ CCI_REG8(0x3176), 0x01 },
++	{ CCI_REG8(0x3177), 0x00 },
++	{ CCI_REG8(0x317c), 0x00 },
++	{ CCI_REG8(0x317d), 0x00 },
++	{ CCI_REG8(0x317e), 0x01 },
++	{ CCI_REG8(0x317f), 0x00 },
++	{ CCI_REG8(0x3184), 0x00 },
++	{ CCI_REG8(0x3186), 0x00 },
++	{ CCI_REG8(0x320b), 0x00 },
++	{ CCI_REG8(0x4400), 0x00 },
++	{ CCI_REG8(0x4401), 0x00 },
++	{ CCI_REG8(0x310b), 0x00 },
++	{ CCI_REG8(0x3107), 0x00 },
++	{ CCI_REG8(0x3268), 0x00 },
++	{ CCI_REG8(0x3104), 0x01 },
++	{ CCI_REG8(0x3879), 0x00 },
++	{ CCI_REG8(0x3103), 0x00 },
++	{ CCI_REG8(0x3422), 0x00 },
++	{ CCI_REG8(0x3423), 0x00 },
++	{ CCI_REG8(0x3878), 0x00 },
++	{ CCI_REG8(0x3190), 0x00 },
++	{ CCI_REG8(0x3191), 0x00 },
++	{ CCI_REG8(0x3880), 0x00 },
++	{ CCI_REG8(0x3884), 0x00 },
++	{ CCI_REG8(0x3886), 0x00 },
++	{ CCI_REG8(0x0e00), 0x00 },
++};
++
++static const struct imx906_mode imx906_modes[] = {
++	{
++		.width = 4096,
++		.height = 3072,
++		.fll_def = 7528,
++		.fll_min = 3200,
++		.llp = 9680,
++		.regs = imx906_4096x3072_regs,
++		.num_regs = ARRAY_SIZE(imx906_4096x3072_regs),
++	},
++};
++
++static const s64 imx906_link_freq_menu[] = {
++	IMX906_LINK_FREQ_DEFAULT,
++};
++
++static const char * const imx906_test_pattern_menu[] = {
++	"Disabled",
++	"Solid Color",
++	"100% Color Bars",
++	"Fade to Grey Color Bars",
++	"PN9",
++};
++
++static u32 imx906_get_format_code(struct imx906 *sensor)
++{
++	static const u32 codes[2][2] = {
++		{ MEDIA_BUS_FMT_SRGGB10_1X10, MEDIA_BUS_FMT_SGRBG10_1X10 },
++		{ MEDIA_BUS_FMT_SGBRG10_1X10, MEDIA_BUS_FMT_SBGGR10_1X10 },
++	};
++	unsigned int v = sensor->vflip ? sensor->vflip->val : 0;
++	unsigned int h = sensor->hflip ? sensor->hflip->val : 0;
++
++	return codes[v][h];
++}
++
++static int imx906_set_ctrl(struct v4l2_ctrl *ctrl)
++{
++	struct imx906 *sensor =
++		container_of(ctrl->handler, struct imx906, ctrl_handler);
++	struct v4l2_mbus_framefmt *fmt;
++	struct v4l2_subdev_state *state;
++	u32 fll;
++	int ret = 0;
++
++	state = v4l2_subdev_get_locked_active_state(&sensor->sd);
++	fmt = v4l2_subdev_state_get_format(state, 0);
++
++	if (ctrl->id == V4L2_CID_VBLANK) {
++		u32 max_exp = fmt->height + ctrl->val - IMX906_EXPOSURE_MARGIN;
++
++		__v4l2_ctrl_modify_range(sensor->exposure,
++					 sensor->exposure->minimum,
++					 max_exp, sensor->exposure->step,
++					 min_t(u32, sensor->exposure->val, max_exp));
++	}
++
++	if (!pm_runtime_get_if_in_use(sensor->dev))
++		return 0;
++
++	switch (ctrl->id) {
++	case V4L2_CID_EXPOSURE:
++		ret = cci_write(sensor->regmap, IMX906_REG_EXPOSURE,
++				ctrl->val, NULL);
++		break;
++	case V4L2_CID_ANALOGUE_GAIN:
++		ret = cci_write(sensor->regmap, IMX906_REG_ANALOG_GAIN,
++				ctrl->val, NULL);
++		break;
++	case V4L2_CID_VBLANK:
++		fll = fmt->height + ctrl->val;
++		ret = cci_write(sensor->regmap, IMX906_REG_FLL, fll, NULL);
++		break;
++	case V4L2_CID_HFLIP:
++	case V4L2_CID_VFLIP:
++		ret = cci_write(sensor->regmap, IMX906_REG_ORIENTATION,
++				sensor->hflip->val | (sensor->vflip->val << 1),
++				NULL);
++		break;
++	case V4L2_CID_TEST_PATTERN:
++		ret = cci_write(sensor->regmap, IMX906_REG_TEST_PATTERN,
++				ctrl->val, NULL);
++		break;
++	default:
++		ret = -EINVAL;
++		break;
++	}
++
++	pm_runtime_put(sensor->dev);
++	return ret;
++}
++
++static const struct v4l2_ctrl_ops imx906_ctrl_ops = {
++	.s_ctrl = imx906_set_ctrl,
++};
++
++static int imx906_enum_mbus_code(struct v4l2_subdev *sd,
++				  struct v4l2_subdev_state *sd_state,
++				  struct v4l2_subdev_mbus_code_enum *code)
++{
++	struct imx906 *sensor = to_imx906(sd);
++
++	if (code->index > 0)
++		return -EINVAL;
++
++	code->code = imx906_get_format_code(sensor);
++	return 0;
++}
++
++static int imx906_enum_frame_size(struct v4l2_subdev *sd,
++				   struct v4l2_subdev_state *sd_state,
++				   struct v4l2_subdev_frame_size_enum *fse)
++{
++	struct imx906 *sensor = to_imx906(sd);
++
++	if (fse->index >= ARRAY_SIZE(imx906_modes))
++		return -EINVAL;
++
++	if (fse->code != imx906_get_format_code(sensor))
++		return -EINVAL;
++
++	fse->min_width = imx906_modes[fse->index].width;
++	fse->max_width = fse->min_width;
++	fse->min_height = imx906_modes[fse->index].height;
++	fse->max_height = fse->min_height;
++
++	return 0;
++}
++
++static void imx906_update_pad_format(struct imx906 *sensor,
++				      const struct imx906_mode *mode,
++				      struct v4l2_subdev_format *fmt)
++{
++	fmt->format.width = mode->width;
++	fmt->format.height = mode->height;
++	fmt->format.code = imx906_get_format_code(sensor);
++	fmt->format.field = V4L2_FIELD_NONE;
++	fmt->format.colorspace = V4L2_COLORSPACE_RAW;
++	fmt->format.ycbcr_enc = V4L2_YCBCR_ENC_DEFAULT;
++	fmt->format.quantization = V4L2_QUANTIZATION_FULL_RANGE;
++	fmt->format.xfer_func = V4L2_XFER_FUNC_NONE;
++}
++
++static int imx906_set_pad_format(struct v4l2_subdev *sd,
++				  struct v4l2_subdev_state *sd_state,
++				  struct v4l2_subdev_format *fmt)
++{
++	struct imx906 *sensor = to_imx906(sd);
++	const struct imx906_mode *mode;
++	int h_blank, ret;
++
++	mode = v4l2_find_nearest_size(imx906_modes, ARRAY_SIZE(imx906_modes),
++				      width, height, fmt->format.width,
++				      fmt->format.height);
++
++	imx906_update_pad_format(sensor, mode, fmt);
++	*v4l2_subdev_state_get_format(sd_state, fmt->pad) = fmt->format;
++
++	if (fmt->which == V4L2_SUBDEV_FORMAT_TRY)
++		return 0;
++
++	if (media_entity_is_streaming(&sensor->sd.entity))
++		return -EBUSY;
++
++	ret = __v4l2_ctrl_modify_range(sensor->vblank,
++				       mode->fll_min - mode->height,
++				       IMX906_FLL_MAX - mode->height,
++				       1, mode->fll_def - mode->height);
++	if (ret)
++		return ret;
++
++	h_blank = mode->llp - mode->width;
++	return __v4l2_ctrl_modify_range(sensor->hblank, h_blank, h_blank,
++					1, h_blank);
++}
++
++static int imx906_get_selection(struct v4l2_subdev *sd,
++				 struct v4l2_subdev_state *sd_state,
++				 struct v4l2_subdev_selection *sel)
++{
++	switch (sel->target) {
++	case V4L2_SEL_TGT_CROP:
++		sel->r = *v4l2_subdev_state_get_crop(sd_state, sel->pad);
++		return 0;
++	case V4L2_SEL_TGT_NATIVE_SIZE:
++	case V4L2_SEL_TGT_CROP_DEFAULT:
++	case V4L2_SEL_TGT_CROP_BOUNDS:
++		sel->r.top = 0;
++		sel->r.left = 0;
++		sel->r.width = IMX906_NATIVE_WIDTH;
++		sel->r.height = IMX906_NATIVE_HEIGHT;
++		return 0;
++	default:
++		return -EINVAL;
++	}
++}
++
++static int imx906_init_state(struct v4l2_subdev *sd,
++			      struct v4l2_subdev_state *sd_state)
++{
++	struct v4l2_subdev_format fmt = {
++		.which = V4L2_SUBDEV_FORMAT_TRY,
++		.format = {
++			.code = MEDIA_BUS_FMT_SRGGB10_1X10,
++			.width = imx906_modes[0].width,
++			.height = imx906_modes[0].height,
++		},
++	};
++	struct v4l2_rect *crop;
++
++	crop = v4l2_subdev_state_get_crop(sd_state, 0);
++	crop->top = 0;
++	crop->left = 0;
++	crop->width = IMX906_NATIVE_WIDTH;
++	crop->height = IMX906_NATIVE_HEIGHT;
++
++	return imx906_set_pad_format(sd, sd_state, &fmt);
++}
++
++static int imx906_identify_module(struct imx906 *sensor)
++{
++	u64 val;
++	int ret;
++
++	ret = cci_read(sensor->regmap, IMX906_REG_CHIP_ID, &val, NULL);
++	if (ret)
++		return dev_err_probe(sensor->dev, ret,
++				     "failed to read chip id\n");
++
++	if (val != IMX906_CHIP_ID)
++		return dev_err_probe(sensor->dev, -EIO,
++				     "chip id mismatch: got 0x%04llx\n", val);
++
++	dev_info(sensor->dev, "identified IMX906 (chip id 0x%04llx)\n", val);
++	return 0;
++}
++
++static int imx906_power_off(struct device *dev)
++{
++	struct v4l2_subdev *sd = dev_get_drvdata(dev);
++	struct imx906 *sensor = to_imx906(sd);
++
++	clk_disable_unprepare(sensor->img_clk);
++	gpiod_set_value_cansleep(sensor->reset_gpio, 1);
++	regulator_bulk_disable(ARRAY_SIZE(imx906_supply_names),
++			       sensor->supplies);
++
++	return 0;
++}
++
++static int imx906_power_on(struct device *dev)
++{
++	struct v4l2_subdev *sd = dev_get_drvdata(dev);
++	struct imx906 *sensor = to_imx906(sd);
++	int ret;
++
++	ret = regulator_bulk_enable(ARRAY_SIZE(imx906_supply_names),
++				    sensor->supplies);
++	if (ret < 0) {
++		dev_err(dev, "failed to enable regulators: %d\n", ret);
++		return ret;
++	}
++
++	ret = clk_prepare_enable(sensor->img_clk);
++	if (ret < 0) {
++		regulator_bulk_disable(ARRAY_SIZE(imx906_supply_names),
++				       sensor->supplies);
++		dev_err(dev, "failed to enable mclk: %d\n", ret);
++		return ret;
++	}
++
++	usleep_range(2000, 3000);
++	gpiod_set_value_cansleep(sensor->reset_gpio, 0);
++	usleep_range(10000, 15000);
++
++	return 0;
++}
++
++static int imx906_enable_stream(struct v4l2_subdev *sd,
++				 struct v4l2_subdev_state *state,
++				 u32 pad, u64 streams_mask)
++{
++	struct imx906 *sensor = to_imx906(sd);
++	const struct imx906_mode *mode;
++	struct v4l2_mbus_framefmt *fmt;
++	int ret;
++
++	ret = pm_runtime_resume_and_get(sensor->dev);
++	if (ret < 0)
++		return ret;
++
++	ret = cci_multi_reg_write(sensor->regmap, imx906_init_regs,
++				  ARRAY_SIZE(imx906_init_regs), NULL);
++	if (ret) {
++		dev_err(sensor->dev, "failed to write init regs: %d\n", ret);
++		goto err_put;
++	}
++
++	fmt = v4l2_subdev_state_get_format(state, 0);
++	mode = v4l2_find_nearest_size(imx906_modes, ARRAY_SIZE(imx906_modes),
++				      width, height, fmt->width, fmt->height);
++
++	ret = cci_multi_reg_write(sensor->regmap, mode->regs,
++				  mode->num_regs, NULL);
++	if (ret) {
++		dev_err(sensor->dev, "failed to write mode regs: %d\n", ret);
++		goto err_put;
++	}
++
++	ret = __v4l2_ctrl_handler_setup(&sensor->ctrl_handler);
++	if (ret)
++		goto err_put;
++
++	ret = cci_write(sensor->regmap, IMX906_REG_MODE_SELECT,
++			IMX906_MODE_STREAMING, NULL);
++	if (ret)
++		goto err_put;
++
++	msleep(12);
++
++	__v4l2_ctrl_grab(sensor->vflip, true);
++	__v4l2_ctrl_grab(sensor->hflip, true);
++	return 0;
++
++err_put:
++	pm_runtime_put(sensor->dev);
++	return ret;
++}
++
++static int imx906_disable_stream(struct v4l2_subdev *sd,
++				  struct v4l2_subdev_state *state,
++				  u32 pad, u64 streams_mask)
++{
++	struct imx906 *sensor = to_imx906(sd);
++
++	cci_write(sensor->regmap, IMX906_REG_MODE_SELECT,
++		  IMX906_MODE_STANDBY, NULL);
++
++	__v4l2_ctrl_grab(sensor->vflip, false);
++	__v4l2_ctrl_grab(sensor->hflip, false);
++
++	pm_runtime_put(sensor->dev);
++	return 0;
++}
++
++static const struct v4l2_subdev_pad_ops imx906_pad_ops = {
++	.enum_mbus_code = imx906_enum_mbus_code,
++	.enum_frame_size = imx906_enum_frame_size,
++	.get_fmt = v4l2_subdev_get_fmt,
++	.set_fmt = imx906_set_pad_format,
++	.get_selection = imx906_get_selection,
++	.enable_streams = imx906_enable_stream,
++	.disable_streams = imx906_disable_stream,
++};
++
++static const struct v4l2_subdev_video_ops imx906_video_ops = {
++	.s_stream = v4l2_subdev_s_stream_helper,
++};
++
++static const struct v4l2_subdev_ops imx906_subdev_ops = {
++	.video = &imx906_video_ops,
++	.pad = &imx906_pad_ops,
++};
++
++static const struct v4l2_subdev_internal_ops imx906_internal_ops = {
++	.init_state = imx906_init_state,
++};
++
++static int imx906_init_controls(struct imx906 *sensor)
++{
++	const struct imx906_mode *mode = &imx906_modes[0];
++	struct v4l2_fwnode_device_properties props;
++	struct v4l2_ctrl_handler *hdl = &sensor->ctrl_handler;
++	struct v4l2_ctrl *ctrl;
++	u32 hblank, vblank, max_exp;
++	int ret;
++
++	ret = v4l2_ctrl_handler_init(hdl, 10);
++	if (ret)
++		return ret;
++
++	ctrl = v4l2_ctrl_new_int_menu(hdl, NULL, V4L2_CID_LINK_FREQ,
++				      ARRAY_SIZE(imx906_link_freq_menu) - 1,
++				      0, imx906_link_freq_menu);
++	if (ctrl)
++		ctrl->flags |= V4L2_CTRL_FLAG_READ_ONLY;
++
++	v4l2_ctrl_new_std(hdl, NULL, V4L2_CID_PIXEL_RATE,
++			  IMX906_PIXEL_RATE, IMX906_PIXEL_RATE,
++			  1, IMX906_PIXEL_RATE);
++
++	hblank = mode->llp - mode->width;
++	sensor->hblank = v4l2_ctrl_new_std(hdl, &imx906_ctrl_ops,
++					   V4L2_CID_HBLANK, hblank, hblank,
++					   1, hblank);
++	if (sensor->hblank)
++		sensor->hblank->flags |= V4L2_CTRL_FLAG_READ_ONLY;
++
++	vblank = mode->fll_def - mode->height;
++	sensor->vblank = v4l2_ctrl_new_std(hdl, &imx906_ctrl_ops,
++					   V4L2_CID_VBLANK,
++					   mode->fll_min - mode->height,
++					   IMX906_FLL_MAX - mode->height,
++					   1, vblank);
++
++	max_exp = mode->fll_def - IMX906_EXPOSURE_MARGIN;
++	sensor->exposure = v4l2_ctrl_new_std(hdl, &imx906_ctrl_ops,
++					     V4L2_CID_EXPOSURE,
++					     IMX906_EXPOSURE_MIN, max_exp,
++					     IMX906_EXPOSURE_STEP,
++					     IMX906_EXPOSURE_DEFAULT);
++
++	v4l2_ctrl_new_std(hdl, &imx906_ctrl_ops, V4L2_CID_ANALOGUE_GAIN,
++			  IMX906_ANA_GAIN_MIN, IMX906_ANA_GAIN_MAX,
++			  IMX906_ANA_GAIN_STEP, IMX906_ANA_GAIN_DEFAULT);
++
++	sensor->hflip = v4l2_ctrl_new_std(hdl, &imx906_ctrl_ops,
++					  V4L2_CID_HFLIP, 0, 1, 1, 0);
++	if (sensor->hflip)
++		sensor->hflip->flags |= V4L2_CTRL_FLAG_MODIFY_LAYOUT;
++
++	sensor->vflip = v4l2_ctrl_new_std(hdl, &imx906_ctrl_ops,
++					  V4L2_CID_VFLIP, 0, 1, 1, 0);
++	if (sensor->vflip)
++		sensor->vflip->flags |= V4L2_CTRL_FLAG_MODIFY_LAYOUT;
++
++	v4l2_ctrl_new_std_menu_items(hdl, &imx906_ctrl_ops,
++				     V4L2_CID_TEST_PATTERN,
++				     ARRAY_SIZE(imx906_test_pattern_menu) - 1,
++				     0, 0, imx906_test_pattern_menu);
++
++	if (hdl->error) {
++		ret = hdl->error;
++		goto err_free;
++	}
++
++	ret = v4l2_fwnode_device_parse(sensor->dev, &props);
++	if (ret)
++		goto err_free;
++
++	ret = v4l2_ctrl_new_fwnode_properties(hdl, &imx906_ctrl_ops, &props);
++	if (ret)
++		goto err_free;
++
++	sensor->sd.ctrl_handler = hdl;
++	return 0;
++
++err_free:
++	v4l2_ctrl_handler_free(hdl);
++	return ret;
++}
++
++static int imx906_parse_endpoint(struct imx906 *sensor)
++{
++	struct v4l2_fwnode_endpoint bus_cfg = {
++		.bus_type = V4L2_MBUS_CSI2_CPHY,
++	};
++	struct fwnode_handle *ep;
++	int ret;
++
++	ep = fwnode_graph_get_next_endpoint(dev_fwnode(sensor->dev), NULL);
++	if (!ep)
++		return dev_err_probe(sensor->dev, -ENXIO,
++				     "failed to get endpoint\n");
++
++	ret = v4l2_fwnode_endpoint_alloc_parse(ep, &bus_cfg);
++	fwnode_handle_put(ep);
++	if (ret)
++		return ret;
++
++	if (bus_cfg.bus.mipi_csi2.num_data_lanes != 3) {
++		dev_err(sensor->dev, "only 3-trio C-PHY is supported\n");
++		ret = -EINVAL;
++	}
++
++	v4l2_fwnode_endpoint_free(&bus_cfg);
++	return ret;
++}
++
++static int imx906_probe(struct i2c_client *client)
++{
++	struct device *dev = &client->dev;
++	struct imx906 *sensor;
++	unsigned int i;
++	int ret;
++
++	sensor = devm_kzalloc(dev, sizeof(*sensor), GFP_KERNEL);
++	if (!sensor)
++		return -ENOMEM;
++
++	sensor->dev = dev;
++
++	ret = imx906_parse_endpoint(sensor);
++	if (ret)
++		return ret;
++
++	sensor->regmap = devm_cci_regmap_init_i2c(client, 16);
++	if (IS_ERR(sensor->regmap))
++		return dev_err_probe(dev, PTR_ERR(sensor->regmap),
++				     "failed to init CCI regmap\n");
++
++	sensor->img_clk = devm_clk_get(dev, NULL);
++	if (IS_ERR(sensor->img_clk))
++		return dev_err_probe(dev, PTR_ERR(sensor->img_clk),
++				     "failed to get mclk\n");
++
++	if (clk_get_rate(sensor->img_clk) != IMX906_EXT_CLK) {
++		ret = clk_set_rate(sensor->img_clk, IMX906_EXT_CLK);
++		if (ret)
++			return dev_err_probe(dev, ret,
++					     "failed to set mclk rate\n");
++	}
++
++	for (i = 0; i < ARRAY_SIZE(imx906_supply_names); i++)
++		sensor->supplies[i].supply = imx906_supply_names[i];
++
++	ret = devm_regulator_bulk_get(dev, ARRAY_SIZE(imx906_supply_names),
++				      sensor->supplies);
++	if (ret)
++		return dev_err_probe(dev, ret, "failed to get regulators\n");
++
++	sensor->reset_gpio = devm_gpiod_get_optional(dev, "reset",
++						     GPIOD_OUT_HIGH);
++	if (IS_ERR(sensor->reset_gpio))
++		return dev_err_probe(dev, PTR_ERR(sensor->reset_gpio),
++				     "failed to get reset gpio\n");
++
++	v4l2_i2c_subdev_init(&sensor->sd, client, &imx906_subdev_ops);
++	sensor->sd.internal_ops = &imx906_internal_ops;
++
++	ret = imx906_power_on(dev);
++	if (ret)
++		return ret;
++
++	ret = imx906_identify_module(sensor);
++	if (ret)
++		goto err_power_off;
++
++	ret = imx906_init_controls(sensor);
++	if (ret)
++		goto err_power_off;
++
++	sensor->sd.flags |= V4L2_SUBDEV_FL_HAS_DEVNODE;
++	sensor->sd.entity.function = MEDIA_ENT_F_CAM_SENSOR;
++	sensor->pad.flags = MEDIA_PAD_FL_SOURCE;
++
++	ret = media_entity_pads_init(&sensor->sd.entity, 1, &sensor->pad);
++	if (ret)
++		goto err_free_ctrls;
++
++	sensor->sd.state_lock = sensor->ctrl_handler.lock;
++	ret = v4l2_subdev_init_finalize(&sensor->sd);
++	if (ret)
++		goto err_entity_cleanup;
++
++	pm_runtime_set_active(dev);
++	pm_runtime_enable(dev);
++
++	ret = v4l2_async_register_subdev_sensor(&sensor->sd);
++	if (ret)
++		goto err_pm_disable;
++
++	pm_runtime_idle(dev);
++	return 0;
++
++err_pm_disable:
++	pm_runtime_disable(dev);
++	pm_runtime_set_suspended(dev);
++	v4l2_subdev_cleanup(&sensor->sd);
++err_entity_cleanup:
++	media_entity_cleanup(&sensor->sd.entity);
++err_free_ctrls:
++	v4l2_ctrl_handler_free(&sensor->ctrl_handler);
++err_power_off:
++	imx906_power_off(dev);
++	return ret;
++}
++
++static void imx906_remove(struct i2c_client *client)
++{
++	struct v4l2_subdev *sd = i2c_get_clientdata(client);
++	struct imx906 *sensor = to_imx906(sd);
++
++	v4l2_async_unregister_subdev(sd);
++	v4l2_subdev_cleanup(sd);
++	media_entity_cleanup(&sd->entity);
++	v4l2_ctrl_handler_free(&sensor->ctrl_handler);
++
++	pm_runtime_disable(sensor->dev);
++	if (!pm_runtime_status_suspended(sensor->dev))
++		imx906_power_off(sensor->dev);
++	pm_runtime_set_suspended(sensor->dev);
++}
++
++static DEFINE_RUNTIME_DEV_PM_OPS(imx906_pm_ops, imx906_power_off,
++				 imx906_power_on, NULL);
++
++static const struct of_device_id imx906_of_match[] = {
++	{ .compatible = "sony,imx906" },
++	{ /* sentinel */ }
++};
++MODULE_DEVICE_TABLE(of, imx906_of_match);
++
++static struct i2c_driver imx906_i2c_driver = {
++	.driver = {
++		.name = "imx906",
++		.pm = pm_ptr(&imx906_pm_ops),
++		.of_match_table = imx906_of_match,
++	},
++	.probe = imx906_probe,
++	.remove = imx906_remove,
++};
++module_i2c_driver(imx906_i2c_driver);
++
++MODULE_DESCRIPTION("Sony IMX906 image sensor driver");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/media/i2c/imx882.c b/drivers/media/i2c/imx882.c
+new file mode 100644
+--- /dev/null
++++ b/drivers/media/i2c/imx882.c
+@@ -0,0 +1,1561 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Sony IMX882 CMOS image sensor driver (MIPI CSI-2 C-PHY 3-trio)
++ */
++
++#include <linux/clk.h>
++#include <linux/delay.h>
++#include <linux/gpio/consumer.h>
++#include <linux/i2c.h>
++#include <linux/module.h>
++#include <linux/pm_runtime.h>
++#include <linux/regulator/consumer.h>
++#include <media/v4l2-cci.h>
++#include <media/v4l2-ctrls.h>
++#include <media/v4l2-fwnode.h>
++#include <media/v4l2-subdev.h>
++
++#define IMX882_REG_CHIP_ID		CCI_REG16(0x0016)
++#define IMX882_CHIP_ID			0x8202
++#define IMX882_CHIP_ID_ALT		0x8206
++
++#define IMX882_REG_MODE_SELECT		CCI_REG8(0x0100)
++#define IMX882_MODE_STANDBY		0x00
++#define IMX882_MODE_STREAMING		0x01
++
++#define IMX882_REG_ORIENTATION		CCI_REG8(0x0101)
++
++#define IMX882_REG_EXPOSURE		CCI_REG16(0x0202)
++#define IMX882_EXPOSURE_MIN		4
++#define IMX882_EXPOSURE_STEP		1
++#define IMX882_EXPOSURE_DEFAULT	0x03e8
++#define IMX882_EXPOSURE_MARGIN		48
++
++#define IMX882_REG_ANALOG_GAIN		CCI_REG16(0x0204)
++#define IMX882_ANA_GAIN_MIN		0
++#define IMX882_ANA_GAIN_MAX		0x3f00
++#define IMX882_ANA_GAIN_STEP		1
++#define IMX882_ANA_GAIN_DEFAULT	0x1334
++
++#define IMX882_REG_FLL			CCI_REG16(0x0340)
++#define IMX882_FLL_MAX			0xffff
++
++#define IMX882_REG_TEST_PATTERN	CCI_REG16(0x0600)
++
++#define IMX882_EXT_CLK			19200000
++#define IMX882_LINK_FREQ_DEFAULT	1632000000LL
++#define IMX882_PIXEL_RATE		878080000ULL
++
++#define IMX882_NATIVE_WIDTH		8192
++#define IMX882_NATIVE_HEIGHT		6144
++
++#define to_imx882(_sd) container_of_const(_sd, struct imx882, sd)
++
++static const char * const imx882_supply_names[] = {
++	"vana",
++	"vdig",
++	"vio",
++};
++
++struct imx882_mode {
++	u32 width;
++	u32 height;
++	u32 fll_def;
++	u32 fll_min;
++	u32 llp;
++	const struct cci_reg_sequence *regs;
++	unsigned int num_regs;
++};
++
++struct imx882 {
++	struct v4l2_subdev sd;
++	struct media_pad pad;
++
++	struct v4l2_ctrl_handler ctrl_handler;
++	struct v4l2_ctrl *vblank;
++	struct v4l2_ctrl *hblank;
++	struct v4l2_ctrl *exposure;
++	struct v4l2_ctrl *vflip;
++	struct v4l2_ctrl *hflip;
++
++	struct gpio_desc *reset_gpio;
++	struct regulator_bulk_data supplies[ARRAY_SIZE(imx882_supply_names)];
++	struct clk *img_clk;
++
++	struct device *dev;
++	struct regmap *regmap;
++};
++
++static const struct cci_reg_sequence imx882_init_regs[] = {
++	{ CCI_REG8(0x0136), 0x13 },
++	{ CCI_REG8(0x0137), 0x33 },
++	{ CCI_REG8(0x0138), 0x01 },
++	{ CCI_REG8(0x3304), 0x00 },
++	{ CCI_REG8(0x33f0), 0x03 },
++	{ CCI_REG8(0x33f1), 0x04 },
++	{ CCI_REG8(0x0111), 0x03 },
++	{ CCI_REG8(0x3855), 0x01 },
++	{ CCI_REG8(0x0d06), 0x82 },
++	{ CCI_REG8(0x0d07), 0x02 },
++	{ CCI_REG8(0x0d12), 0x78 },
++	{ CCI_REG8(0x0d13), 0x01 },
++	{ CCI_REG8(0x0d0d), 0x00 },
++	{ CCI_REG8(0x0d08), 0x01 },
++	{ CCI_REG8(0x1012), 0x00 },
++	{ CCI_REG8(0x2edf), 0x07 },
++	{ CCI_REG8(0x3953), 0x01 },
++	{ CCI_REG8(0x3954), 0x01 },
++	{ CCI_REG8(0x3955), 0x01 },
++	{ CCI_REG8(0x3b30), 0x01 },
++	{ CCI_REG8(0x3b32), 0x0a },
++	{ CCI_REG8(0x3b33), 0x04 },
++	{ CCI_REG8(0x3b34), 0x0a },
++	{ CCI_REG8(0x3b36), 0xb2 },
++	{ CCI_REG8(0x3b40), 0x01 },
++	{ CCI_REG8(0x3b42), 0x0a },
++	{ CCI_REG8(0x3b43), 0x04 },
++	{ CCI_REG8(0x3b45), 0x0d },
++	{ CCI_REG8(0x3b46), 0x40 },
++	{ CCI_REG8(0x5a1d), 0x52 },
++	{ CCI_REG8(0x5a27), 0x19 },
++	{ CCI_REG8(0x5a37), 0xc8 },
++	{ CCI_REG8(0x5a39), 0x25 },
++	{ CCI_REG8(0x5a3d), 0x0e },
++	{ CCI_REG8(0x5a41), 0x19 },
++	{ CCI_REG8(0x5a47), 0x62 },
++	{ CCI_REG8(0x5a51), 0x52 },
++	{ CCI_REG8(0x5a5b), 0x19 },
++	{ CCI_REG8(0x5a69), 0xc8 },
++	{ CCI_REG8(0x5a6b), 0x25 },
++	{ CCI_REG8(0x5a6f), 0x11 },
++	{ CCI_REG8(0x5a73), 0x19 },
++	{ CCI_REG8(0x5a79), 0x8a },
++	{ CCI_REG8(0x5a83), 0x52 },
++	{ CCI_REG8(0x5a8d), 0x19 },
++	{ CCI_REG8(0x5a9b), 0xc8 },
++	{ CCI_REG8(0x5a9d), 0x25 },
++	{ CCI_REG8(0x5aa1), 0x52 },
++	{ CCI_REG8(0x5aa5), 0x19 },
++	{ CCI_REG8(0x5aab), 0x93 },
++	{ CCI_REG8(0x5ab5), 0x52 },
++	{ CCI_REG8(0x5abf), 0x19 },
++	{ CCI_REG8(0x5acd), 0xc8 },
++	{ CCI_REG8(0x5acf), 0x25 },
++	{ CCI_REG8(0x5ad3), 0x11 },
++	{ CCI_REG8(0x5ad7), 0x19 },
++	{ CCI_REG8(0x5add), 0x4b },
++	{ CCI_REG8(0x5ae7), 0x52 },
++	{ CCI_REG8(0x5af1), 0x19 },
++	{ CCI_REG8(0x5af5), 0x2d },
++	{ CCI_REG8(0x5aff), 0xc8 },
++	{ CCI_REG8(0x5b01), 0x25 },
++	{ CCI_REG8(0x5b05), 0x0e },
++	{ CCI_REG8(0x5b09), 0x19 },
++	{ CCI_REG8(0x5b0d), 0x9e },
++	{ CCI_REG8(0x5b0f), 0x34 },
++	{ CCI_REG8(0x5b21), 0x19 },
++	{ CCI_REG8(0x5b27), 0x2d },
++	{ CCI_REG8(0x5b33), 0x19 },
++	{ CCI_REG8(0x5b39), 0x9e },
++	{ CCI_REG8(0x5b3f), 0x52 },
++	{ CCI_REG8(0x5b49), 0x19 },
++	{ CCI_REG8(0x5b4d), 0x87 },
++	{ CCI_REG8(0x5b57), 0xc8 },
++	{ CCI_REG8(0x5b59), 0x25 },
++	{ CCI_REG8(0x5b5d), 0x0e },
++	{ CCI_REG8(0x5b61), 0x19 },
++	{ CCI_REG8(0x5b65), 0xda },
++	{ CCI_REG8(0x5b6d), 0x52 },
++	{ CCI_REG8(0x5b79), 0x19 },
++	{ CCI_REG8(0x5b7f), 0x2d },
++	{ CCI_REG8(0x5b8b), 0x19 },
++	{ CCI_REG8(0x5b91), 0x9e },
++	{ CCI_REG8(0x5b97), 0x52 },
++	{ CCI_REG8(0x5ba1), 0x19 },
++	{ CCI_REG8(0x5ba5), 0x2d },
++	{ CCI_REG8(0x5baf), 0xc8 },
++	{ CCI_REG8(0x5bb1), 0x25 },
++	{ CCI_REG8(0x5bb5), 0x11 },
++	{ CCI_REG8(0x5bb9), 0x19 },
++	{ CCI_REG8(0x5bbd), 0x9e },
++	{ CCI_REG8(0x5bbf), 0x5c },
++	{ CCI_REG8(0x5bd1), 0x19 },
++	{ CCI_REG8(0x5bd7), 0x2d },
++	{ CCI_REG8(0x5be3), 0x19 },
++	{ CCI_REG8(0x5be9), 0x9e },
++	{ CCI_REG8(0x5bef), 0x52 },
++	{ CCI_REG8(0x5bf9), 0x19 },
++	{ CCI_REG8(0x5bfd), 0x87 },
++	{ CCI_REG8(0x5c07), 0xc8 },
++	{ CCI_REG8(0x5c09), 0x25 },
++	{ CCI_REG8(0x5c0d), 0x11 },
++	{ CCI_REG8(0x5c11), 0x19 },
++	{ CCI_REG8(0x5c15), 0xda },
++	{ CCI_REG8(0x5c29), 0x19 },
++	{ CCI_REG8(0x5c2f), 0x2d },
++	{ CCI_REG8(0x5c3b), 0x19 },
++	{ CCI_REG8(0x5c41), 0x9e },
++	{ CCI_REG8(0x5c47), 0x52 },
++	{ CCI_REG8(0x5c51), 0x19 },
++	{ CCI_REG8(0x5c57), 0x41 },
++	{ CCI_REG8(0x5c5f), 0xc8 },
++	{ CCI_REG8(0x5c61), 0x25 },
++	{ CCI_REG8(0x5c65), 0x11 },
++	{ CCI_REG8(0x5c69), 0x19 },
++	{ CCI_REG8(0x5c6e), 0x01 },
++	{ CCI_REG8(0x5c6f), 0x13 },
++	{ CCI_REG8(0x5c85), 0xc8 },
++	{ CCI_REG8(0x5c87), 0x25 },
++	{ CCI_REG8(0x5c8b), 0x1b },
++	{ CCI_REG8(0x5c8f), 0x19 },
++	{ CCI_REG8(0x5c95), 0x41 },
++	{ CCI_REG8(0x5c9b), 0x52 },
++	{ CCI_REG8(0x5ca5), 0x19 },
++	{ CCI_REG8(0x5caa), 0x03 },
++	{ CCI_REG8(0x5cab), 0xde },
++	{ CCI_REG8(0x5cb3), 0xc8 },
++	{ CCI_REG8(0x5cb5), 0x25 },
++	{ CCI_REG8(0x5cb9), 0x11 },
++	{ CCI_REG8(0x5cbd), 0x19 },
++	{ CCI_REG8(0x5cc3), 0xb8 },
++	{ CCI_REG8(0x5cd9), 0xc8 },
++	{ CCI_REG8(0x5cdb), 0x25 },
++	{ CCI_REG8(0x5cdf), 0x1b },
++	{ CCI_REG8(0x5ce3), 0x19 },
++	{ CCI_REG8(0x5ce8), 0x03 },
++	{ CCI_REG8(0x5ce9), 0xde },
++	{ CCI_REG8(0x5cef), 0x52 },
++	{ CCI_REG8(0x5cf9), 0x19 },
++	{ CCI_REG8(0x5cff), 0x79 },
++	{ CCI_REG8(0x5d07), 0xc8 },
++	{ CCI_REG8(0x5d09), 0x25 },
++	{ CCI_REG8(0x5d0c), 0x00 },
++	{ CCI_REG8(0x5d0d), 0x52 },
++	{ CCI_REG8(0x5d11), 0x19 },
++	{ CCI_REG8(0x5d16), 0x01 },
++	{ CCI_REG8(0x5d17), 0x28 },
++	{ CCI_REG8(0x5d2d), 0xc8 },
++	{ CCI_REG8(0x5d2f), 0x25 },
++	{ CCI_REG8(0x5d33), 0x53 },
++	{ CCI_REG8(0x5d37), 0x19 },
++	{ CCI_REG8(0x5d3d), 0x79 },
++	{ CCI_REG8(0x5d43), 0x52 },
++	{ CCI_REG8(0x5d4d), 0x19 },
++	{ CCI_REG8(0x5d51), 0x2d },
++	{ CCI_REG8(0x5d53), 0x41 },
++	{ CCI_REG8(0x5d55), 0x6b },
++	{ CCI_REG8(0x5d5b), 0xc8 },
++	{ CCI_REG8(0x5d5d), 0x25 },
++	{ CCI_REG8(0x5d61), 0x11 },
++	{ CCI_REG8(0x5d65), 0x19 },
++	{ CCI_REG8(0x5d69), 0x9e },
++	{ CCI_REG8(0x5d6b), 0xd0 },
++	{ CCI_REG8(0x5d7d), 0x19 },
++	{ CCI_REG8(0x5d83), 0x2d },
++	{ CCI_REG8(0x5d95), 0xc8 },
++	{ CCI_REG8(0x5d97), 0x25 },
++	{ CCI_REG8(0x5d9b), 0x1b },
++	{ CCI_REG8(0x5d9f), 0x19 },
++	{ CCI_REG8(0x5da5), 0x41 },
++	{ CCI_REG8(0x5db1), 0x19 },
++	{ CCI_REG8(0x5db7), 0x6b },
++	{ CCI_REG8(0x5dc3), 0x19 },
++	{ CCI_REG8(0x5dc9), 0x9e },
++	{ CCI_REG8(0x5dcf), 0x52 },
++	{ CCI_REG8(0x5dd9), 0x19 },
++	{ CCI_REG8(0x5ddd), 0x87 },
++	{ CCI_REG8(0x5ddf), 0x41 },
++	{ CCI_REG8(0x5de1), 0x41 },
++	{ CCI_REG8(0x5de7), 0xc8 },
++	{ CCI_REG8(0x5de9), 0x25 },
++	{ CCI_REG8(0x5ded), 0x11 },
++	{ CCI_REG8(0x5df1), 0x19 },
++	{ CCI_REG8(0x5df5), 0xda },
++	{ CCI_REG8(0x5df7), 0x4a },
++	{ CCI_REG8(0x5e09), 0x19 },
++	{ CCI_REG8(0x5e0f), 0x2d },
++	{ CCI_REG8(0x5e21), 0xc8 },
++	{ CCI_REG8(0x5e23), 0x25 },
++	{ CCI_REG8(0x5e27), 0x1b },
++	{ CCI_REG8(0x5e2b), 0x19 },
++	{ CCI_REG8(0x5e31), 0x41 },
++	{ CCI_REG8(0x5e3d), 0x19 },
++	{ CCI_REG8(0x5e43), 0x6b },
++	{ CCI_REG8(0x5e4f), 0x19 },
++	{ CCI_REG8(0x5e55), 0x9e },
++	{ CCI_REG8(0x5e5b), 0x52 },
++	{ CCI_REG8(0x5e65), 0x19 },
++	{ CCI_REG8(0x5e69), 0x2d },
++	{ CCI_REG8(0x5e6b), 0x41 },
++	{ CCI_REG8(0x5e73), 0xc8 },
++	{ CCI_REG8(0x5e75), 0x25 },
++	{ CCI_REG8(0x5e79), 0x11 },
++	{ CCI_REG8(0x5e7d), 0x19 },
++	{ CCI_REG8(0x5e81), 0x9e },
++	{ CCI_REG8(0x5e83), 0xfb },
++	{ CCI_REG8(0x5e95), 0x19 },
++	{ CCI_REG8(0x5e9b), 0x2d },
++	{ CCI_REG8(0x5ead), 0xc8 },
++	{ CCI_REG8(0x5eaf), 0x25 },
++	{ CCI_REG8(0x5eb3), 0x1b },
++	{ CCI_REG8(0x5eb7), 0x19 },
++	{ CCI_REG8(0x5ebd), 0x41 },
++	{ CCI_REG8(0x5ec9), 0x19 },
++	{ CCI_REG8(0x5ecf), 0x9e },
++	{ CCI_REG8(0x5ed5), 0x52 },
++	{ CCI_REG8(0x5edf), 0x19 },
++	{ CCI_REG8(0x5ee3), 0x2d },
++	{ CCI_REG8(0x5ee5), 0x5a },
++	{ CCI_REG8(0x5ee7), 0x41 },
++	{ CCI_REG8(0x5eef), 0xc8 },
++	{ CCI_REG8(0x5ef1), 0x25 },
++	{ CCI_REG8(0x5ef5), 0x11 },
++	{ CCI_REG8(0x5ef9), 0x19 },
++	{ CCI_REG8(0x5efd), 0xda },
++	{ CCI_REG8(0x5eff), 0xcb },
++	{ CCI_REG8(0x5f11), 0x19 },
++	{ CCI_REG8(0x5f17), 0x2d },
++	{ CCI_REG8(0x5f23), 0x19 },
++	{ CCI_REG8(0x5f29), 0x2d },
++	{ CCI_REG8(0x5f3b), 0xc8 },
++	{ CCI_REG8(0x5f3d), 0x25 },
++	{ CCI_REG8(0x5f41), 0x1b },
++	{ CCI_REG8(0x5f45), 0x19 },
++	{ CCI_REG8(0x5f4b), 0x41 },
++	{ CCI_REG8(0x5f57), 0x19 },
++	{ CCI_REG8(0x5f5d), 0x9e },
++	{ CCI_REG8(0x5f63), 0x52 },
++	{ CCI_REG8(0x5f6d), 0x19 },
++	{ CCI_REG8(0x5f7f), 0x55 },
++	{ CCI_REG8(0x5f83), 0x0e },
++	{ CCI_REG8(0x5f87), 0x19 },
++	{ CCI_REG8(0x5f93), 0x12 },
++	{ CCI_REG8(0x6c06), 0xff },
++	{ CCI_REG8(0x6c07), 0xff },
++	{ CCI_REG8(0x6c0e), 0x00 },
++	{ CCI_REG8(0x6c0f), 0x02 },
++	{ CCI_REG8(0x6c11), 0xd9 },
++	{ CCI_REG8(0x6c12), 0xff },
++	{ CCI_REG8(0x6c13), 0xff },
++	{ CCI_REG8(0x6c1a), 0x00 },
++	{ CCI_REG8(0x6c1b), 0x02 },
++	{ CCI_REG8(0x6c1d), 0xd9 },
++	{ CCI_REG8(0x6c1e), 0xff },
++	{ CCI_REG8(0x6c1f), 0xff },
++	{ CCI_REG8(0x6c26), 0x00 },
++	{ CCI_REG8(0x6c27), 0x02 },
++	{ CCI_REG8(0x6c29), 0xd9 },
++	{ CCI_REG8(0x6c2a), 0xff },
++	{ CCI_REG8(0x6c2b), 0xff },
++	{ CCI_REG8(0x6c32), 0x00 },
++	{ CCI_REG8(0x6c33), 0x02 },
++	{ CCI_REG8(0x6c35), 0xd9 },
++	{ CCI_REG8(0x6c36), 0xff },
++	{ CCI_REG8(0x6c37), 0xff },
++	{ CCI_REG8(0x6c3e), 0x00 },
++	{ CCI_REG8(0x6c3f), 0x02 },
++	{ CCI_REG8(0x6c41), 0xd9 },
++	{ CCI_REG8(0x6c42), 0xff },
++	{ CCI_REG8(0x6c43), 0xff },
++	{ CCI_REG8(0x6c4a), 0x00 },
++	{ CCI_REG8(0x6c4b), 0x02 },
++	{ CCI_REG8(0x6c4d), 0xd9 },
++	{ CCI_REG8(0x6c4e), 0xff },
++	{ CCI_REG8(0x6c4f), 0xff },
++	{ CCI_REG8(0x6c5a), 0xff },
++	{ CCI_REG8(0x6c5b), 0xff },
++	{ CCI_REG8(0x6c66), 0xff },
++	{ CCI_REG8(0x6c67), 0xff },
++	{ CCI_REG8(0x6c72), 0xff },
++	{ CCI_REG8(0x6c73), 0xff },
++	{ CCI_REG8(0x6c7e), 0xff },
++	{ CCI_REG8(0x6c7f), 0xff },
++	{ CCI_REG8(0x6caa), 0x00 },
++	{ CCI_REG8(0x6cab), 0x02 },
++	{ CCI_REG8(0x6cad), 0xd9 },
++	{ CCI_REG8(0x6cae), 0x00 },
++	{ CCI_REG8(0x6caf), 0x02 },
++	{ CCI_REG8(0x6cb1), 0xd9 },
++	{ CCI_REG8(0x6cb2), 0x00 },
++	{ CCI_REG8(0x6cb3), 0x02 },
++	{ CCI_REG8(0x6cb5), 0xd9 },
++	{ CCI_REG8(0x6cb6), 0x00 },
++	{ CCI_REG8(0x6cb7), 0x02 },
++	{ CCI_REG8(0x6cb9), 0xd9 },
++	{ CCI_REG8(0x6cba), 0x00 },
++	{ CCI_REG8(0x6cbb), 0x02 },
++	{ CCI_REG8(0x6cbd), 0xd9 },
++	{ CCI_REG8(0x6e3f), 0xde },
++	{ CCI_REG8(0x6e47), 0xde },
++	{ CCI_REG8(0x6e4f), 0xde },
++	{ CCI_REG8(0x6e57), 0xde },
++	{ CCI_REG8(0x6e5f), 0xde },
++	{ CCI_REG8(0x6e67), 0xde },
++	{ CCI_REG8(0x6eb3), 0xde },
++	{ CCI_REG8(0x6eb7), 0xde },
++	{ CCI_REG8(0x6ebb), 0xde },
++	{ CCI_REG8(0x6ebf), 0xde },
++	{ CCI_REG8(0x6ec3), 0xde },
++	{ CCI_REG8(0x7476), 0x00 },
++	{ CCI_REG8(0x7477), 0x00 },
++	{ CCI_REG8(0x7478), 0x00 },
++	{ CCI_REG8(0x7509), 0x00 },
++	{ CCI_REG8(0x750b), 0x00 },
++	{ CCI_REG8(0x7516), 0x01 },
++	{ CCI_REG8(0x7524), 0x0c },
++	{ CCI_REG8(0x7528), 0x02 },
++	{ CCI_REG8(0x7530), 0x03 },
++	{ CCI_REG8(0x7616), 0x0c },
++	{ CCI_REG8(0x7619), 0x0c },
++	{ CCI_REG8(0x761c), 0x0c },
++	{ CCI_REG8(0x761d), 0x0c },
++	{ CCI_REG8(0x761e), 0x0c },
++	{ CCI_REG8(0x761f), 0x0c },
++	{ CCI_REG8(0x7620), 0x00 },
++	{ CCI_REG8(0x7623), 0x00 },
++	{ CCI_REG8(0x7624), 0x00 },
++	{ CCI_REG8(0x7625), 0x00 },
++	{ CCI_REG8(0x7626), 0x00 },
++	{ CCI_REG8(0x7627), 0x00 },
++	{ CCI_REG8(0x7628), 0x00 },
++	{ CCI_REG8(0x7629), 0x00 },
++	{ CCI_REG8(0x762a), 0x00 },
++	{ CCI_REG8(0x762b), 0x00 },
++	{ CCI_REG8(0x762c), 0x00 },
++	{ CCI_REG8(0x762d), 0x00 },
++	{ CCI_REG8(0x762e), 0x00 },
++	{ CCI_REG8(0x762f), 0x00 },
++	{ CCI_REG8(0x7631), 0x07 },
++	{ CCI_REG8(0x7632), 0x07 },
++	{ CCI_REG8(0x7634), 0x07 },
++	{ CCI_REG8(0x7635), 0x07 },
++	{ CCI_REG8(0x76fc), 0x44 },
++	{ CCI_REG8(0x76fd), 0x2a },
++	{ CCI_REG8(0x76fe), 0x2c },
++	{ CCI_REG8(0x76ff), 0x26 },
++	{ CCI_REG8(0x7700), 0x43 },
++	{ CCI_REG8(0x7701), 0x2a },
++	{ CCI_REG8(0x7702), 0x2a },
++	{ CCI_REG8(0x7703), 0x26 },
++	{ CCI_REG8(0x7704), 0x2c },
++	{ CCI_REG8(0x7705), 0x2a },
++	{ CCI_REG8(0x7706), 0x2a },
++	{ CCI_REG8(0x7707), 0x65 },
++	{ CCI_REG8(0x7708), 0x44 },
++	{ CCI_REG8(0x7709), 0x48 },
++	{ CCI_REG8(0x770a), 0x40 },
++	{ CCI_REG8(0x770b), 0x64 },
++	{ CCI_REG8(0x770c), 0x44 },
++	{ CCI_REG8(0x770d), 0x44 },
++	{ CCI_REG8(0x770e), 0x40 },
++	{ CCI_REG8(0x770f), 0x48 },
++	{ CCI_REG8(0x7710), 0x44 },
++	{ CCI_REG8(0x7711), 0x44 },
++	{ CCI_REG8(0x7712), 0x45 },
++	{ CCI_REG8(0x7713), 0x43 },
++	{ CCI_REG8(0x7714), 0x47 },
++	{ CCI_REG8(0x7715), 0x40 },
++	{ CCI_REG8(0x7716), 0x42 },
++	{ CCI_REG8(0x7717), 0x43 },
++	{ CCI_REG8(0x7718), 0x43 },
++	{ CCI_REG8(0x7719), 0x40 },
++	{ CCI_REG8(0x771a), 0x47 },
++	{ CCI_REG8(0x771b), 0x43 },
++	{ CCI_REG8(0x771c), 0x43 },
++	{ CCI_REG8(0x771d), 0x5d },
++	{ CCI_REG8(0x771e), 0x43 },
++	{ CCI_REG8(0x771f), 0x46 },
++	{ CCI_REG8(0x7720), 0x40 },
++	{ CCI_REG8(0x7721), 0x62 },
++	{ CCI_REG8(0x7722), 0x43 },
++	{ CCI_REG8(0x7723), 0x43 },
++	{ CCI_REG8(0x7724), 0x40 },
++	{ CCI_REG8(0x7725), 0x46 },
++	{ CCI_REG8(0x7726), 0x43 },
++	{ CCI_REG8(0x7727), 0x43 },
++	{ CCI_REG8(0x7728), 0x41 },
++	{ CCI_REG8(0x7729), 0x43 },
++	{ CCI_REG8(0x772a), 0x3f },
++	{ CCI_REG8(0x772b), 0x41 },
++	{ CCI_REG8(0x772c), 0x41 },
++	{ CCI_REG8(0x772d), 0x3f },
++	{ CCI_REG8(0x772e), 0x43 },
++	{ CCI_REG8(0x772f), 0x41 },
++	{ CCI_REG8(0x7730), 0x41 },
++	{ CCI_REG8(0x7731), 0x40 },
++	{ CCI_REG8(0x7732), 0x42 },
++	{ CCI_REG8(0x7733), 0x3f },
++	{ CCI_REG8(0x7734), 0x40 },
++	{ CCI_REG8(0x7735), 0x40 },
++	{ CCI_REG8(0x7736), 0x3f },
++	{ CCI_REG8(0x7737), 0x42 },
++	{ CCI_REG8(0x7738), 0x40 },
++	{ CCI_REG8(0x7739), 0x40 },
++	{ CCI_REG8(0x773a), 0x40 },
++	{ CCI_REG8(0x773b), 0x15 },
++	{ CCI_REG8(0x773c), 0x16 },
++	{ CCI_REG8(0x773d), 0x09 },
++	{ CCI_REG8(0x773e), 0x3b },
++	{ CCI_REG8(0x773f), 0x15 },
++	{ CCI_REG8(0x7740), 0x15 },
++	{ CCI_REG8(0x7741), 0x09 },
++	{ CCI_REG8(0x7742), 0x16 },
++	{ CCI_REG8(0x7743), 0x15 },
++	{ CCI_REG8(0x7744), 0x15 },
++	{ CCI_REG8(0x7745), 0x63 },
++	{ CCI_REG8(0x7746), 0x2f },
++	{ CCI_REG8(0x7747), 0x2f },
++	{ CCI_REG8(0x7748), 0x19 },
++	{ CCI_REG8(0x7749), 0x5d },
++	{ CCI_REG8(0x774a), 0x2f },
++	{ CCI_REG8(0x774b), 0x2f },
++	{ CCI_REG8(0x774c), 0x19 },
++	{ CCI_REG8(0x774d), 0x2f },
++	{ CCI_REG8(0x774e), 0x2f },
++	{ CCI_REG8(0x774f), 0x2f },
++	{ CCI_REG8(0x7750), 0x45 },
++	{ CCI_REG8(0x7751), 0x2f },
++	{ CCI_REG8(0x7752), 0x2f },
++	{ CCI_REG8(0x7753), 0x24 },
++	{ CCI_REG8(0x7754), 0x43 },
++	{ CCI_REG8(0x7755), 0x2f },
++	{ CCI_REG8(0x7756), 0x2f },
++	{ CCI_REG8(0x7757), 0x24 },
++	{ CCI_REG8(0x7758), 0x2f },
++	{ CCI_REG8(0x7759), 0x2f },
++	{ CCI_REG8(0x775a), 0x2f },
++	{ CCI_REG8(0x775b), 0x57 },
++	{ CCI_REG8(0x775c), 0x39 },
++	{ CCI_REG8(0x775d), 0x36 },
++	{ CCI_REG8(0x775e), 0x32 },
++	{ CCI_REG8(0x775f), 0x64 },
++	{ CCI_REG8(0x7760), 0x39 },
++	{ CCI_REG8(0x7761), 0x39 },
++	{ CCI_REG8(0x7762), 0x32 },
++	{ CCI_REG8(0x7763), 0x36 },
++	{ CCI_REG8(0x7764), 0x39 },
++	{ CCI_REG8(0x7765), 0x39 },
++	{ CCI_REG8(0x7766), 0x3b },
++	{ CCI_REG8(0x7767), 0x3b },
++	{ CCI_REG8(0x7768), 0x3b },
++	{ CCI_REG8(0x7769), 0x3b },
++	{ CCI_REG8(0x776a), 0x3b },
++	{ CCI_REG8(0x776b), 0x3b },
++	{ CCI_REG8(0x776c), 0x3b },
++	{ CCI_REG8(0x776d), 0x3b },
++	{ CCI_REG8(0x776e), 0x3b },
++	{ CCI_REG8(0x776f), 0x41 },
++	{ CCI_REG8(0x7770), 0x40 },
++	{ CCI_REG8(0x7771), 0x3f },
++	{ CCI_REG8(0x7772), 0x41 },
++	{ CCI_REG8(0x7773), 0x41 },
++	{ CCI_REG8(0x7774), 0x3f },
++	{ CCI_REG8(0x7775), 0x40 },
++	{ CCI_REG8(0x7776), 0x41 },
++	{ CCI_REG8(0x7777), 0x41 },
++	{ CCI_REG8(0x7778), 0x0f },
++	{ CCI_REG8(0x7779), 0x0a },
++	{ CCI_REG8(0x777a), 0x0a },
++	{ CCI_REG8(0x777b), 0x0a },
++	{ CCI_REG8(0x777c), 0x0f },
++	{ CCI_REG8(0x777d), 0x0a },
++	{ CCI_REG8(0x777e), 0x0a },
++	{ CCI_REG8(0x777f), 0x0a },
++	{ CCI_REG8(0x7780), 0x0a },
++	{ CCI_REG8(0x7781), 0x0a },
++	{ CCI_REG8(0x7782), 0x0a },
++	{ CCI_REG8(0x7783), 0x0f },
++	{ CCI_REG8(0x7784), 0x0a },
++	{ CCI_REG8(0x7785), 0x0a },
++	{ CCI_REG8(0x7786), 0x0a },
++	{ CCI_REG8(0x7787), 0x0f },
++	{ CCI_REG8(0x7788), 0x0a },
++	{ CCI_REG8(0x7789), 0x0a },
++	{ CCI_REG8(0x778a), 0x0a },
++	{ CCI_REG8(0x778b), 0x0a },
++	{ CCI_REG8(0x778c), 0x0a },
++	{ CCI_REG8(0x778d), 0x0a },
++	{ CCI_REG8(0x778e), 0x14 },
++	{ CCI_REG8(0x778f), 0x0a },
++	{ CCI_REG8(0x7790), 0x0a },
++	{ CCI_REG8(0x7791), 0x0a },
++	{ CCI_REG8(0x7792), 0x0f },
++	{ CCI_REG8(0x7793), 0x0a },
++	{ CCI_REG8(0x7794), 0x0a },
++	{ CCI_REG8(0x7795), 0x0a },
++	{ CCI_REG8(0x7796), 0x0a },
++	{ CCI_REG8(0x7797), 0x0a },
++	{ CCI_REG8(0x7798), 0x0a },
++	{ CCI_REG8(0x7799), 0x14 },
++	{ CCI_REG8(0x779a), 0x0a },
++	{ CCI_REG8(0x779b), 0x0a },
++	{ CCI_REG8(0x779c), 0x0a },
++	{ CCI_REG8(0x779d), 0x0f },
++	{ CCI_REG8(0x779e), 0x0a },
++	{ CCI_REG8(0x779f), 0x0a },
++	{ CCI_REG8(0x77a0), 0x0a },
++	{ CCI_REG8(0x77a1), 0x0a },
++	{ CCI_REG8(0x77a2), 0x0a },
++	{ CCI_REG8(0x77a3), 0x0a },
++	{ CCI_REG8(0x77a4), 0x0a },
++	{ CCI_REG8(0x77a5), 0x0a },
++	{ CCI_REG8(0x77a6), 0x0a },
++	{ CCI_REG8(0x77a7), 0x0a },
++	{ CCI_REG8(0x77a8), 0x0a },
++	{ CCI_REG8(0x77a9), 0x0a },
++	{ CCI_REG8(0x77aa), 0x0a },
++	{ CCI_REG8(0x77ab), 0x0a },
++	{ CCI_REG8(0x77ac), 0x0a },
++	{ CCI_REG8(0x77ad), 0x0b },
++	{ CCI_REG8(0x77ae), 0x0a },
++	{ CCI_REG8(0x77af), 0x0a },
++	{ CCI_REG8(0x77b0), 0x0b },
++	{ CCI_REG8(0x77b1), 0x0b },
++	{ CCI_REG8(0x77b2), 0x0a },
++	{ CCI_REG8(0x77b3), 0x0a },
++	{ CCI_REG8(0x77b4), 0x0b },
++	{ CCI_REG8(0x77b5), 0x0b },
++	{ CCI_REG8(0x77f4), 0x01 },
++	{ CCI_REG8(0x77f5), 0x01 },
++	{ CCI_REG8(0x77f6), 0x01 },
++	{ CCI_REG8(0x77f8), 0x01 },
++	{ CCI_REG8(0x77f9), 0x01 },
++	{ CCI_REG8(0x77fb), 0x01 },
++	{ CCI_REG8(0x77fc), 0x01 },
++	{ CCI_REG8(0x7814), 0x2a },
++	{ CCI_REG8(0x7815), 0x01 },
++	{ CCI_REG8(0x7816), 0x28 },
++	{ CCI_REG8(0x7818), 0x2a },
++	{ CCI_REG8(0x7819), 0x28 },
++	{ CCI_REG8(0x781a), 0x01 },
++	{ CCI_REG8(0x781c), 0x28 },
++	{ CCI_REG8(0x781d), 0x28 },
++	{ CCI_REG8(0x781e), 0x28 },
++	{ CCI_REG8(0x781f), 0x2a },
++	{ CCI_REG8(0x7820), 0x01 },
++	{ CCI_REG8(0x7821), 0x28 },
++	{ CCI_REG8(0x7823), 0x2a },
++	{ CCI_REG8(0x7824), 0x28 },
++	{ CCI_REG8(0x7825), 0x01 },
++	{ CCI_REG8(0x7827), 0x28 },
++	{ CCI_REG8(0x7828), 0x28 },
++	{ CCI_REG8(0x7829), 0x28 },
++	{ CCI_REG8(0x782a), 0x2a },
++	{ CCI_REG8(0x782b), 0x0a },
++	{ CCI_REG8(0x782c), 0x28 },
++	{ CCI_REG8(0x782e), 0x2a },
++	{ CCI_REG8(0x782f), 0x28 },
++	{ CCI_REG8(0x7830), 0x0a },
++	{ CCI_REG8(0x7832), 0x28 },
++	{ CCI_REG8(0x7833), 0x28 },
++	{ CCI_REG8(0x7834), 0x28 },
++	{ CCI_REG8(0x7835), 0x2a },
++	{ CCI_REG8(0x7836), 0x19 },
++	{ CCI_REG8(0x7837), 0x2a },
++	{ CCI_REG8(0x7838), 0x2a },
++	{ CCI_REG8(0x7839), 0x2a },
++	{ CCI_REG8(0x783a), 0x2a },
++	{ CCI_REG8(0x783b), 0x19 },
++	{ CCI_REG8(0x783c), 0x2a },
++	{ CCI_REG8(0x783d), 0x2a },
++	{ CCI_REG8(0x783e), 0x2a },
++	{ CCI_REG8(0x783f), 0x2a },
++	{ CCI_REG8(0x7840), 0x1d },
++	{ CCI_REG8(0x7841), 0x2a },
++	{ CCI_REG8(0x7842), 0x2a },
++	{ CCI_REG8(0x7843), 0x2a },
++	{ CCI_REG8(0x7844), 0x1d },
++	{ CCI_REG8(0x7845), 0x2a },
++	{ CCI_REG8(0x7846), 0x2a },
++	{ CCI_REG8(0x7847), 0x2a },
++	{ CCI_REG8(0x7848), 0x2a },
++	{ CCI_REG8(0x7849), 0x2a },
++	{ CCI_REG8(0x784a), 0x2a },
++	{ CCI_REG8(0x784b), 0x2a },
++	{ CCI_REG8(0x784c), 0x2a },
++	{ CCI_REG8(0x784d), 0x2a },
++	{ CCI_REG8(0x784e), 0x2a },
++	{ CCI_REG8(0x784f), 0x2a },
++	{ CCI_REG8(0x7850), 0x2a },
++	{ CCI_REG8(0x7851), 0x2a },
++	{ CCI_REG8(0x7853), 0x50 },
++	{ CCI_REG8(0x7856), 0x50 },
++	{ CCI_REG8(0x7857), 0x50 },
++	{ CCI_REG8(0x785a), 0x50 },
++	{ CCI_REG8(0x785b), 0x50 },
++	{ CCI_REG8(0x785d), 0x50 },
++	{ CCI_REG8(0x7860), 0x50 },
++	{ CCI_REG8(0x7861), 0x50 },
++	{ CCI_REG8(0x7864), 0x50 },
++	{ CCI_REG8(0x7865), 0x50 },
++	{ CCI_REG8(0x7867), 0x50 },
++	{ CCI_REG8(0x786a), 0x50 },
++	{ CCI_REG8(0x786b), 0x50 },
++	{ CCI_REG8(0x7902), 0x15 },
++	{ CCI_REG8(0x7904), 0x13 },
++	{ CCI_REG8(0x7905), 0x15 },
++	{ CCI_REG8(0x7908), 0x13 },
++	{ CCI_REG8(0x7909), 0x08 },
++	{ CCI_REG8(0x790b), 0x11 },
++	{ CCI_REG8(0x790d), 0x0c },
++	{ CCI_REG8(0x790e), 0x08 },
++	{ CCI_REG8(0x790f), 0x08 },
++	{ CCI_REG8(0x7912), 0x0b },
++	{ CCI_REG8(0x7919), 0x06 },
++	{ CCI_REG8(0x791e), 0x06 },
++	{ CCI_REG8(0x791f), 0x06 },
++	{ CCI_REG8(0x7929), 0x00 },
++	{ CCI_REG8(0x792e), 0x00 },
++	{ CCI_REG8(0x792f), 0x00 },
++	{ CCI_REG8(0x7a2a), 0x19 },
++	{ CCI_REG8(0x7a2b), 0xf1 },
++	{ CCI_REG8(0x7a2c), 0x0f },
++	{ CCI_REG8(0x7a48), 0x0f },
++	{ CCI_REG8(0x7a49), 0x01 },
++	{ CCI_REG8(0x7a4a), 0x03 },
++	{ CCI_REG8(0x7a51), 0x09 },
++	{ CCI_REG8(0x7a58), 0x0f },
++	{ CCI_REG8(0x7a5d), 0x32 },
++	{ CCI_REG8(0x7a63), 0x32 },
++	{ CCI_REG8(0x7a6b), 0x3e },
++	{ CCI_REG8(0x7a71), 0x3e },
++	{ CCI_REG8(0x7aad), 0x99 },
++	{ CCI_REG8(0x7ab3), 0x99 },
++	{ CCI_REG8(0x7abb), 0xa5 },
++	{ CCI_REG8(0x7ac1), 0xa5 },
++	{ CCI_REG8(0x7afd), 0x66 },
++	{ CCI_REG8(0x7b05), 0x72 },
++	{ CCI_REG8(0x7b26), 0x12 },
++	{ CCI_REG8(0x7b27), 0x12 },
++	{ CCI_REG8(0x7b28), 0x12 },
++	{ CCI_REG8(0x7b29), 0x12 },
++	{ CCI_REG8(0x7b2a), 0x12 },
++	{ CCI_REG8(0x7b2b), 0x12 },
++	{ CCI_REG8(0x7b2c), 0x12 },
++	{ CCI_REG8(0x7b2d), 0x12 },
++	{ CCI_REG8(0x7b2e), 0x12 },
++	{ CCI_REG8(0x7b2f), 0x12 },
++	{ CCI_REG8(0x7b30), 0x12 },
++	{ CCI_REG8(0x7b31), 0x12 },
++	{ CCI_REG8(0x7b32), 0x12 },
++	{ CCI_REG8(0x7b33), 0x12 },
++	{ CCI_REG8(0x7b34), 0x12 },
++	{ CCI_REG8(0x7b35), 0x12 },
++	{ CCI_REG8(0x7b36), 0x12 },
++	{ CCI_REG8(0x7b37), 0x12 },
++	{ CCI_REG8(0x7b38), 0x12 },
++	{ CCI_REG8(0x7b39), 0x12 },
++	{ CCI_REG8(0x7b3a), 0x12 },
++	{ CCI_REG8(0x7b3b), 0x12 },
++	{ CCI_REG8(0x7b3c), 0x12 },
++	{ CCI_REG8(0x7b3d), 0x12 },
++	{ CCI_REG8(0x7b3e), 0x12 },
++	{ CCI_REG8(0x7b3f), 0x12 },
++	{ CCI_REG8(0x7b40), 0x12 },
++	{ CCI_REG8(0x7b41), 0x12 },
++	{ CCI_REG8(0x7b42), 0x12 },
++	{ CCI_REG8(0x7b43), 0x12 },
++	{ CCI_REG8(0x7b44), 0x12 },
++	{ CCI_REG8(0x7b45), 0x12 },
++	{ CCI_REG8(0x7b46), 0x12 },
++	{ CCI_REG8(0x7b47), 0x12 },
++	{ CCI_REG8(0x7b48), 0x12 },
++	{ CCI_REG8(0x7b49), 0x12 },
++	{ CCI_REG8(0x7b4a), 0x12 },
++	{ CCI_REG8(0x7b4b), 0x12 },
++	{ CCI_REG8(0x7b4c), 0x12 },
++	{ CCI_REG8(0x7b4d), 0x12 },
++	{ CCI_REG8(0x7c73), 0x0b },
++	{ CCI_REG8(0x7c74), 0x0b },
++	{ CCI_REG8(0x7c75), 0x0b },
++	{ CCI_REG8(0x7c76), 0x0b },
++	{ CCI_REG8(0x7c77), 0x0b },
++	{ CCI_REG8(0x7c78), 0x0b },
++	{ CCI_REG8(0x7c79), 0x0b },
++	{ CCI_REG8(0x7c7c), 0x0b },
++	{ CCI_REG8(0x7c7d), 0x0b },
++	{ CCI_REG8(0x7c7e), 0x0b },
++	{ CCI_REG8(0x7c7f), 0x0b },
++	{ CCI_REG8(0x7c80), 0x0b },
++	{ CCI_REG8(0x7c81), 0x0b },
++	{ CCI_REG8(0x7c83), 0x0b },
++	{ CCI_REG8(0x7c84), 0x0b },
++	{ CCI_REG8(0x7c85), 0x0b },
++	{ CCI_REG8(0x7c86), 0x0b },
++	{ CCI_REG8(0x7c87), 0x0b },
++	{ CCI_REG8(0x7c88), 0x0b },
++	{ CCI_REG8(0x7ca5), 0x01 },
++	{ CCI_REG8(0x7caa), 0x01 },
++	{ CCI_REG8(0x7cb0), 0x01 },
++	{ CCI_REG8(0x7cb5), 0x01 },
++	{ CCI_REG8(0x7cbb), 0x01 },
++	{ CCI_REG8(0x7cc0), 0x01 },
++	{ CCI_REG8(0x7cd1), 0x01 },
++	{ CCI_REG8(0x7cd6), 0x01 },
++	{ CCI_REG8(0x7cdc), 0x01 },
++	{ CCI_REG8(0x7ce1), 0x01 },
++	{ CCI_REG8(0x7ce7), 0x01 },
++	{ CCI_REG8(0x7cec), 0x01 },
++	{ CCI_REG8(0x90b3), 0x80 },
++	{ CCI_REG8(0x974a), 0x09 },
++	{ CCI_REG8(0x974b), 0x08 },
++	{ CCI_REG8(0x9752), 0x0e },
++	{ CCI_REG8(0x9753), 0xb4 },
++	{ CCI_REG8(0x975b), 0x0c },
++	{ CCI_REG8(0x9762), 0x09 },
++	{ CCI_REG8(0x9763), 0x08 },
++	{ CCI_REG8(0x976a), 0x09 },
++	{ CCI_REG8(0x976b), 0x08 },
++	{ CCI_REG8(0x9772), 0x0f },
++	{ CCI_REG8(0x9773), 0x7c },
++	{ CCI_REG8(0x978a), 0x09 },
++	{ CCI_REG8(0x978b), 0xe8 },
++	{ CCI_REG8(0xdda9), 0x4e },
++	{ CCI_REG8(0xde8d), 0x01 },
++	{ CCI_REG8(0xe24e), 0x01 },
++	{ CCI_REG8(0xae24), 0x01 },
++	{ CCI_REG8(0xae25), 0x61 },
++	{ CCI_REG8(0xae26), 0x01 },
++	{ CCI_REG8(0xae27), 0xdf },
++	{ CCI_REG8(0xae28), 0x02 },
++	{ CCI_REG8(0xae29), 0xd0 },
++	{ CCI_REG8(0xab55), 0x23 },
++	{ CCI_REG8(0xab57), 0x23 },
++	{ CCI_REG8(0xab59), 0x23 },
++	{ CCI_REG8(0xab5b), 0x0a },
++	{ CCI_REG8(0xab5d), 0x0a },
++	{ CCI_REG8(0xab5f), 0x0a },
++	{ CCI_REG8(0xab73), 0x23 },
++	{ CCI_REG8(0xab75), 0x23 },
++	{ CCI_REG8(0xab77), 0x23 },
++	{ CCI_REG8(0xab79), 0x0a },
++	{ CCI_REG8(0xab7b), 0x0a },
++	{ CCI_REG8(0xab7d), 0x0a },
++	{ CCI_REG8(0x0d08), 0x00 },
++	{ CCI_REG8(0x0101), 0x02 },
++};
++
++static const struct cci_reg_sequence imx882_4096x3072_regs[] = {
++	{ CCI_REG8(0x0112), 0x0a },
++	{ CCI_REG8(0x0113), 0x0a },
++	{ CCI_REG8(0x0114), 0x02 },
++	{ CCI_REG8(0x0342), 0x1d },
++	{ CCI_REG8(0x0343), 0x4c },
++	{ CCI_REG8(0x3850), 0x00 },
++	{ CCI_REG8(0x3851), 0xa4 },
++	{ CCI_REG8(0x0340), 0x0f },
++	{ CCI_REG8(0x0341), 0x3c },
++	{ CCI_REG8(0x0344), 0x00 },
++	{ CCI_REG8(0x0345), 0x00 },
++	{ CCI_REG8(0x0346), 0x00 },
++	{ CCI_REG8(0x0347), 0x00 },
++	{ CCI_REG8(0x0348), 0x1f },
++	{ CCI_REG8(0x0349), 0xff },
++	{ CCI_REG8(0x034a), 0x17 },
++	{ CCI_REG8(0x034b), 0xff },
++	{ CCI_REG8(0x0900), 0x01 },
++	{ CCI_REG8(0x0901), 0x22 },
++	{ CCI_REG8(0x0902), 0x00 },
++	{ CCI_REG8(0x3005), 0x02 },
++	{ CCI_REG8(0x3006), 0x02 },
++	{ CCI_REG8(0x301c), 0x00 },
++	{ CCI_REG8(0x3140), 0x0a },
++	{ CCI_REG8(0x3144), 0x00 },
++	{ CCI_REG8(0x3148), 0x04 },
++	{ CCI_REG8(0x31c0), 0x41 },
++	{ CCI_REG8(0x31c1), 0x41 },
++	{ CCI_REG8(0x3205), 0x00 },
++	{ CCI_REG8(0x323c), 0x01 },
++	{ CCI_REG8(0x39ac), 0x01 },
++	{ CCI_REG8(0x0408), 0x00 },
++	{ CCI_REG8(0x0409), 0x00 },
++	{ CCI_REG8(0x040a), 0x00 },
++	{ CCI_REG8(0x040b), 0x00 },
++	{ CCI_REG8(0x040c), 0x10 },
++	{ CCI_REG8(0x040d), 0x00 },
++	{ CCI_REG8(0x040e), 0x0c },
++	{ CCI_REG8(0x040f), 0x00 },
++	{ CCI_REG8(0x034c), 0x10 },
++	{ CCI_REG8(0x034d), 0x00 },
++	{ CCI_REG8(0x034e), 0x0c },
++	{ CCI_REG8(0x034f), 0x00 },
++	{ CCI_REG8(0x0301), 0x05 },
++	{ CCI_REG8(0x0303), 0x02 },
++	{ CCI_REG8(0x0305), 0x03 },
++	{ CCI_REG8(0x0306), 0x01 },
++	{ CCI_REG8(0x0307), 0x57 },
++	{ CCI_REG8(0x030b), 0x01 },
++	{ CCI_REG8(0x030d), 0x02 },
++	{ CCI_REG8(0x030e), 0x00 },
++	{ CCI_REG8(0x030f), 0xaa },
++	{ CCI_REG8(0x3104), 0x01 },
++	{ CCI_REG8(0x38a0), 0x00 },
++	{ CCI_REG8(0x38a1), 0xb4 },
++	{ CCI_REG8(0x38a2), 0x00 },
++	{ CCI_REG8(0x38a3), 0xe8 },
++	{ CCI_REG8(0x38a8), 0x00 },
++	{ CCI_REG8(0x38a9), 0x38 },
++	{ CCI_REG8(0x38aa), 0x00 },
++	{ CCI_REG8(0x38ab), 0x6a },
++	{ CCI_REG8(0x38b0), 0x03 },
++	{ CCI_REG8(0x38b1), 0xff },
++	{ CCI_REG8(0x38b4), 0x03 },
++	{ CCI_REG8(0x38b5), 0xff },
++	{ CCI_REG8(0x38b8), 0x03 },
++	{ CCI_REG8(0x38b9), 0xff },
++	{ CCI_REG8(0x38bc), 0x03 },
++	{ CCI_REG8(0x38bd), 0xff },
++	{ CCI_REG8(0x38d0), 0x0b },
++	{ CCI_REG8(0x38d1), 0x04 },
++	{ CCI_REG8(0x38d2), 0x08 },
++	{ CCI_REG8(0x38d3), 0xb0 },
++	{ CCI_REG8(0x38d8), 0x14 },
++	{ CCI_REG8(0x38e0), 0x00 },
++	{ CCI_REG8(0x38e1), 0x00 },
++	{ CCI_REG8(0x38e2), 0x00 },
++	{ CCI_REG8(0x38e3), 0x00 },
++	{ CCI_REG8(0x38e4), 0x00 },
++	{ CCI_REG8(0x38e5), 0x00 },
++	{ CCI_REG8(0x38e6), 0x00 },
++	{ CCI_REG8(0x38e7), 0x00 },
++	{ CCI_REG8(0x3b00), 0x08 },
++	{ CCI_REG8(0x3b01), 0x8e },
++	{ CCI_REG8(0x3b04), 0x00 },
++	{ CCI_REG8(0x3b05), 0x88 },
++	{ CCI_REG8(0x0202), 0x03 },
++	{ CCI_REG8(0x0203), 0xe8 },
++	{ CCI_REG8(0x0204), 0x13 },
++	{ CCI_REG8(0x0205), 0x34 },
++	{ CCI_REG8(0x020e), 0x01 },
++	{ CCI_REG8(0x020f), 0x00 },
++	{ CCI_REG8(0x3103), 0x00 },
++	{ CCI_REG8(0x3422), 0x01 },
++	{ CCI_REG8(0x3423), 0xfc },
++	{ CCI_REG8(0x0e00), 0x00 },
++	{ CCI_REG8(0x30a4), 0x00 },
++	{ CCI_REG8(0x30a6), 0x00 },
++	{ CCI_REG8(0x30f2), 0x01 },
++	{ CCI_REG8(0x30f3), 0x01 },
++	{ CCI_REG8(0x30a5), 0x30 },
++	{ CCI_REG8(0x30a7), 0x30 },
++	{ CCI_REG8(0x30a2), 0x00 },
++	{ CCI_REG8(0x30f1), 0x01 },
++	{ CCI_REG8(0x30a3), 0x30 },
++};
++
++static const struct imx882_mode imx882_modes[] = {
++	{
++		.width = 4096,
++		.height = 3072,
++		.fll_def = 3900,
++		.fll_min = 3200,
++		.llp = 7500,
++		.regs = imx882_4096x3072_regs,
++		.num_regs = ARRAY_SIZE(imx882_4096x3072_regs),
++	},
++};
++
++static const s64 imx882_link_freq_menu[] = {
++	IMX882_LINK_FREQ_DEFAULT,
++};
++
++static const char * const imx882_test_pattern_menu[] = {
++	"Disabled",
++	"Solid Color",
++	"100% Color Bars",
++	"Fade to Grey Color Bars",
++	"PN9",
++};
++
++static u32 imx882_get_format_code(struct imx882 *sensor)
++{
++	static const u32 codes[2][2] = {
++		{ MEDIA_BUS_FMT_SRGGB10_1X10, MEDIA_BUS_FMT_SGRBG10_1X10 },
++		{ MEDIA_BUS_FMT_SGBRG10_1X10, MEDIA_BUS_FMT_SBGGR10_1X10 },
++	};
++	unsigned int v = sensor->vflip ? sensor->vflip->val : 0;
++	unsigned int h = sensor->hflip ? sensor->hflip->val : 0;
++
++	return codes[v][h];
++}
++
++static int imx882_set_ctrl(struct v4l2_ctrl *ctrl)
++{
++	struct imx882 *sensor =
++		container_of(ctrl->handler, struct imx882, ctrl_handler);
++	struct v4l2_mbus_framefmt *fmt;
++	struct v4l2_subdev_state *state;
++	u32 fll;
++	int ret = 0;
++
++	state = v4l2_subdev_get_locked_active_state(&sensor->sd);
++	fmt = v4l2_subdev_state_get_format(state, 0);
++
++	if (ctrl->id == V4L2_CID_VBLANK) {
++		u32 max_exp = fmt->height + ctrl->val - IMX882_EXPOSURE_MARGIN;
++
++		__v4l2_ctrl_modify_range(sensor->exposure,
++					 sensor->exposure->minimum,
++					 max_exp, sensor->exposure->step,
++					 min_t(u32, sensor->exposure->val, max_exp));
++	}
++
++	if (!pm_runtime_get_if_in_use(sensor->dev))
++		return 0;
++
++	switch (ctrl->id) {
++	case V4L2_CID_EXPOSURE:
++		ret = cci_write(sensor->regmap, IMX882_REG_EXPOSURE,
++				ctrl->val, NULL);
++		break;
++	case V4L2_CID_ANALOGUE_GAIN:
++		ret = cci_write(sensor->regmap, IMX882_REG_ANALOG_GAIN,
++				ctrl->val, NULL);
++		break;
++	case V4L2_CID_VBLANK:
++		fll = fmt->height + ctrl->val;
++		ret = cci_write(sensor->regmap, IMX882_REG_FLL, fll, NULL);
++		break;
++	case V4L2_CID_HFLIP:
++	case V4L2_CID_VFLIP:
++		ret = cci_write(sensor->regmap, IMX882_REG_ORIENTATION,
++				sensor->hflip->val | (sensor->vflip->val << 1),
++				NULL);
++		break;
++	case V4L2_CID_TEST_PATTERN:
++		ret = cci_write(sensor->regmap, IMX882_REG_TEST_PATTERN,
++				ctrl->val, NULL);
++		break;
++	default:
++		ret = -EINVAL;
++		break;
++	}
++
++	pm_runtime_put(sensor->dev);
++	return ret;
++}
++
++static const struct v4l2_ctrl_ops imx882_ctrl_ops = {
++	.s_ctrl = imx882_set_ctrl,
++};
++
++static int imx882_enum_mbus_code(struct v4l2_subdev *sd,
++				  struct v4l2_subdev_state *sd_state,
++				  struct v4l2_subdev_mbus_code_enum *code)
++{
++	struct imx882 *sensor = to_imx882(sd);
++
++	if (code->index > 0)
++		return -EINVAL;
++
++	code->code = imx882_get_format_code(sensor);
++	return 0;
++}
++
++static int imx882_enum_frame_size(struct v4l2_subdev *sd,
++				   struct v4l2_subdev_state *sd_state,
++				   struct v4l2_subdev_frame_size_enum *fse)
++{
++	struct imx882 *sensor = to_imx882(sd);
++
++	if (fse->index >= ARRAY_SIZE(imx882_modes))
++		return -EINVAL;
++
++	if (fse->code != imx882_get_format_code(sensor))
++		return -EINVAL;
++
++	fse->min_width = imx882_modes[fse->index].width;
++	fse->max_width = fse->min_width;
++	fse->min_height = imx882_modes[fse->index].height;
++	fse->max_height = fse->min_height;
++
++	return 0;
++}
++
++static void imx882_update_pad_format(struct imx882 *sensor,
++				      const struct imx882_mode *mode,
++				      struct v4l2_subdev_format *fmt)
++{
++	fmt->format.width = mode->width;
++	fmt->format.height = mode->height;
++	fmt->format.code = imx882_get_format_code(sensor);
++	fmt->format.field = V4L2_FIELD_NONE;
++	fmt->format.colorspace = V4L2_COLORSPACE_RAW;
++	fmt->format.ycbcr_enc = V4L2_YCBCR_ENC_DEFAULT;
++	fmt->format.quantization = V4L2_QUANTIZATION_FULL_RANGE;
++	fmt->format.xfer_func = V4L2_XFER_FUNC_NONE;
++}
++
++static int imx882_set_pad_format(struct v4l2_subdev *sd,
++				  struct v4l2_subdev_state *sd_state,
++				  struct v4l2_subdev_format *fmt)
++{
++	struct imx882 *sensor = to_imx882(sd);
++	const struct imx882_mode *mode;
++	int h_blank, ret;
++
++	mode = v4l2_find_nearest_size(imx882_modes, ARRAY_SIZE(imx882_modes),
++				      width, height, fmt->format.width,
++				      fmt->format.height);
++
++	imx882_update_pad_format(sensor, mode, fmt);
++	*v4l2_subdev_state_get_format(sd_state, fmt->pad) = fmt->format;
++
++	if (fmt->which == V4L2_SUBDEV_FORMAT_TRY)
++		return 0;
++
++	if (media_entity_is_streaming(&sensor->sd.entity))
++		return -EBUSY;
++
++	ret = __v4l2_ctrl_modify_range(sensor->vblank,
++				       mode->fll_min - mode->height,
++				       IMX882_FLL_MAX - mode->height,
++				       1, mode->fll_def - mode->height);
++	if (ret)
++		return ret;
++
++	h_blank = mode->llp - mode->width;
++	return __v4l2_ctrl_modify_range(sensor->hblank, h_blank, h_blank,
++					1, h_blank);
++}
++
++static int imx882_get_selection(struct v4l2_subdev *sd,
++				 struct v4l2_subdev_state *sd_state,
++				 struct v4l2_subdev_selection *sel)
++{
++	switch (sel->target) {
++	case V4L2_SEL_TGT_CROP:
++		sel->r = *v4l2_subdev_state_get_crop(sd_state, sel->pad);
++		return 0;
++	case V4L2_SEL_TGT_NATIVE_SIZE:
++	case V4L2_SEL_TGT_CROP_DEFAULT:
++	case V4L2_SEL_TGT_CROP_BOUNDS:
++		sel->r.top = 0;
++		sel->r.left = 0;
++		sel->r.width = IMX882_NATIVE_WIDTH;
++		sel->r.height = IMX882_NATIVE_HEIGHT;
++		return 0;
++	default:
++		return -EINVAL;
++	}
++}
++
++static int imx882_init_state(struct v4l2_subdev *sd,
++			      struct v4l2_subdev_state *sd_state)
++{
++	struct v4l2_subdev_format fmt = {
++		.which = V4L2_SUBDEV_FORMAT_TRY,
++		.format = {
++			.code = MEDIA_BUS_FMT_SRGGB10_1X10,
++			.width = imx882_modes[0].width,
++			.height = imx882_modes[0].height,
++		},
++	};
++	struct v4l2_rect *crop;
++
++	crop = v4l2_subdev_state_get_crop(sd_state, 0);
++	crop->top = 0;
++	crop->left = 0;
++	crop->width = IMX882_NATIVE_WIDTH;
++	crop->height = IMX882_NATIVE_HEIGHT;
++
++	return imx882_set_pad_format(sd, sd_state, &fmt);
++}
++
++static int imx882_identify_module(struct imx882 *sensor)
++{
++	u64 val;
++	int ret;
++
++	ret = cci_read(sensor->regmap, IMX882_REG_CHIP_ID, &val, NULL);
++	if (ret)
++		return dev_err_probe(sensor->dev, ret,
++				     "failed to read chip id\n");
++
++	if (val != IMX882_CHIP_ID && val != IMX882_CHIP_ID_ALT)
++		return dev_err_probe(sensor->dev, -EIO,
++				     "chip id mismatch: got 0x%04llx\n", val);
++
++	dev_info(sensor->dev, "identified IMX882 (chip id 0x%04llx)\n", val);
++	return 0;
++}
++
++static int imx882_power_off(struct device *dev)
++{
++	struct v4l2_subdev *sd = dev_get_drvdata(dev);
++	struct imx882 *sensor = to_imx882(sd);
++
++	clk_disable_unprepare(sensor->img_clk);
++	gpiod_set_value_cansleep(sensor->reset_gpio, 1);
++	regulator_bulk_disable(ARRAY_SIZE(imx882_supply_names),
++			       sensor->supplies);
++
++	return 0;
++}
++
++static int imx882_power_on(struct device *dev)
++{
++	struct v4l2_subdev *sd = dev_get_drvdata(dev);
++	struct imx882 *sensor = to_imx882(sd);
++	int ret;
++
++	ret = regulator_bulk_enable(ARRAY_SIZE(imx882_supply_names),
++				    sensor->supplies);
++	if (ret < 0) {
++		dev_err(dev, "failed to enable regulators: %d\n", ret);
++		return ret;
++	}
++
++	ret = clk_prepare_enable(sensor->img_clk);
++	if (ret < 0) {
++		regulator_bulk_disable(ARRAY_SIZE(imx882_supply_names),
++				       sensor->supplies);
++		dev_err(dev, "failed to enable mclk: %d\n", ret);
++		return ret;
++	}
++
++	usleep_range(2000, 3000);
++	gpiod_set_value_cansleep(sensor->reset_gpio, 0);
++	usleep_range(10000, 15000);
++
++	return 0;
++}
++
++static int imx882_enable_stream(struct v4l2_subdev *sd,
++				 struct v4l2_subdev_state *state,
++				 u32 pad, u64 streams_mask)
++{
++	struct imx882 *sensor = to_imx882(sd);
++	const struct imx882_mode *mode;
++	struct v4l2_mbus_framefmt *fmt;
++	int ret;
++
++	ret = pm_runtime_resume_and_get(sensor->dev);
++	if (ret < 0)
++		return ret;
++
++	ret = cci_multi_reg_write(sensor->regmap, imx882_init_regs,
++				  ARRAY_SIZE(imx882_init_regs), NULL);
++	if (ret) {
++		dev_err(sensor->dev, "failed to write init regs: %d\n", ret);
++		goto err_put;
++	}
++
++	fmt = v4l2_subdev_state_get_format(state, 0);
++	mode = v4l2_find_nearest_size(imx882_modes, ARRAY_SIZE(imx882_modes),
++				      width, height, fmt->width, fmt->height);
++
++	ret = cci_multi_reg_write(sensor->regmap, mode->regs,
++				  mode->num_regs, NULL);
++	if (ret) {
++		dev_err(sensor->dev, "failed to write mode regs: %d\n", ret);
++		goto err_put;
++	}
++
++	ret = __v4l2_ctrl_handler_setup(&sensor->ctrl_handler);
++	if (ret)
++		goto err_put;
++
++	ret = cci_write(sensor->regmap, IMX882_REG_MODE_SELECT,
++			IMX882_MODE_STREAMING, NULL);
++	if (ret)
++		goto err_put;
++
++	msleep(12);
++
++	__v4l2_ctrl_grab(sensor->vflip, true);
++	__v4l2_ctrl_grab(sensor->hflip, true);
++	return 0;
++
++err_put:
++	pm_runtime_put(sensor->dev);
++	return ret;
++}
++
++static int imx882_disable_stream(struct v4l2_subdev *sd,
++				  struct v4l2_subdev_state *state,
++				  u32 pad, u64 streams_mask)
++{
++	struct imx882 *sensor = to_imx882(sd);
++
++	cci_write(sensor->regmap, IMX882_REG_MODE_SELECT,
++		  IMX882_MODE_STANDBY, NULL);
++
++	__v4l2_ctrl_grab(sensor->vflip, false);
++	__v4l2_ctrl_grab(sensor->hflip, false);
++
++	pm_runtime_put(sensor->dev);
++	return 0;
++}
++
++static const struct v4l2_subdev_pad_ops imx882_pad_ops = {
++	.enum_mbus_code = imx882_enum_mbus_code,
++	.enum_frame_size = imx882_enum_frame_size,
++	.get_fmt = v4l2_subdev_get_fmt,
++	.set_fmt = imx882_set_pad_format,
++	.get_selection = imx882_get_selection,
++	.enable_streams = imx882_enable_stream,
++	.disable_streams = imx882_disable_stream,
++};
++
++static const struct v4l2_subdev_video_ops imx882_video_ops = {
++	.s_stream = v4l2_subdev_s_stream_helper,
++};
++
++static const struct v4l2_subdev_ops imx882_subdev_ops = {
++	.video = &imx882_video_ops,
++	.pad = &imx882_pad_ops,
++};
++
++static const struct v4l2_subdev_internal_ops imx882_internal_ops = {
++	.init_state = imx882_init_state,
++};
++
++static int imx882_init_controls(struct imx882 *sensor)
++{
++	const struct imx882_mode *mode = &imx882_modes[0];
++	struct v4l2_fwnode_device_properties props;
++	struct v4l2_ctrl_handler *hdl = &sensor->ctrl_handler;
++	struct v4l2_ctrl *ctrl;
++	u32 hblank, vblank, max_exp;
++	int ret;
++
++	ret = v4l2_ctrl_handler_init(hdl, 10);
++	if (ret)
++		return ret;
++
++	ctrl = v4l2_ctrl_new_int_menu(hdl, NULL, V4L2_CID_LINK_FREQ,
++				      ARRAY_SIZE(imx882_link_freq_menu) - 1,
++				      0, imx882_link_freq_menu);
++	if (ctrl)
++		ctrl->flags |= V4L2_CTRL_FLAG_READ_ONLY;
++
++	v4l2_ctrl_new_std(hdl, NULL, V4L2_CID_PIXEL_RATE,
++			  IMX882_PIXEL_RATE, IMX882_PIXEL_RATE,
++			  1, IMX882_PIXEL_RATE);
++
++	hblank = mode->llp - mode->width;
++	sensor->hblank = v4l2_ctrl_new_std(hdl, &imx882_ctrl_ops,
++					   V4L2_CID_HBLANK, hblank, hblank,
++					   1, hblank);
++	if (sensor->hblank)
++		sensor->hblank->flags |= V4L2_CTRL_FLAG_READ_ONLY;
++
++	vblank = mode->fll_def - mode->height;
++	sensor->vblank = v4l2_ctrl_new_std(hdl, &imx882_ctrl_ops,
++					   V4L2_CID_VBLANK,
++					   mode->fll_min - mode->height,
++					   IMX882_FLL_MAX - mode->height,
++					   1, vblank);
++
++	max_exp = mode->fll_def - IMX882_EXPOSURE_MARGIN;
++	sensor->exposure = v4l2_ctrl_new_std(hdl, &imx882_ctrl_ops,
++					     V4L2_CID_EXPOSURE,
++					     IMX882_EXPOSURE_MIN, max_exp,
++					     IMX882_EXPOSURE_STEP,
++					     IMX882_EXPOSURE_DEFAULT);
++
++	v4l2_ctrl_new_std(hdl, &imx882_ctrl_ops, V4L2_CID_ANALOGUE_GAIN,
++			  IMX882_ANA_GAIN_MIN, IMX882_ANA_GAIN_MAX,
++			  IMX882_ANA_GAIN_STEP, IMX882_ANA_GAIN_DEFAULT);
++
++	sensor->hflip = v4l2_ctrl_new_std(hdl, &imx882_ctrl_ops,
++					  V4L2_CID_HFLIP, 0, 1, 1, 0);
++	if (sensor->hflip)
++		sensor->hflip->flags |= V4L2_CTRL_FLAG_MODIFY_LAYOUT;
++
++	sensor->vflip = v4l2_ctrl_new_std(hdl, &imx882_ctrl_ops,
++					  V4L2_CID_VFLIP, 0, 1, 1, 0);
++	if (sensor->vflip)
++		sensor->vflip->flags |= V4L2_CTRL_FLAG_MODIFY_LAYOUT;
++
++	v4l2_ctrl_new_std_menu_items(hdl, &imx882_ctrl_ops,
++				     V4L2_CID_TEST_PATTERN,
++				     ARRAY_SIZE(imx882_test_pattern_menu) - 1,
++				     0, 0, imx882_test_pattern_menu);
++
++	if (hdl->error) {
++		ret = hdl->error;
++		goto err_free;
++	}
++
++	ret = v4l2_fwnode_device_parse(sensor->dev, &props);
++	if (ret)
++		goto err_free;
++
++	ret = v4l2_ctrl_new_fwnode_properties(hdl, &imx882_ctrl_ops, &props);
++	if (ret)
++		goto err_free;
++
++	sensor->sd.ctrl_handler = hdl;
++	return 0;
++
++err_free:
++	v4l2_ctrl_handler_free(hdl);
++	return ret;
++}
++
++static int imx882_parse_endpoint(struct imx882 *sensor)
++{
++	struct v4l2_fwnode_endpoint bus_cfg = {
++		.bus_type = V4L2_MBUS_CSI2_CPHY,
++	};
++	struct fwnode_handle *ep;
++	int ret;
++
++	ep = fwnode_graph_get_next_endpoint(dev_fwnode(sensor->dev), NULL);
++	if (!ep)
++		return dev_err_probe(sensor->dev, -ENXIO,
++				     "failed to get endpoint\n");
++
++	ret = v4l2_fwnode_endpoint_alloc_parse(ep, &bus_cfg);
++	fwnode_handle_put(ep);
++	if (ret)
++		return ret;
++
++	if (bus_cfg.bus.mipi_csi2.num_data_lanes != 3) {
++		dev_err(sensor->dev, "only 3-trio C-PHY is supported\n");
++		ret = -EINVAL;
++	}
++
++	v4l2_fwnode_endpoint_free(&bus_cfg);
++	return ret;
++}
++
++static int imx882_probe(struct i2c_client *client)
++{
++	struct device *dev = &client->dev;
++	struct imx882 *sensor;
++	unsigned int i;
++	int ret;
++
++	sensor = devm_kzalloc(dev, sizeof(*sensor), GFP_KERNEL);
++	if (!sensor)
++		return -ENOMEM;
++
++	sensor->dev = dev;
++
++	ret = imx882_parse_endpoint(sensor);
++	if (ret)
++		return ret;
++
++	sensor->regmap = devm_cci_regmap_init_i2c(client, 16);
++	if (IS_ERR(sensor->regmap))
++		return dev_err_probe(dev, PTR_ERR(sensor->regmap),
++				     "failed to init CCI regmap\n");
++
++	sensor->img_clk = devm_clk_get(dev, NULL);
++	if (IS_ERR(sensor->img_clk))
++		return dev_err_probe(dev, PTR_ERR(sensor->img_clk),
++				     "failed to get mclk\n");
++
++	if (clk_get_rate(sensor->img_clk) != IMX882_EXT_CLK) {
++		ret = clk_set_rate(sensor->img_clk, IMX882_EXT_CLK);
++		if (ret)
++			return dev_err_probe(dev, ret,
++					     "failed to set mclk rate\n");
++	}
++
++	for (i = 0; i < ARRAY_SIZE(imx882_supply_names); i++)
++		sensor->supplies[i].supply = imx882_supply_names[i];
++
++	ret = devm_regulator_bulk_get(dev, ARRAY_SIZE(imx882_supply_names),
++				      sensor->supplies);
++	if (ret)
++		return dev_err_probe(dev, ret, "failed to get regulators\n");
++
++	sensor->reset_gpio = devm_gpiod_get_optional(dev, "reset",
++						     GPIOD_OUT_HIGH);
++	if (IS_ERR(sensor->reset_gpio))
++		return dev_err_probe(dev, PTR_ERR(sensor->reset_gpio),
++				     "failed to get reset gpio\n");
++
++	v4l2_i2c_subdev_init(&sensor->sd, client, &imx882_subdev_ops);
++	sensor->sd.internal_ops = &imx882_internal_ops;
++
++	ret = imx882_power_on(dev);
++	if (ret)
++		return ret;
++
++	ret = imx882_identify_module(sensor);
++	if (ret)
++		goto err_power_off;
++
++	ret = imx882_init_controls(sensor);
++	if (ret)
++		goto err_power_off;
++
++	sensor->sd.flags |= V4L2_SUBDEV_FL_HAS_DEVNODE;
++	sensor->sd.entity.function = MEDIA_ENT_F_CAM_SENSOR;
++	sensor->pad.flags = MEDIA_PAD_FL_SOURCE;
++
++	ret = media_entity_pads_init(&sensor->sd.entity, 1, &sensor->pad);
++	if (ret)
++		goto err_free_ctrls;
++
++	sensor->sd.state_lock = sensor->ctrl_handler.lock;
++	ret = v4l2_subdev_init_finalize(&sensor->sd);
++	if (ret)
++		goto err_entity_cleanup;
++
++	pm_runtime_set_active(dev);
++	pm_runtime_enable(dev);
++
++	ret = v4l2_async_register_subdev_sensor(&sensor->sd);
++	if (ret)
++		goto err_pm_disable;
++
++	pm_runtime_idle(dev);
++	return 0;
++
++err_pm_disable:
++	pm_runtime_disable(dev);
++	pm_runtime_set_suspended(dev);
++	v4l2_subdev_cleanup(&sensor->sd);
++err_entity_cleanup:
++	media_entity_cleanup(&sensor->sd.entity);
++err_free_ctrls:
++	v4l2_ctrl_handler_free(&sensor->ctrl_handler);
++err_power_off:
++	imx882_power_off(dev);
++	return ret;
++}
++
++static void imx882_remove(struct i2c_client *client)
++{
++	struct v4l2_subdev *sd = i2c_get_clientdata(client);
++	struct imx882 *sensor = to_imx882(sd);
++
++	v4l2_async_unregister_subdev(sd);
++	v4l2_subdev_cleanup(sd);
++	media_entity_cleanup(&sd->entity);
++	v4l2_ctrl_handler_free(&sensor->ctrl_handler);
++
++	pm_runtime_disable(sensor->dev);
++	if (!pm_runtime_status_suspended(sensor->dev))
++		imx882_power_off(sensor->dev);
++	pm_runtime_set_suspended(sensor->dev);
++}
++
++static DEFINE_RUNTIME_DEV_PM_OPS(imx882_pm_ops, imx882_power_off,
++				 imx882_power_on, NULL);
++
++static const struct of_device_id imx882_of_match[] = {
++	{ .compatible = "sony,imx882" },
++	{ /* sentinel */ }
++};
++MODULE_DEVICE_TABLE(of, imx882_of_match);
++
++static struct i2c_driver imx882_i2c_driver = {
++	.driver = {
++		.name = "imx882",
++		.pm = pm_ptr(&imx882_pm_ops),
++		.of_match_table = imx882_of_match,
++	},
++	.probe = imx882_probe,
++	.remove = imx882_remove,
++};
++module_i2c_driver(imx882_i2c_driver);
++
++MODULE_DESCRIPTION("Sony IMX882 image sensor driver");
++MODULE_LICENSE("GPL");

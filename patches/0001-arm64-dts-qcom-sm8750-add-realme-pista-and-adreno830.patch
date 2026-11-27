@@ -7,6 +7,7 @@ Wi-Fi 7 & BT, ADSP/CDSP/MPSS remoteprocs, SM8750 IPA v5.5, PM8010M/N
 camera PMICs, SM8750 CAMSS + CCI0/1/2 + MCLK pinctrl, rear 8MP Sony
 IMX355 ultrawide, and front 16MP Sony IMX471 selfie cameras.
 ---
+diff --git a/arch/arm64/boot/dts/qcom/sm8750.dtsi b/arch/arm64/boot/dts/qcom/sm8750.dtsi
 --- a/arch/arm64/boot/dts/qcom/sm8750.dtsi
 +++ b/arch/arm64/boot/dts/qcom/sm8750.dtsi
 @@ -8,7 +8,9 @@
@@ -815,9 +816,11 @@ IMX355 ultrawide, and front 16MP Sony IMX471 selfie cameras.
  		apps_smmu: iommu@15000000 {
  			compatible = "qcom,sm8750-smmu-500", "qcom,smmu-500", "arm,mmu-500";
  			reg = <0x0 0x15000000 0x0 0x100000>;
+diff --git a/arch/arm64/boot/dts/qcom/sm8750-realme-pista.dts b/arch/arm64/boot/dts/qcom/sm8750-realme-pista.dts
+new file mode 100644
 --- /dev/null
 +++ b/arch/arm64/boot/dts/qcom/sm8750-realme-pista.dts
-@@ -0,0 +1,1628 @@
+@@ -0,0 +1,1735 @@
 +// SPDX-License-Identifier: BSD-3-Clause
 +/*
 + * Realme GT7 Pro (pista / RMX5010) mainline DT:
@@ -1472,7 +1475,8 @@ IMX355 ultrawide, and front 16MP Sony IMX471 selfie cameras.
 +		compatible = "qcom,pm8010-rpmh-regulators";
 +		qcom,pmic-id = "n";
 +
-+		vdd-l1-l2-supply = <&vreg_s7i_1p2>;
++		/* On pista, PM8010N VIN_L1_L2 is fed by smpd1 (max 1100 mV in AOP VRM) */
++		vdd-l1-l2-supply = <&vreg_s1d_0p97>;
 +		vdd-l3-l4-supply = <&vreg_bob1>;
 +		vdd-l5-supply = <&vreg_bob2>;
 +		vdd-l6-supply = <&vreg_bob2>;
@@ -1480,12 +1484,9 @@ IMX355 ultrawide, and front 16MP Sony IMX471 selfie cameras.
 +
 +		vreg_l1n_1p1: ldo1 {
 +			regulator-name = "vreg_l1n_1p1";
-+			regulator-min-microvolt = <1104000>;
-+			regulator-max-microvolt = <1104000>;
++			regulator-min-microvolt = <1096000>;
++			regulator-max-microvolt = <1096000>;
 +			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
-+			regulator-allow-set-load;
-+			regulator-allowed-modes = <RPMH_REGULATOR_MODE_LPM
-+						   RPMH_REGULATOR_MODE_HPM>;
 +		};
 +
 +		vreg_l3n_2p8: ldo3 {
@@ -1693,6 +1694,30 @@ IMX355 ultrawide, and front 16MP Sony IMX471 selfie cameras.
 +	};
 +};
 +
++&pm8550ve_gpios {
++	cam_wide_reset_default: cam-wide-reset-default-state {
++		pins = "gpio5";
++		function = "normal";
++		input-disable;
++		output-enable;
++		bias-disable;
++		output-low;
++		power-source = <1>;
++	};
++};
++
++&pm8550ve_g_gpios {
++	cam_tele_reset_default: cam-tele-reset-default-state {
++		pins = "gpio5";
++		function = "normal";
++		input-disable;
++		output-enable;
++		bias-disable;
++		output-low;
++		power-source = <1>;
++	};
++};
++
 +&pon_pwrkey {
 +	status = "okay";
 +};
@@ -1793,6 +1818,26 @@ IMX355 ultrawide, and front 16MP Sony IMX471 selfie cameras.
 +	status = "okay";
 +
 +	ports {
++		port@1 {
++			reg = <1>;
++
++			camss_csiphy1_ep: endpoint {
++				bus-type = <1>; /* MIPI CSI-2 C-PHY */
++				data-lanes = <0 1 2>;
++				remote-endpoint = <&imx882_ep>;
++			};
++		};
++
++		port@2 {
++			reg = <2>;
++
++			camss_csiphy2_ep: endpoint {
++				bus-type = <1>; /* MIPI CSI-2 C-PHY */
++				data-lanes = <0 1 2>;
++				remote-endpoint = <&imx906_ep>;
++			};
++		};
++
 +		port@3 {
 +			reg = <3>;
 +
@@ -1860,6 +1905,39 @@ IMX355 ultrawide, and front 16MP Sony IMX471 selfie cameras.
 +	};
 +};
 +
++&cci0_i2c1 {
++	/* Rear 50MP Main Wide (Sony IMX906) -> CSIPHY2 (C-PHY 3-trio) */
++	camera@1a {
++		compatible = "sony,imx906";
++		reg = <0x1a>;
++
++		reset-gpios = <&pm8550ve_gpios 5 GPIO_ACTIVE_LOW>;
++		pinctrl-names = "default";
++		pinctrl-0 = <&cam1_default &cam_wide_reset_default>;
++
++		clocks = <&cambistmclkcc CAM_BIST_MCLK_CC_MCLK1_CLK>;
++		assigned-clocks = <&cambistmclkcc CAM_BIST_MCLK_CC_MCLK1_CLK>;
++		assigned-clock-rates = <19200000>;
++
++		vana-supply = <&vreg_l4m_2p8>;
++		vdig-supply = <&vreg_l2m_1p12>;
++		vio-supply = <&vreg_l5m_1p8>;
++		vcustom1-supply = <&vreg_l6m_1p8>;
++
++		orientation = <1>;
++		rotation = <270>;
++
++		port {
++			imx906_ep: endpoint {
++				bus-type = <1>; /* MIPI CSI-2 C-PHY */
++				data-lanes = <0 1 2>;
++				link-frequencies = /bits/ 64 <1634400000>;
++				remote-endpoint = <&camss_csiphy2_ep>;
++			};
++		};
++	};
++};
++
 +&cci1 {
 +	/* Only bind cci1_0 (gpio117/118); gpio164 on cci1_1 is speaker_right reset */
 +	pinctrl-0 = <&cci1_0_default>;
@@ -1867,6 +1945,38 @@ IMX355 ultrawide, and front 16MP Sony IMX471 selfie cameras.
 +	assigned-clocks = <&camcc CAM_CC_CCI_1_CLK>;
 +	assigned-clock-rates = <37500000>;
 +	status = "okay";
++};
++
++&cci1_i2c0 {
++	/* Rear 50MP 3x Periscope Telephoto (Sony IMX882 / LYT-600) -> CSIPHY1 (C-PHY 3-trio) */
++	camera@1a {
++		compatible = "sony,imx882";
++		reg = <0x1a>;
++
++		reset-gpios = <&pm8550ve_g_gpios 5 GPIO_ACTIVE_LOW>;
++		pinctrl-names = "default";
++		pinctrl-0 = <&cam3_default &cam_tele_reset_default>;
++
++		clocks = <&cambistmclkcc CAM_BIST_MCLK_CC_MCLK3_CLK>;
++		assigned-clocks = <&cambistmclkcc CAM_BIST_MCLK_CC_MCLK3_CLK>;
++		assigned-clock-rates = <19200000>;
++
++		vana-supply = <&vreg_l3m_2p8>;
++		vdig-supply = <&vreg_l1n_1p1>;
++		vio-supply = <&vreg_l5m_1p8>;
++
++		orientation = <1>;
++		rotation = <270>;
++
++		port {
++			imx882_ep: endpoint {
++				bus-type = <1>; /* MIPI CSI-2 C-PHY */
++				data-lanes = <0 1 2>;
++				link-frequencies = /bits/ 64 <1632000000>;
++				remote-endpoint = <&camss_csiphy1_ep>;
++			};
++		};
++	};
 +};
 +
 +/* GT7 Pro stock ADSP image spans 80.5 MiB (0x5080000), larger than upstream 0x3a80000 */
