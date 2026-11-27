@@ -1,0 +1,2 @@
+# Enable Qualcomm ADSP SSC accelerometer, light, proximity, and compass on Realme GT7 Pro
+SUBSYSTEM=="misc", KERNEL=="fastrpc-adsp*", ENV{IIO_SENSOR_PROXY_TYPE}+="ssc-accel ssc-light ssc-proximity ssc-compass", ENV{ACCEL_MOUNT_MATRIX}="-1, 0, 0; 0, -1, 0; 0, 0, 1"

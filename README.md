@@ -24,7 +24,8 @@ All features listed below as working have been verified on real Realme GT7 Pro h
 | **Flashlight / Torch LED** | PM8550 Flash LED (`pm8550_flash`, `leds-qcom-flash`) | Working | Single populated white channel (`led-sources = <1>`) exposed at `/sys/class/leds/white:flash` (`0..255` -> `0..500 mA` torch, up to `1500 mA` / `1280 ms` flash strobe) |
 | **Hardware Video Codec** | Qualcomm Iris VPU 3.5 (`qcom,sm8750-iris` + `videocc`) | Working | `/dev/video0` hardware decoder (**H.264 / HEVC / VP9 / AV1**, NV12/P010/UBWC) and `/dev/video1` hardware encoder (**H.264 / HEVC**); end-to-end V4L2 M2M encode+decode loopback verified with user's own device-signed `vpu35_4v.mbn` |
 | **IR Blaster** | QUPv3 `spi5` (`gpio53` MOSI) + PM8550 `L9B` (`2.504V`) + `ir-spi` | Working | Raw 38 kHz LIRC transmitter at `/dev/lirc0` + touch-friendly GTK3 GUI [`ir/pista-remote.py`](ir/pista-remote.py) preloaded with verified Xiaomi TV / Mi Box codes & Flipper-IRDB `.ir` import; verified on real Xiaomi TV |
-| **Modem / Camera / Sensors / Haptics** | WWAN, CamSS, ADSP SSC, PMIH0108 | WIP | Not yet enabled |
+| **Sensors (ADSP SSC)** | `fastrpc` (`/dev/fastrpc-adsp-secure`) + patched `hexagonrpcd` + `libssc` + `iio-sensor-proxy` | Working | Live **Accelerometer** (`BMI26x`), **Proximity** (`TCS3720`), **Magnetometer** (`AK09919`), and **Compass / Rotation Vector** (`rotv`) streaming via ADSP SSC & `iio-sensor-proxy` (`monitor-sensor` + KDE Plasma 6 auto-rotate); requires user's own device sensor registry/configs staged read-only from `persist`/`vendor_a`/`odm_a`/`dsp_a` |
+| **Modem / Camera / Haptics** | WWAN, CamSS, PMIH0108 | WIP | Not yet enabled |
 
 ---
 
@@ -51,6 +52,11 @@ All features listed below as working have been verified on real Realme GT7 Pro h
 │   ├── pista-remote.py                                        # Touch-friendly GTK3 IR remote GUI (Xiaomi TV preset + Flipper .ir + torch)
 │   ├── pista-remote.desktop                                   # Desktop launcher entry
 │   └── 99-pista-hw.rules                                      # Udev permissions for /dev/lirc0 & /sys/class/leds/white:flash
+├── sensors/
+│   ├── hexagonrpcd-pista.patch                                # Upstream hexagonrpc patch (/odm/etc/sensor/config map + non-fatal extended RPC)
+│   ├── 79-pista-sensors.rules                                 # Udev rule enabling ssc-accel/light/proximity/compass in iio-sensor-proxy
+│   ├── hexagonrpcd-override.conf                              # Systemd drop-in (/dev/fastrpc-adsp-secure + /var/lib/pista-sensors/)
+│   └── iio-sensor-proxy-override.conf                         # Systemd drop-in ordering iio-sensor-proxy after hexagonrpcd
 ├── patches/                                                   # Clean patch series against upstream Linux 7.3.6
 │   ├── 0001-arm64-dts-qcom-sm8750-add-realme-pista-and-adreno830.patch
 │   ├── 0002-drm-msm-sm8750-adreno830-dsc-and-qtb500-fixes.patch
@@ -123,6 +129,9 @@ This repository intentionally contains **no proprietary firmware blobs**. You mu
   - Extract device-signed `vpu35_4v.mbn` read-only from your own GT7 Pro `vendor_a` image (`super` -> `vendor_a` EROFS `/firmware/vpu35_4v.mbn`) to `/lib/firmware/qcom/sm8750/realme/pista/vpu35_4v.mbn`.
 - **IR Blaster & Rear Flashlight GUI (`ir/pista-remote.py`)**:
   - Install `ir/99-pista-hw.rules` -> `/etc/udev/rules.d/`, `ir/pista-remote.py` -> `/usr/local/bin/pista-remote`, and `ir/pista-remote.desktop` -> `/usr/share/applications/` (requires `python3-gi` / GTK3; no root needed for users in the `video` group).
+- **ADSP SSC Sensors (`sensors/`)**:
+  - Extract your own device's sensor files read-only into `/var/lib/pista-sensors/`: `persist/sensors/registry/registry/*` -> `sensors/registry/`, `vendor_a/etc/sensors/config/*` + `odm_a/etc/sensor/config/*` -> `sensors/config/`, `vendor_a/etc/sensors/sns_reg_config` -> `sensors/sns_reg.conf`, `dsp_a/adsp/*` -> `dsp/adsp/`, and populate `socinfo/{hw_platform=MTP,soc_id=618,revision=2.0}`.
+  - Build upstream `linux-msm/hexagonrpc` with `sensors/hexagonrpcd-pista.patch` (adds `/odm/etc/sensor/config` virtual mapping and keeps the FastRPC listener alive on SM8750 extended method IDs such as method 36), and install `sensors/79-pista-sensors.rules`, `sensors/hexagonrpcd-override.conf`, and `sensors/iio-sensor-proxy-override.conf`.
 
 ### 3. VAB-Safe Booting (Important Safety Notice)
 The Realme GT7 Pro uses Android 15 Virtual A/B (VAB):

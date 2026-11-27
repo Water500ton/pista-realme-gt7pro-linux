@@ -1,0 +1,90 @@
+diff --git a/hexagonrpcd/listener.c b/hexagonrpcd/listener.c
+index 3414974..b70b26f 100644
+--- a/hexagonrpcd/listener.c
++++ b/hexagonrpcd/listener.c
+@@ -425,7 +425,7 @@ static int return_for_next_invoke(int fd,
+ 				  struct fastrpc_io_buffer **decoded)
+ {
+ 	struct fastrpc_decoder_context *ctx;
+-	char inbufs[256];
++	char inbufs[4096];
+ 	char *outbufs = NULL;
+ 	uint32_t inbufs_len;
+ 	uint32_t outbufs_len;
+@@ -447,7 +447,7 @@ static int return_for_next_invoke(int fd,
+ 				  *rctx, result,
+ 				  outbufs_len, outbufs,
+ 				  rctx, handle, sc,
+-				  &inbufs_len, 256, inbufs);
++				  &inbufs_len, sizeof(inbufs), inbufs);
+ 	if (ret) {
+ 		if (ret == -1)
+ 			perror("Could not fetch next FastRPC message");
+@@ -457,8 +457,8 @@ static int return_for_next_invoke(int fd,
+ 		goto err_free_outbufs;
+ 	}
+ 
+-	if (inbufs_len > 256) {
+-		fprintf(stderr, "Large (>256B) input buffers aren't implemented\n");
++	if (inbufs_len > sizeof(inbufs)) {
++		fprintf(stderr, "Large (>%zuB) input buffers aren't implemented (got %u)\n", sizeof(inbufs), inbufs_len);
+ 		ret = -1;
+ 		goto err_free_outbufs;
+ 	}
+@@ -586,17 +586,26 @@ int run_fastrpc_listener(int fd,
+ 		if (ret)
+ 			break;
+ 
+-		if (returned != NULL)
++		if (returned != NULL) {
+ 			iobuf_free(n_outbufs, returned);
++			returned = NULL;
++		}
+ 
+ 		ret = invoke_requested_procedure(n_ifaces, ifaces,
+ 						 handle, sc, &result,
+ 						 decoded, &returned);
+-		if (ret)
+-			break;
+-
+-		if (decoded != NULL)
++		if (decoded != NULL) {
+ 			iobuf_free(REMOTE_SCALARS_INBUFS(sc), decoded);
++			decoded = NULL;
++		}
++		if (ret) {
++			/* Keep listener alive and return error result to DSP */
++			returned = NULL;
++			sc = REMOTE_SCALARS_MAKE(0, 0, 0);
++			n_outbufs = 0;
++			ret = 0;
++			continue;
++		}
+ 
+ 		n_outbufs = REMOTE_SCALARS_OUTBUFS(sc);
+ 	}
+diff --git a/hexagonrpcd/rpcd_builder.c b/hexagonrpcd/rpcd_builder.c
+index d374958..fae9bd9 100644
+--- a/hexagonrpcd/rpcd_builder.c
++++ b/hexagonrpcd/rpcd_builder.c
+@@ -182,12 +182,19 @@ struct hexagonfs_dirent *construct_root_dir(const char *prefix, const char *dsp)
+ 				)
+ 			);
+ 
+-	return hfs_mkdir("/", 6,
++	return hfs_mkdir("/", 7,
+ 			hfs_mkdir("mnt", 1,
+ 				hfs_mkdir("vendor", 1,
+ 					persist_dir
+ 				)
+ 			),
++			hfs_mkdir("odm", 1,
++				hfs_mkdir("etc", 1,
++					hfs_mkdir("sensor", 1,
++						hfs_map_or_empty("config", sns_cfg)
++					)
++				)
++			),
+ 			persist_dir,
+ 			hfs_mkdir("sys", 1,
+ 				hfs_mkdir("devices", 1,
