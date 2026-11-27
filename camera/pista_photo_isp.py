@@ -355,32 +355,31 @@ class SmartAEController:
         # Target middle gray in sRGB (~120/255: crisp, bright indoor exposure with highlight guard)
         target = 120.0 * (2.0 ** (self.ev_bias * 0.45))
 
-        # 1. Base exposure ratio (convert sRGB luminance ratio to linear light via gamma ~1.9)
+        # 1. Base exposure ratio (convert sRGB luminance ratio to linear light via gamma ~1.85)
         meas = max(4.0, w_luma)
         ratio = (target / meas) ** 1.85
 
-        # 2. Highlight / Screen Protection (covers both centered AND off-center bright windows):
-        # If bright screen/light in ROI or frame is clipping while scene isn't pitch-black,
-        # pull exposure down so screens stay crisp & legible instead of blowing out to solid white.
-        eff_p96 = max(roi_p96, global_p97) if global_clip > 0.04 else roi_p96
-        if (clip_frac > 0.035 or global_clip > 0.045 or eff_p96 > 244.0) and w_luma > 34.0:
-            hl_ratio = (224.0 / max(224.0, eff_p96)) ** 2.1
-            if clip_frac > 0.12 or global_clip > 0.12:
-                hl_ratio = min(hl_ratio, 0.58)
-            elif clip_frac > 0.05 or global_clip > 0.06:
-                hl_ratio = min(hl_ratio, 0.74)
-            # Don't crush overall scene darker than luma ~44 just for a tiny specular lamp
-            min_safe_ratio = max(0.22, (44.0 / max(10.0, w_luma)) ** 1.85)
+        # 2. Continuous, Hysteresis-Free Highlight Ceiling (ZERO breathing/pumping!):
+        # Always compute a smooth monotonic upper bound from eff_p96 toward 234/255 so AE
+        # glides smoothly to the highlight ceiling and stops dead inside the deadband,
+        # instead of toggling ON/OFF around a clip threshold.
+        eff_p96 = max(roi_p96, global_p97 * 0.96)
+        if w_luma > 34.0 and eff_p96 > 195.0:
+            hl_target = 234.0
+            hl_ratio = (hl_target / eff_p96) ** 1.85
+            if clip_frac > 0.14 or global_clip > 0.16:
+                hl_ratio = min(hl_ratio, 0.78)
+            # Don't crush overall scene darker than luma ~48 just for a small bright window
+            min_safe_ratio = max(0.25, (48.0 / max(10.0, w_luma)) ** 1.85)
             ratio = min(ratio, max(hl_ratio, min_safe_ratio))
 
-        # Deadband: avoid micro-hunting / unnecessary I2C writes when already well-exposed
-        # (libpista_ae_guard.so prevents libcamera DelayedControls from overwriting our regs)
-        if 0.89 <= ratio <= 1.12:
+        # Deadband: lock rock-solid once within ~14% of target/ceiling (eliminates micro-pumping)
+        if 0.86 <= ratio <= 1.16:
             return
 
-        # Damped step in log-exposure space for smooth, rapid convergence (3-5 frames)
-        log_step = math.log2(max(0.18, min(5.5, ratio)))
-        damped_mult = 2.0 ** (log_step * 0.58)
+        # Smoothly damped step in log-exposure space (converges cleanly without overshoot)
+        log_step = math.log2(max(0.22, min(4.5, ratio)))
+        damped_mult = 2.0 ** (log_step * 0.45)
 
         # Read current hardware regs (or use cached)
         exp_now = self.cur_exp if self.cur_exp is not None else self.sc.get_exposure()
@@ -399,8 +398,8 @@ class SmartAEController:
         if new_exp != exp_now or new_gain != gain_now:
             self.sc.set_exposure_and_gain(new_exp, new_gain)
             self.cur_exp, self.cur_gain = new_exp, new_gain
-            # Wait 2 frames for sensor+SoftISP pipeline latency before next measurement
-            self.wait_frames = 2
+            # Wait 3 frames for full sensor+SoftISP latency so AE never chases stale frames
+            self.wait_frames = 3
 
     def estimate_exif_params(self, sensor_key: str):
         """Convert V4L2 exposure lines and Sony SMIA gain code to approximate shutter & ISO."""
