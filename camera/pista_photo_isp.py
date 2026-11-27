@@ -348,6 +348,7 @@ class SmartAEController:
         # Weighted scene luminance: 65% ROI + 35% global
         w_luma = 0.65 * float(np.mean(roi_luma)) + 0.35 * float(np.mean(luma))
         roi_p96 = float(np.percentile(roi_peak, 96))
+        global_p97 = float(np.percentile(peak, 97))
         clip_frac = float(np.mean(roi_peak >= 246.0))
         global_clip = float(np.mean(peak >= 248.0))
 
@@ -358,17 +359,18 @@ class SmartAEController:
         meas = max(4.0, w_luma)
         ratio = (target / meas) ** 1.85
 
-        # 2. Highlight / Screen Protection:
+        # 2. Highlight / Screen Protection (covers both centered AND off-center bright windows):
         # If bright screen/light in ROI or frame is clipping while scene isn't pitch-black,
         # pull exposure down so screens stay crisp & legible instead of blowing out to solid white.
-        if (clip_frac > 0.035 or global_clip > 0.08 or roi_p96 > 244.0) and w_luma > 34.0:
-            hl_ratio = (224.0 / max(224.0, roi_p96)) ** 2.1
-            if clip_frac > 0.12:
-                hl_ratio = min(hl_ratio, 0.55)
-            elif clip_frac > 0.05:
-                hl_ratio = min(hl_ratio, 0.72)
-            # Don't crush overall scene darker than luma ~42 just for a tiny specular lamp
-            min_safe_ratio = max(0.20, (42.0 / max(10.0, w_luma)) ** 1.85)
+        eff_p96 = max(roi_p96, global_p97) if global_clip > 0.04 else roi_p96
+        if (clip_frac > 0.035 or global_clip > 0.045 or eff_p96 > 244.0) and w_luma > 34.0:
+            hl_ratio = (224.0 / max(224.0, eff_p96)) ** 2.1
+            if clip_frac > 0.12 or global_clip > 0.12:
+                hl_ratio = min(hl_ratio, 0.58)
+            elif clip_frac > 0.05 or global_clip > 0.06:
+                hl_ratio = min(hl_ratio, 0.74)
+            # Don't crush overall scene darker than luma ~44 just for a tiny specular lamp
+            min_safe_ratio = max(0.22, (44.0 / max(10.0, w_luma)) ** 1.85)
             ratio = min(ratio, max(hl_ratio, min_safe_ratio))
 
         # Deadband: avoid micro-hunting / unnecessary I2C writes when already well-exposed
@@ -623,6 +625,37 @@ def merge_hdr_mertens_srgb(frames_u8: list) -> np.ndarray:
     imgs.sort(key=lambda im: float(im[::16, ::16].mean()))
     ref_idx = len(imgs) // 2
 
+    # Lock chromaticity (AWB) of EV- and EV+ brackets to the EV0 reference frame in LINEAR light!
+    # Using upper-midtone overlap (0.28..0.82) for EV- ensures zero AWB seam (no cyan/green or
+    # lavender cast on bright screens/windows when libcamera Gray-World AWB shifts on EV-).
+    ref_im = imgs[ref_idx]
+    ref_s = np.power(np.clip(ref_im[::8, ::8, :], 0.0, 1.0), 2.2)
+    ref_y = 0.2126 * ref_s[:, :, 0] + 0.7152 * ref_s[:, :, 1] + 0.0722 * ref_s[:, :, 2]
+    for k in range(len(imgs)):
+        if k == ref_idx:
+            continue
+        ks = np.power(np.clip(imgs[k][::8, ::8, :], 0.0, 1.0), 2.2)
+        ky = 0.2126 * ks[:, :, 0] + 0.7152 * ks[:, :, 1] + 0.0722 * ks[:, :, 2]
+        if k < ref_idx:
+            mask = (ref_y > 0.08) & (ref_y < 0.68) & (ky > 0.025) & (ky < 0.72)
+        else:
+            mask = (ref_y > 0.02) & (ref_y < 0.45) & (ky > 0.05) & (ky < 0.72)
+        if int(np.count_nonzero(mask)) < 60:
+            mask = (ref_y > 0.015) & (ref_y < 0.75) & (ky > 0.015) & (ky < 0.78)
+        if int(np.count_nonzero(mask)) >= 50:
+            rr = float(np.mean(ref_s[:, :, 0][mask])) / max(1e-4, float(np.mean(ks[:, :, 0][mask])))
+            rg = float(np.mean(ref_s[:, :, 1][mask])) / max(1e-4, float(np.mean(ks[:, :, 1][mask])))
+            rb = float(np.mean(ref_s[:, :, 2][mask])) / max(1e-4, float(np.mean(ks[:, :, 2][mask])))
+            # Pure linear chromaticity scale (G = 1.0, preserve bracket luminance!)
+            r_sc = max(0.55, min(1.80, rr / max(1e-4, rg)))
+            b_sc = max(0.55, min(1.80, rb / max(1e-4, rg)))
+            if abs(r_sc - 1.0) > 0.02 or abs(b_sc - 1.0) > 0.02:
+                # Apply in sRGB via gamma-root scale (exact equivalent of linear multiply!)
+                adj = imgs[k].copy()
+                adj[:, :, 0] = np.clip(adj[:, :, 0] * (r_sc ** (1.0 / 2.2)), 0.0, 1.0)
+                adj[:, :, 2] = np.clip(adj[:, :, 2] * (b_sc ** (1.0 / 2.2)), 0.0, 1.0)
+                imgs[k] = adj
+
     # Check actual luminance spread across captured hardware brackets.
     # If the brightest bracket saturated at the sensor's max shutter+gain (e.g. dim room),
     # synthesize a virtual +1.2 EV shadow-lifted bracket in linear light so Mertens fusion
@@ -666,13 +699,13 @@ def merge_hdr_mertens_srgb(frames_u8: list) -> np.ndarray:
         w = (lap + 0.025) * (sat + 0.06) * (exp_w + 1e-3) * clip_pen
 
         if ref_peak is not None:
-            hl_mask = np.clip((ref_peak - 0.80) * 6.0, 0.0, 1.0)
+            hl_mask = np.clip((ref_peak - 0.86) * 7.0, 0.0, 1.0)
             if idx == 0:
-                # Boost EV- dark bracket strongly on clipped highlights
-                w = w * (1.0 + 12.0 * hl_mask)
+                # Gently pull clipped screen/highlight detail from EV- without making whites muddy gray
+                w = w * (1.0 + 3.2 * hl_mask)
             elif idx == len(imgs) - 1:
                 # Suppress EV+ bright bracket on already-bright areas
-                w = w * (1.0 - 0.92 * hl_mask)
+                w = w * (1.0 - 0.88 * hl_mask)
         weights.append(w.astype(np.float32))
 
     # Normalize weights across exposures

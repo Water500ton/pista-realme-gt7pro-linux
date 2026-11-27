@@ -1488,10 +1488,11 @@ class PistaCameraWindow(Gtk.Window):
                 )
                 if orig_exp and orig_exp >= 4:
                     skey = self.current_cam()["key"]
-                    # Wider -3.0 EV dark bracket prevents bright screen clipping in HDR mode
-                    b_lo = self.sensor_ctrl.compute_ev_bracket(skey, orig_exp, orig_gain, 0.12)
+                    # Balanced -2.2 EV / 0 EV / +1.1 EV brackets: recovers bright screen text cleanly
+                    # while keeping white windows bright instead of muddy gray
+                    b_lo = self.sensor_ctrl.compute_ev_bracket(skey, orig_exp, orig_gain, 0.22)
                     b_mid = (orig_exp, orig_gain)
-                    b_hi = self.sensor_ctrl.compute_ev_bracket(skey, orig_exp, orig_gain, 2.50)
+                    b_hi = self.sensor_ctrl.compute_ev_bracket(skey, orig_exp, orig_gain, 2.20)
                     self._hdr_orig_exp = orig_exp
                     self._hdr_orig_gain = orig_gain
                     self._hdr_brackets = [b_lo, b_mid, b_hi]
