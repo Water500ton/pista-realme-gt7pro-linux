@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=相机
+Name[en]=Camera
+Comment=Realme GT7 Pro Mainline Linux Camera (libcamera + Adreno 830 GPU ISP)
+Exec=/usr/local/bin/pista-camera
+Icon=camera-photo
+Terminal=false
+Categories=AudioVideo;Photography;GTK;

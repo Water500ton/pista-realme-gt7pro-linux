@@ -526,6 +526,7 @@
 	regulators-4 {
 		compatible = "qcom,pm8550ve-rpmh-regulators";
 
+		vdd-l1-supply = <&vreg_s7i_1p2>;
 		vdd-l2-supply = <&vreg_s7i_1p2>;
 		vdd-l3-supply = <&vreg_s1d_0p97>;
 		vdd-s7-supply = <&vph_pwr>;
@@ -537,6 +538,16 @@
 			regulator-min-microvolt = <1312000>;
 			regulator-max-microvolt = <1340000>;
 			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		vreg_l1i_1p2: ldo1 {
+			regulator-name = "vreg_l1i_1p2";
+			regulator-min-microvolt = <1200000>;
+			regulator-max-microvolt = <1200000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+			regulator-allow-set-load;
+			regulator-allowed-modes = <RPMH_REGULATOR_MODE_LPM
+						   RPMH_REGULATOR_MODE_HPM>;
 		};
 
 		vreg_l2i_1p2: ldo2 {
@@ -577,6 +588,107 @@
 						   RPMH_REGULATOR_MODE_HPM>;
 		};
 	};
+
+	regulators-6 {
+		compatible = "qcom,pm8010-rpmh-regulators";
+		qcom,pmic-id = "m";
+
+		vdd-l1-l2-supply = <&vreg_s7i_1p2>;
+		vdd-l3-l4-supply = <&vreg_bob1>;
+		vdd-l5-supply = <&vreg_s3g_1p8>;
+		vdd-l6-supply = <&vreg_s3g_1p8>;
+		vdd-l7-supply = <&vreg_bob1>;
+
+		vreg_l1m_1p056: ldo1 {
+			regulator-name = "vreg_l1m_1p056";
+			regulator-min-microvolt = <1056000>;
+			regulator-max-microvolt = <1056000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+			regulator-allow-set-load;
+			regulator-allowed-modes = <RPMH_REGULATOR_MODE_LPM
+						   RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		vreg_l2m_1p12: ldo2 {
+			regulator-name = "vreg_l2m_1p12";
+			regulator-min-microvolt = <1120000>;
+			regulator-max-microvolt = <1120000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+			regulator-allow-set-load;
+			regulator-allowed-modes = <RPMH_REGULATOR_MODE_LPM
+						   RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		vreg_l3m_2p8: ldo3 {
+			regulator-name = "vreg_l3m_2p8";
+			regulator-min-microvolt = <2800000>;
+			regulator-max-microvolt = <2800000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		vreg_l4m_2p8: ldo4 {
+			regulator-name = "vreg_l4m_2p8";
+			regulator-min-microvolt = <2800000>;
+			regulator-max-microvolt = <2800000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		vreg_l5m_1p8: ldo5 {
+			regulator-name = "vreg_l5m_1p8";
+			regulator-min-microvolt = <1800000>;
+			regulator-max-microvolt = <1800000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		vreg_l6m_1p8: ldo6 {
+			regulator-name = "vreg_l6m_1p8";
+			regulator-min-microvolt = <1800000>;
+			regulator-max-microvolt = <1800000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+	};
+
+	regulators-7 {
+		compatible = "qcom,pm8010-rpmh-regulators";
+		qcom,pmic-id = "n";
+
+		vdd-l1-l2-supply = <&vreg_s7i_1p2>;
+		vdd-l3-l4-supply = <&vreg_bob1>;
+		vdd-l5-supply = <&vreg_bob2>;
+		vdd-l6-supply = <&vreg_bob2>;
+		vdd-l7-supply = <&vreg_bob1>;
+
+		vreg_l1n_1p1: ldo1 {
+			regulator-name = "vreg_l1n_1p1";
+			regulator-min-microvolt = <1104000>;
+			regulator-max-microvolt = <1104000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+			regulator-allow-set-load;
+			regulator-allowed-modes = <RPMH_REGULATOR_MODE_LPM
+						   RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		vreg_l3n_2p8: ldo3 {
+			regulator-name = "vreg_l3n_2p8";
+			regulator-min-microvolt = <2800000>;
+			regulator-max-microvolt = <2800000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		vreg_l4n_2p7: ldo4 {
+			regulator-name = "vreg_l4n_2p7";
+			regulator-min-microvolt = <2704000>;
+			regulator-max-microvolt = <2704000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		vreg_l7n_3p1: ldo7 {
+			regulator-name = "vreg_l7n_3p1";
+			regulator-min-microvolt = <3104000>;
+			regulator-max-microvolt = <3104000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+	};
 };
 
 &tlmm {
@@ -595,6 +707,20 @@
 		function = "gpio";
 		drive-strength = <8>;
 		bias-pull-down;
+	};
+
+	cam_uw_reset_default: cam-uw-reset-default-state {
+		pins = "gpio178";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-disable;
+	};
+
+	cam_front_reset_default: cam-front-reset-default-state {
+		pins = "gpio7";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-disable;
 	};
 
 	ts_reset_active: ts-reset-active-state {
@@ -827,7 +953,100 @@
 };
 
 &camcc {
-	status = "disabled";
+	status = "okay";
+};
+
+&camss {
+	vdd-csiphy0-0p9-supply = <&vreg_l1f_0p88>;
+	vdd-csiphy0-1p2-supply = <&vreg_l3g_1p2>;
+	vdd-csiphy1-0p9-supply = <&vreg_l1f_0p88>;
+	vdd-csiphy1-1p2-supply = <&vreg_l3g_1p2>;
+	vdd-csiphy2-0p9-supply = <&vreg_l3i_0p88>;
+	vdd-csiphy2-1p2-supply = <&vreg_l3g_1p2>;
+	vdd-csiphy3-0p9-supply = <&vreg_l1f_0p88>;
+	vdd-csiphy3-1p2-supply = <&vreg_l3g_1p2>;
+	vdd-csiphy4-0p9-supply = <&vreg_l3i_0p88>;
+	vdd-csiphy4-1p2-supply = <&vreg_l3g_1p2>;
+	vdd-csiphy5-0p9-supply = <&vreg_l1f_0p88>;
+	vdd-csiphy5-1p2-supply = <&vreg_l3g_1p2>;
+
+	status = "okay";
+
+	ports {
+		port@3 {
+			reg = <3>;
+
+			camss_csiphy3_ep: endpoint {
+				data-lanes = <0 1 2 3>;
+				remote-endpoint = <&imx355_ep>;
+			};
+		};
+
+		port@4 {
+			reg = <4>;
+
+			camss_csiphy4_ep: endpoint {
+				data-lanes = <0 1 2 3>;
+				remote-endpoint = <&imx471_ep>;
+			};
+		};
+	};
+};
+
+&cci0_0_default {
+	sda-pins {
+		bias-pull-up = <2200>;
+	};
+
+	scl-pins {
+		bias-pull-up = <2200>;
+	};
+};
+
+&cci0 {
+	assigned-clocks = <&camcc CAM_CC_CCI_0_CLK>;
+	assigned-clock-rates = <37500000>;
+	status = "okay";
+};
+
+&cci0_i2c0 {
+	/* Rear 8MP Ultrawide (Sony IMX355) -> CSIPHY3 */
+	camera@1a {
+		compatible = "sony,imx355";
+		reg = <0x1a>;
+
+		reset-gpios = <&tlmm 178 GPIO_ACTIVE_LOW>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&cam2_default &cam_uw_reset_default>;
+
+		clocks = <&cambistmclkcc CAM_BIST_MCLK_CC_MCLK2_CLK>;
+		assigned-clocks = <&cambistmclkcc CAM_BIST_MCLK_CC_MCLK2_CLK>;
+		assigned-clock-rates = <19200000>;
+
+		avdd-supply = <&vreg_l4n_2p7>;
+		dvdd-supply = <&vreg_l1i_1p2>;
+		dovdd-supply = <&vreg_l5m_1p8>;
+
+		orientation = <1>;
+		rotation = <270>;
+
+		port {
+			imx355_ep: endpoint {
+				data-lanes = <1 2 3 4>;
+				link-frequencies = /bits/ 64 <360000000>;
+				remote-endpoint = <&camss_csiphy3_ep>;
+			};
+		};
+	};
+};
+
+&cci1 {
+	/* Only bind cci1_0 (gpio117/118); gpio164 on cci1_1 is speaker_right reset */
+	pinctrl-0 = <&cci1_0_default>;
+	pinctrl-1 = <&cci1_0_sleep>;
+	assigned-clocks = <&camcc CAM_CC_CCI_1_CLK>;
+	assigned-clock-rates = <37500000>;
+	status = "okay";
 };
 
 /* GT7 Pro stock ADSP image spans 80.5 MiB (0x5080000), larger than upstream 0x3a80000 */
@@ -1023,6 +1242,44 @@
 
 &gpi_dma1 {
 	status = "okay";
+};
+
+&gpi_dma2 {
+	status = "okay";
+};
+
+&i2c9 {
+	clock-frequency = <1000000>;
+	status = "okay";
+
+	/* Front 16MP Selfie (Sony IMX471 / IMX480) -> CSIPHY4 */
+	camera@10 {
+		compatible = "sony,imx471";
+		reg = <0x10>;
+
+		reset-gpios = <&tlmm 7 GPIO_ACTIVE_LOW>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&cam4_default &cam_front_reset_default>;
+
+		clocks = <&cambistmclkcc CAM_BIST_MCLK_CC_MCLK4_CLK>;
+		assigned-clocks = <&cambistmclkcc CAM_BIST_MCLK_CC_MCLK4_CLK>;
+		assigned-clock-rates = <19200000>;
+
+		vana-supply = <&vreg_l3m_2p8>;
+		vdig-supply = <&vreg_l1m_1p056>;
+		vio-supply = <&vreg_l5m_1p8>;
+
+		orientation = <0>;
+		rotation = <90>;
+
+		port {
+			imx471_ep: endpoint {
+				data-lanes = <1 2 3 4>;
+				link-frequencies = /bits/ 64 <200000000>;
+				remote-endpoint = <&camss_csiphy4_ep>;
+			};
+		};
+	};
 };
 
 &spi4 {

@@ -27,7 +27,8 @@ All features listed below as working have been verified on real Realme GT7 Pro h
 | **Sensors (ADSP SSC)** | `fastrpc` (`/dev/fastrpc-adsp-secure`) + patched `hexagonrpcd` + `libssc` + `iio-sensor-proxy` | Working | Live **Accelerometer** (`BMI26x`), **Proximity** (`TCS3720`), **Magnetometer** (`AK09919`), and **Compass / Rotation Vector** (`rotv`) streaming via ADSP SSC & `iio-sensor-proxy` (`monitor-sensor` + KDE Plasma 6 auto-rotate); requires user's own device sensor registry/configs staged read-only from `persist`/`vendor_a`/`odm_a`/`dsp_a` |
 | **NPU (Hexagon V79 CDSP)** | `remoteproc_cdsp` (`qcom,sm8650-cdsp-pas`) + `nsp_noc` + `fastrpc` (`/dev/fastrpc-cdsp`) | Working | Hexagon **V79** (`0x8c79`), **6× 128-byte HVX** vector engines, **8 MiB VTCM** SRAM, 9 SMMU compute context banks, and **Unsigned PD** compute verified end-to-end via DMA-BUF (`fastrpc_shell_unsigned_3`); requires user's own device-signed `cdsp.mbn`/`cdsp_dtb.mbn` + `dsp_a/cdsp/` |
 | **5G Modem (MPSS + IPA v5.5)** | `remoteproc_mpss` (`qcom,sm8750-mpss-pas`) + SM8750 **IPA v5.5** (`qcom,sm8750-ipa`, `rmnet_ipa0` + `rmnet.ko` QMAPv5) + EFS-safe `rmtfs` sandbox + `tqftpserv` | Working | **5G NR SA (`n78` 100 MHz)** & **4G LTE** live network registration, **dual physical USIM slots**, and end-to-end **cellular IPv4 data** (`ping` @ **28.8 ms** RTT + multi-MB HTTP download with QMAPv5 hardware aggregation & checksum offload, 0 errors/drops) verified alongside active Wi-Fi 7 (`wlan0`), ADSP, and CDSP. Uses RAM-only EFS/NV sandbox (`/var/lib/pista-rmtfs`, never touches UFS EFS/NV). *Notes:* `modem/pista-cellular.py` handles clean DPM/WDA/WDS QMAPv5 bringup (upstream `ModemManager 1.24.2` has a DSDS dual-active-slot false SIM-swap quirk); QMI LOC service (`16 v2`) is online (`standalone` / engine lock unlocked), while SM8750 GNSS event registration remains WIP. |
-| **Camera / Haptics / NFC** | CamSS, PMIH0108 HV-Haptics, NXP NFC | WIP | Not yet enabled |
+| **Camera (Front 16MP + Rear 8MP UW)** | SM8750 **CAMSS** (`csid-980`, `vfe-gen4`, CSIPHY 2.4.0) + `camcc` + `cambistmclkcc` + `cci0`/`cci1` + PM8010M/N + **Sony IMX471** (Front 16MP) & **Sony IMX355** (Rear 8MP Ultrawide) | Working | Both sensors verified live via `v4l2-ctl`, **`libcamera v0.7.2` + Adreno 830 GPU SoftISP** (**~5.5 ms/frame @ 30 fps**, auto-exposure & auto-white-balance), PipeWire (`libspa-0.2-libcamera`), and touch-friendly GTK3 camera app [`camera/pista-camera`](camera/pista-camera) with upright portrait rotation & JPEG capture. Zero proprietary firmware required. *WIP:* Rear 50MP main (Sony IMX906) and 50MP 3× telephoto (Sony IMX882/LYT-600) currently lack mainline drivers and default to C-PHY 3-trio. |
+| **Haptics / NFC** | PMIH0108 HV-Haptics, NXP NFC | WIP | Not yet enabled |
 
 ---
 
@@ -66,6 +67,11 @@ All features listed below as working have been verified on real Realme GT7 Pro h
 │   ├── pista-cellular.service                                 # Systemd service unit for background cellular session
 │   ├── pista-cellular.desktop                                 # Desktop launcher ("5G 蜂窝网络")
 │   └── pista-cellular.sudoers                                 # Scoped NOPASSWD sudoers rule for touch-friendly GUI toggling
+├── camera/
+│   ├── pista-camera                                           # Touch-friendly GTK3 + GStreamer libcamera Camera App (portrait rotation + JPEG capture)
+│   ├── pista-camera.desktop                                   # Desktop launcher ("相机" / "Camera")
+│   ├── 99-pista-camera.rules                                  # Udev permissions for /dev/dma_heap/* & /dev/udmabuf (non-root GPU SoftISP)
+│   └── install.sh                                             # Installs libcamera, PipeWire SPA plugin, GStreamer GTK3, and pista-camera
 ├── patches/                                                   # Clean patch series against upstream Linux 7.3.6
 │   ├── 0001-arm64-dts-qcom-sm8750-add-realme-pista-and-adreno830.patch
 │   ├── 0002-drm-msm-sm8750-adreno830-dsc-and-qtb500-fixes.patch
@@ -75,7 +81,8 @@ All features listed below as working have been verified on real Realme GT7 Pro h
 │   ├── 0006-asoc-codecs-add-nxp-tfa9873-tfa9874-speaker-amp-driver.patch
 │   ├── 0007-power-supply-qcom_battmgr-add-realme-pista-gauge-and-pd18w.patch
 │   ├── 0008-bluetooth-btqca-hci_qca-add-ganges-2.0-wcn7860-support.patch
-│   └── 0009-net-ipa-add-sm8750-ipa-v5.5-and-qmi-smem-tlv-support.patch
+│   ├── 0009-net-ipa-add-sm8750-ipa-v5.5-and-qmi-smem-tlv-support.patch
+│   └── 0010-media-camss-add-sm8750-camera-camcc-pinctrl-and-imx471-support.patch
 ├── boot/
 │   ├── cmdline.txt                                            # UEFI boot kernel command line
 │   ├── init                                                   # Initramfs init (USB NCM + Wi-Fi 7 + iSCSI switch_root)
@@ -83,7 +90,7 @@ All features listed below as working have been verified on real Realme GT7 Pro h
 │   ├── pista-iscsi.conf.example                               # Template for Wi-Fi / iSCSI settings
 │   └── pack_esp_fat16.py                                      # Builds 100 MiB UFS-4K-native FAT16 ESP for recovery_b
 ├── scripts/
-│   ├── apply_patches.sh                                       # Applies patches/0001..0009 to Linux 7.3.6
+│   ├── apply_patches.sh                                       # Applies patches/0001..0010 to Linux 7.3.6
 │   └── build_kernel.sh                                        # Builds ARM64 Image.efi, pista.dtb, and modules
 └── tools/
     ├── pista-kvm-recv.py                                      # Phone uinput USB gaming keyboard/mouse receiver
@@ -100,6 +107,7 @@ All features listed below as working have been verified on real Realme GT7 Pro h
 4. **OBS Studio Preview & Hardware Encoding Tip**: Launch OBS with `MESA_LOADER_DRIVER_OVERRIDE=zink obs` (Adreno 830 Turnip Vulkan backend) to eliminate Wayland PipeWire UBWC preview flicker, and select Custom Output (FFmpeg) with `h264_v4l2m2m` or `hevc_v4l2m2m` (`NV12`) for VPU 3.5 hardware encoding.
 5. **SM8750 IPA v5.5 (`patches/0009` + `dts/qcom/sm8750-realme-pista.dts`)**: Adds SM8750 GSI endpoints (`AP_LAN_RX` ch14/ep17, `AP_MODEM_RX` ch1/ep24, `MODEM_AP_RX` ch7/ep22), SM8750 non-overlapping IPA SRAM partitions, and the three SM8750 `QMI_IPA_INIT_MODEM_DRIVER_REQ` TLVs (`0x23` `hw_filter_stats`, `0x24` `ipa_smem_info`, `0x25` `smem_info`, req size 197) needed to prevent MPSS `IPA_SMEM_ALLOC_EX` assertion on handshake.
 6. **WCN7860 / MPSS Shared SMPS Coexistence (`sm8750-realme-pista.dts`)**: Raises `vreg_s4d_0p85`/`vreg_s5f_0p85` (`876 mV`), `vreg_s7i_1p2` (`1312 mV`), `vreg_s3g_1p8` (`1864 mV` HPM), `vreg_s1d_0p97` (`976 mV`), and `vreg_l1f_0p88` (HPM) to match stock `wlan_peach` requirements so MPSS RF bringup never browns out `1c00000.pcie` (WCN7860 Wi-Fi 7).
+7. **SM8750 Camera Subsystem & TLMM I2C Strong Pull-Up (`patches/0010` + `sm8750-realme-pista.dts`)**: Adds `.i2c_pull_bit = 13` to `pinctrl-sm8750.c` (`PINGROUP`) and sets `bias-pull-up = <2200>` on `cci0_0_default` (`gpio113`/`gpio114`) so 1 MHz CCI0 I2C0 works reliably with IMX355; maps `vreg_l3i_0p88` as the 0.9V supply for CSIPHY2 & CSIPHY4 (while CSIPHY0/1/3/5 use `vreg_l1f_0p88`); binds `cci1` to `cci1_0` only to avoid conflicting with right speaker amp reset on `gpio164`; sets `37.5 MHz` assigned clocks on `cci0`/`cci1`; adds OF match + `vdig`/`vio` supplies + `V4L2_SEL_TGT_CROP` fix to `imx471.c`; and binds each async sensor independently in `camss.c`.
 
 ---
 
@@ -150,6 +158,8 @@ This repository intentionally contains **no proprietary firmware blobs**. You mu
   - Squash `modem.mdt/.b*`, `modem_dtb.mdt/.b*`, and `ipa_fws.mdt/.b*` read-only from `modem_a` into `/lib/firmware/qcom/sm8750/realme/pista/`, copy `modem_pr/`, `modem_oem/`, `pakala/`, `modemr.jsn` for `tqftpserv`, and copy `modemst1`, `modemst2`, `fsg`, `fsc` (plus `oplusstanvbk_a` -> `oem_stanvbk` and `oplusdycnvbk` -> `oem_dycnvbk` for full RF online calibration) read-only into `/var/lib/pista-rmtfs/` (with symlinks `modem_fs1 -> modemst1`, `modem_fs2 -> modemst2`, `modem_fsg -> fsg`, `modem_fsc -> fsc`).
   - Install `modem/rmtfs-override.conf` -> `/etc/systemd/system/rmtfs.service.d/override.conf` (runs `rmtfs -o /var/lib/pista-rmtfs -r` so Android's UFS EFS/NV partitions are never touched).
   - Install the CLI/daemon & touch-friendly GTK3 GUI: `modem/pista-cellular.py` -> `/usr/local/bin/pista-cellular`, `modem/pista-cellular-gui.py` -> `/usr/local/bin/pista-cellular-gui`, `modem/pista-cellular.service` -> `/etc/systemd/system/`, `modem/pista-cellular.desktop` -> `/usr/share/applications/`, and `modem/pista-cellular.sudoers` -> `/etc/sudoers.d/pista-cellular` (`chmod 0440`). Launch **5G 蜂窝网络** from the application menu (or run `sudo pista-cellular --default-route` in a terminal) to automatically start MPSS, enable 5G NR / 4G LTE, and dial QMAPv5 data on `rmnet_ipa0` -> `rmnet_data0` without disturbing Wi-Fi / LAN iSCSI routes.
+- **Camera (Front 16MP IMX471 + Rear 8MP Ultrawide IMX355 — Zero Proprietary Blobs)**:
+  - Run `sudo ./camera/install.sh` on the phone to install `libcamera-tools`, `libspa-0.2-libcamera` (PipeWire camera integration), `gstreamer1.0-libcamera`, `gstreamer1.0-gtk3`, `/etc/udev/rules.d/99-pista-camera.rules` (enables non-root `/dev/dma_heap/system` access for Adreno 830 GPU SoftISP), and the touch-friendly portrait camera app `/usr/local/bin/pista-camera` (**相机** / **Camera**).
 
 ### 3. VAB-Safe Booting (Important Safety Notice)
 The Realme GT7 Pro uses Android 15 Virtual A/B (VAB):

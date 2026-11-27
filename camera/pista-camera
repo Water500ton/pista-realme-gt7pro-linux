@@ -1,0 +1,321 @@
+#!/usr/bin/env python3
+"""Touch-friendly GTK3 + GStreamer libcamera Camera App for Realme GT7 Pro (SM8750)."""
+
+import datetime
+import os
+import subprocess
+import sys
+
+import gi
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+gi.require_version("Gst", "1.0")
+from gi.repository import Gdk, GLib, Gst, Gtk
+from PIL import Image
+
+Gst.init(None)
+
+CAMERAS = [
+    {
+        "key": "rear_uw",
+        "label": "后置 8MP 超广角 (IMX355)",
+        "short": "后置超广角",
+        "path": "/base/soc@0/cci@ac7b000/i2c-bus@0/camera@1a",
+        "width": 1640,
+        "height": 1232,
+        "rot_deg": 270,   # counterclockwise: fixes 90° CW raw sensor orientation
+        "mirror": False,
+    },
+    {
+        "key": "front",
+        "label": "前置 16MP 自拍 (IMX471)",
+        "short": "前置自拍",
+        "path": "/base/soc@0/geniqup@8c0000/i2c@884000/camera@10",
+        "width": 1920,
+        "height": 1088,
+        "rot_deg": 90,    # clockwise for upright portrait
+        "mirror": True,   # natural selfie mirror
+    },
+]
+
+# Map (rot_deg_cw, mirror_horiz_after_rot) -> GStreamer videoflip method
+FLIP_METHOD_MAP = {
+    (0, False): "none",
+    (90, False): "clockwise",
+    (180, False): "rotate-180",
+    (270, False): "counterclockwise",
+    (0, True): "horizontal-flip",
+    (90, True): "upper-left-diagonal",
+    (180, True): "vertical-flip",
+    (270, True): "upper-right-diagonal",
+}
+
+CSS = b"""
+window {
+    background-color: #000000;
+    color: #f3f4f6;
+}
+.topbar {
+    background-color: rgba(12, 12, 16, 0.92);
+    padding: 12px 16px;
+}
+.bottombar {
+    background-color: rgba(12, 12, 16, 0.95);
+    padding: 18px 24px 28px 24px;
+}
+.cam-title {
+    font-size: 16px;
+    font-weight: 700;
+    color: #ffffff;
+}
+.status-lbl {
+    font-size: 13px;
+    color: #93c5fd;
+}
+.tool-btn {
+    background: #1f2937;
+    color: #f9fafb;
+    border: 1px solid #374151;
+    border-radius: 18px;
+    padding: 8px 14px;
+    font-size: 14px;
+    font-weight: 600;
+}
+.tool-btn:active {
+    background: #374151;
+}
+.switch-btn {
+    background: #1e293b;
+    color: #ffffff;
+    border: 1px solid #475569;
+    border-radius: 26px;
+    padding: 14px 20px;
+    font-size: 15px;
+    font-weight: 700;
+    min-width: 112px;
+}
+.switch-btn:active {
+    background: #334155;
+}
+.shutter-btn {
+    background: #ffffff;
+    color: #111827;
+    border: 5px solid #9ca3af;
+    border-radius: 44px;
+    min-width: 84px;
+    min-height: 84px;
+    font-size: 16px;
+    font-weight: 800;
+}
+.shutter-btn:active {
+    background: #d1d5db;
+}
+"""
+
+
+class PistaCameraWindow(Gtk.Window):
+    def __init__(self):
+        super().__init__(title="相机 · Realme GT7 Pro")
+        self.set_default_size(540, 1080)
+        self.set_position(Gtk.WindowPosition.CENTER)
+
+        provider = Gtk.CssProvider()
+        provider.load_from_data(CSS)
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(),
+            provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
+        )
+
+        self.cam_idx = 0
+        self.pipeline = None
+        self.sink = None
+        self.flip = None
+        self.pictures_dir = os.path.expanduser("~/Pictures")
+        os.makedirs(self.pictures_dir, exist_ok=True)
+        self.photo_count = 0
+
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.add(root)
+
+        # Top bar
+        top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        top.get_style_context().add_class("topbar")
+        root.pack_start(top, False, False, 0)
+
+        title_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        self.title_lbl = Gtk.Label(xalign=0)
+        self.title_lbl.get_style_context().add_class("cam-title")
+        self.status_lbl = Gtk.Label(label="Adreno 830 GPU SoftISP · 就绪", xalign=0)
+        self.status_lbl.get_style_context().add_class("status-lbl")
+        title_box.pack_start(self.title_lbl, False, False, 0)
+        title_box.pack_start(self.status_lbl, False, False, 0)
+        top.pack_start(title_box, True, True, 0)
+
+        self.rot_btn = Gtk.Button(label="↻ 旋转")
+        self.rot_btn.get_style_context().add_class("tool-btn")
+        self.rot_btn.connect("clicked", self.on_rotate)
+        top.pack_end(self.rot_btn, False, False, 0)
+
+        self.mirror_btn = Gtk.Button(label="⇄ 镜像")
+        self.mirror_btn.get_style_context().add_class("tool-btn")
+        self.mirror_btn.connect("clicked", self.on_mirror)
+        top.pack_end(self.mirror_btn, False, False, 0)
+
+        # Viewfinder container
+        self.vf_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        root.pack_start(self.vf_box, True, True, 0)
+
+        # Bottom controls
+        bottom = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=16)
+        bottom.get_style_context().add_class("bottombar")
+        root.pack_start(bottom, False, False, 0)
+
+        self.gallery_btn = Gtk.Button(label="相册")
+        self.gallery_btn.get_style_context().add_class("switch-btn")
+        self.gallery_btn.connect("clicked", self.on_open_gallery)
+        bottom.pack_start(self.gallery_btn, True, False, 0)
+
+        self.shutter_btn = Gtk.Button(label="拍照")
+        self.shutter_btn.get_style_context().add_class("shutter-btn")
+        self.shutter_btn.connect("clicked", self.on_capture)
+        bottom.pack_start(self.shutter_btn, True, False, 0)
+
+        self.switch_btn = Gtk.Button(label="切换镜头")
+        self.switch_btn.get_style_context().add_class("switch-btn")
+        self.switch_btn.connect("clicked", self.on_switch_camera)
+        bottom.pack_start(self.switch_btn, True, False, 0)
+
+        self.connect("destroy", self.on_destroy)
+        self.show_all()
+        GLib.idle_add(self.start_camera)
+
+    def current_cam(self):
+        return CAMERAS[self.cam_idx]
+
+    def current_flip_method(self):
+        c = self.current_cam()
+        return FLIP_METHOD_MAP[(c["rot_deg"] % 360, bool(c["mirror"]))]
+
+    def update_header(self):
+        c = self.current_cam()
+        m_txt = "镜像开" if c["mirror"] else "镜像关"
+        self.title_lbl.set_text(c["label"])
+        self.rot_btn.set_label(f"↻ {c['rot_deg']}°")
+        self.mirror_btn.set_label(f"⇄ {m_txt}")
+        other = CAMERAS[(self.cam_idx + 1) % len(CAMERAS)]
+        self.switch_btn.set_label(f"切{other['short']}")
+
+    def stop_camera(self):
+        if self.pipeline is not None:
+            self.pipeline.set_state(Gst.State.NULL)
+            self.pipeline = None
+        self.sink = None
+        self.flip = None
+        for child in self.vf_box.get_children():
+            self.vf_box.remove(child)
+
+    def start_camera(self):
+        self.stop_camera()
+        c = self.current_cam()
+        self.update_header()
+        method = self.current_flip_method()
+        desc = (
+            f'libcamerasrc camera-name="{c["path"]}" ! '
+            f'video/x-raw,width={c["width"]},height={c["height"]} ! '
+            f'videoflip name=flip method={method} ! '
+            f'videoconvert ! '
+            f'gtksink name=sink enable-last-sample=true sync=false'
+        )
+        try:
+            self.pipeline = Gst.parse_launch(desc)
+            self.sink = self.pipeline.get_by_name("sink")
+            self.flip = self.pipeline.get_by_name("flip")
+            widget = self.sink.get_property("widget")
+            widget.set_hexpand(True)
+            widget.set_vexpand(True)
+            self.vf_box.pack_start(widget, True, True, 0)
+            self.vf_box.show_all()
+
+            bus = self.pipeline.get_bus()
+            bus.add_signal_watch()
+            bus.connect("message::error", self.on_gst_error)
+            bus.connect("message::state-changed", self.on_gst_state)
+
+            self.pipeline.set_state(Gst.State.PLAYING)
+            self.status_lbl.set_text(f"正在启动 {c['short']} ({c['width']}×{c['height']})...")
+        except Exception as exc:
+            self.status_lbl.set_text(f"启动失败: {exc}")
+        return False
+
+    def on_gst_state(self, _bus, msg):
+        if msg.src == self.pipeline:
+            _old, new, _pending = msg.parse_state_changed()
+            if new == Gst.State.PLAYING:
+                c = self.current_cam()
+                self.status_lbl.set_text(
+                    f"实时预览 · {c['width']}×{c['height']} · Adreno 830 GPU ISP"
+                )
+
+    def on_gst_error(self, _bus, msg):
+        err, _dbg = msg.parse_error()
+        self.status_lbl.set_text(f"流错误: {err.message}")
+
+    def on_rotate(self, _btn):
+        c = self.current_cam()
+        c["rot_deg"] = (c["rot_deg"] + 90) % 360
+        self.start_camera()
+
+    def on_mirror(self, _btn):
+        c = self.current_cam()
+        c["mirror"] = not c["mirror"]
+        self.start_camera()
+
+    def on_switch_camera(self, _btn):
+        self.cam_idx = (self.cam_idx + 1) % len(CAMERAS)
+        self.start_camera()
+
+    def on_capture(self, _btn):
+        if self.sink is None:
+            return
+        sample = self.sink.get_property("last-sample")
+        if sample is None:
+            self.status_lbl.set_text("尚未收到画面帧，请稍候")
+            return
+        caps = sample.get_caps()
+        s = caps.get_structure(0)
+        w = s.get_value("width")
+        h = s.get_value("height")
+        buf = sample.get_buffer()
+        ok, mapinfo = buf.map(Gst.MapFlags.READ)
+        if not ok:
+            self.status_lbl.set_text("读取帧缓冲失败")
+            return
+        try:
+            fmt = s.get_value("format")
+            raw_mode = "BGRX" if fmt in ("BGRx", "BGRA") else "RGBX"
+            img = Image.frombytes("RGB", (w, h), bytes(mapinfo.data), "raw", raw_mode)
+            ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            cam_tag = self.current_cam()["key"]
+            out_path = os.path.join(self.pictures_dir, f"IMG_{ts}_{cam_tag}.jpg")
+            img.save(out_path, quality=95)
+            self.photo_count += 1
+            self.gallery_btn.set_label(f"相册 ({self.photo_count})")
+            self.status_lbl.set_text(f"已保存: {os.path.basename(out_path)} ({w}×{h})")
+        except Exception as exc:
+            self.status_lbl.set_text(f"保存失败: {exc}")
+        finally:
+            buf.unmap(mapinfo)
+
+    def on_open_gallery(self, _btn):
+        subprocess.Popen(["xdg-open", self.pictures_dir])
+
+    def on_destroy(self, _win):
+        self.stop_camera()
+        Gtk.main_quit()
+
+
+if __name__ == "__main__":
+    win = PistaCameraWindow()
+    Gtk.main()
