@@ -292,7 +292,7 @@ diff --git a/arch/arm64/boot/dts/qcom/sm8750-realme-pista.dts b/arch/arm64/boot/
 new file mode 100644
 --- /dev/null
 +++ b/arch/arm64/boot/dts/qcom/sm8750-realme-pista.dts
-@@ -0,0 +1,1299 @@
+@@ -0,0 +1,1317 @@
 +// SPDX-License-Identifier: BSD-3-Clause
 +/*
 + * Realme GT7 Pro (pista / RMX5010) mainline DT:
@@ -301,6 +301,7 @@ new file mode 100644
 +
 +/dts-v1/;
 +
++#include <dt-bindings/firmware/qcom,scm.h>
 +#include <dt-bindings/gpio/gpio.h>
 +#include <dt-bindings/input/linux-event-codes.h>
 +#include <dt-bindings/leds/common.h>
@@ -325,6 +326,17 @@ new file mode 100644
 +
 +	chosen {
 +		/* cmdline and EFI GOP framebuffer come from UEFI */
++	};
++
++	reserved-memory {
++		rmtfs_mem: rmtfs@d7c00000 {
++			compatible = "qcom,rmtfs-mem";
++			reg = <0x0 0xd7c00000 0x0 0x400000>;
++			no-map;
++
++			qcom,client-id = <1>;
++			qcom,vmid = <QCOM_SCM_VMID_MSS_MSA>;
++		};
 +	};
 +
 +	pmic-glink {
@@ -1133,6 +1145,12 @@ new file mode 100644
 +&remoteproc_cdsp {
 +	firmware-name = "qcom/sm8750/realme/pista/cdsp.mbn",
 +			"qcom/sm8750/realme/pista/cdsp_dtb.mbn";
++	status = "okay";
++};
++
++&remoteproc_mpss {
++	firmware-name = "qcom/sm8750/realme/pista/modem.mbn",
++			"qcom/sm8750/realme/pista/modem_dtb.mbn";
 +	status = "okay";
 +};
 +

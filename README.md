@@ -26,7 +26,8 @@ All features listed below as working have been verified on real Realme GT7 Pro h
 | **IR Blaster** | QUPv3 `spi5` (`gpio53` MOSI) + PM8550 `L9B` (`2.504V`) + `ir-spi` | Working | Raw 38 kHz LIRC transmitter at `/dev/lirc0` + touch-friendly GTK3 GUI [`ir/pista-remote.py`](ir/pista-remote.py) preloaded with verified Xiaomi TV / Mi Box codes & Flipper-IRDB `.ir` import; verified on real Xiaomi TV |
 | **Sensors (ADSP SSC)** | `fastrpc` (`/dev/fastrpc-adsp-secure`) + patched `hexagonrpcd` + `libssc` + `iio-sensor-proxy` | Working | Live **Accelerometer** (`BMI26x`), **Proximity** (`TCS3720`), **Magnetometer** (`AK09919`), and **Compass / Rotation Vector** (`rotv`) streaming via ADSP SSC & `iio-sensor-proxy` (`monitor-sensor` + KDE Plasma 6 auto-rotate); requires user's own device sensor registry/configs staged read-only from `persist`/`vendor_a`/`odm_a`/`dsp_a` |
 | **NPU (Hexagon V79 CDSP)** | `remoteproc_cdsp` (`qcom,sm8650-cdsp-pas`) + `nsp_noc` + `fastrpc` (`/dev/fastrpc-cdsp`) | Working | Hexagon **V79** (`0x8c79`), **6× 128-byte HVX** vector engines, **8 MiB VTCM** SRAM, 9 SMMU compute context banks, and **Unsigned PD** compute verified end-to-end via DMA-BUF (`fastrpc_shell_unsigned_3`); requires user's own device-signed `cdsp.mbn`/`cdsp_dtb.mbn` + `dsp_a/cdsp/` |
-| **Modem / Camera / Haptics** | WWAN, CamSS, PMIH0108 | WIP | Not yet enabled |
+| **5G Modem (MPSS)** | `remoteproc_mpss` (`qcom,sm8750-mpss-pas`) + `rmtfs_mem@d7c00000` + sandboxed `rmtfs` + `tqftpserv` | Partial | Modem boots on demand (`auto_boot = false`) alongside ADSP & CDSP; 50+ QMI services (`DMS`/`NAS`/`UIM`/`WMS`/`Voice`/`LOC`) & **dual physical USIM slots** verified live via `qmicli -d qrtr://0` using RAM-only EFS sandbox (`/var/lib/pista-rmtfs`, never touches UFS EFS). *Blocked for cellular data/RF online:* mainline Linux 7.3.6 lacks the SM8750 **IPA v5.5** driver (`drivers/net/ipa` currently ends at `sm8550-ipa` v5.0). |
+| **Camera / Haptics / NFC** | CamSS, PMIH0108 HV-Haptics, NXP NFC | WIP | Not yet enabled |
 
 ---
 
@@ -58,6 +59,8 @@ All features listed below as working have been verified on real Realme GT7 Pro h
 │   ├── 79-pista-sensors.rules                                 # Udev rule enabling ssc-accel/light/proximity/compass in iio-sensor-proxy
 │   ├── hexagonrpcd-override.conf                              # Systemd drop-in (/dev/fastrpc-adsp-secure + /var/lib/pista-sensors/)
 │   └── iio-sensor-proxy-override.conf                         # Systemd drop-in ordering iio-sensor-proxy after hexagonrpcd
+├── modem/
+│   └── rmtfs-override.conf                                    # EFS-safe RAM-only sandboxed rmtfs systemd drop-in (never writes UFS EFS)
 ├── patches/                                                   # Clean patch series against upstream Linux 7.3.6
 │   ├── 0001-arm64-dts-qcom-sm8750-add-realme-pista-and-adreno830.patch
 │   ├── 0002-drm-msm-sm8750-adreno830-dsc-and-qtb500-fixes.patch
@@ -135,6 +138,9 @@ This repository intentionally contains **no proprietary firmware blobs**. You mu
   - Build upstream `linux-msm/hexagonrpc` with `sensors/hexagonrpcd-pista.patch` (adds `/odm/etc/sensor/config` virtual mapping and keeps the FastRPC listener alive on SM8750 extended method IDs such as method 36), and install `sensors/79-pista-sensors.rules`, `sensors/hexagonrpcd-override.conf`, and `sensors/iio-sensor-proxy-override.conf`.
 - **Hexagon V79 NPU (CDSP)**:
   - Squash `cdsp.mdt/.b*` and `cdsp_dtb.mdt/.b*` read-only from your own GT7 Pro `modem_a` partition into `/lib/firmware/qcom/sm8750/realme/pista/cdsp.mbn` and `cdsp_dtb.mbn`, and extract `dsp_a/cdsp/*` (`fastrpc_shell_3`, `fastrpc_shell_unsigned_3`, etc.) into `/usr/lib/qcom/cdsp/`. Add your user to the `fastrpc` group for non-root access to `/dev/fastrpc-cdsp`.
+- **5G Modem (MPSS — EFS-Safe Sandbox)**:
+  - Squash `modem.mdt/.b*` and `modem_dtb.mdt/.b*` read-only from `modem_a` into `/lib/firmware/qcom/sm8750/realme/pista/`, copy `modem_pr/`, `modem_oem/`, `pakala/`, `modemr.jsn` for `tqftpserv`, and copy `modemst1`, `modemst2`, `fsg`, `fsc` read-only into `/var/lib/pista-rmtfs/` (symlink `modem_fs1 -> modemst1`, `modem_fs2 -> modemst2`, `modem_fsg -> fsg`, `modem_fsc -> fsc`).
+  - Install `modem/rmtfs-override.conf` -> `/etc/systemd/system/rmtfs.service.d/override.conf` (runs `rmtfs -o /var/lib/pista-rmtfs -r` so Android's UFS EFS partitions are never touched), then start MPSS on demand with `echo start > /sys/class/remoteproc/remoteproc0/state`.
 
 ### 3. VAB-Safe Booting (Important Safety Notice)
 The Realme GT7 Pro uses Android 15 Virtual A/B (VAB):
