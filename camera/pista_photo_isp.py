@@ -360,17 +360,18 @@ class SmartAEController:
         ratio = (target / meas) ** 1.85
 
         # 2. Continuous, Hysteresis-Free Highlight Ceiling (ZERO breathing/pumping!):
-        # Always compute a smooth monotonic upper bound from eff_p96 toward 234/255 so AE
+        # Always compute a smooth monotonic upper bound from eff_p96 toward 242/255 so AE
         # glides smoothly to the highlight ceiling and stops dead inside the deadband,
-        # instead of toggling ON/OFF around a clip threshold.
-        eff_p96 = max(roi_p96, global_p97 * 0.96)
-        if w_luma > 34.0 and eff_p96 > 195.0:
-            hl_target = 234.0
+        # while keeping overall indoor brightness >= 82 (prevents UW from looking dark
+        # when a bright monitor or lamp sits inside its wide 112-deg field of view).
+        eff_p96 = max(roi_p96, global_p97 * 0.90)
+        if w_luma > 38.0 and eff_p96 > 205.0:
+            hl_target = 242.0
             hl_ratio = (hl_target / eff_p96) ** 1.85
-            if clip_frac > 0.14 or global_clip > 0.16:
-                hl_ratio = min(hl_ratio, 0.78)
-            # Don't crush overall scene darker than luma ~48 just for a small bright window
-            min_safe_ratio = max(0.25, (48.0 / max(10.0, w_luma)) ** 1.85)
+            if clip_frac > 0.16 or global_clip > 0.18:
+                hl_ratio = min(hl_ratio, 0.80)
+            # Never drag overall scene below a natural bright floor (~82 luma)
+            min_safe_ratio = max(0.35, (82.0 / max(10.0, w_luma)) ** 1.85)
             ratio = min(ratio, max(hl_ratio, min_safe_ratio))
 
         # Deadband: lock rock-solid once within ~14% of target/ceiling (eliminates micro-pumping)

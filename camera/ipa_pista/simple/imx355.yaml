@@ -1,26 +1,27 @@
 # SPDX-License-Identifier: CC0-1.0
 # Calibrated libcamera Simple SoftISP tuning for Realme GT7 Pro (pista)
 # Rear 8MP 0.6x Ultrawide — Sony IMX355 (pista-camera SmartAE mode, no Agc)
-# Auto BlackLevel + neutral-balanced gentle CCM (prevents indoor red/magenta shift)
+# Calibrated blackLevel=3840 (15/255: eliminates purple-red shadow pedestal fog without AWB underflow)
 %YAML 1.1
 ---
 version: 1
 algorithms:
   - BlackLevel:
+      blackLevel: 3840
   - Awb:
   - Ccm:
       ccms:
         - ct: 2800
-          ccm: [  1.0550, -0.0400, -0.0150,
-                 -0.0150,  1.0250, -0.0100,
-                  0.0050, -0.1050,  1.1000 ]
+          ccm: [  1.0000,  0.0000,  0.0000,
+                  0.0000,  1.0000,  0.0000,
+                  0.0000, -0.0400,  1.0400 ]
         - ct: 4000
-          ccm: [  1.0450, -0.0450,  0.0000,
-                 -0.0200,  1.0300, -0.0100,
-                  0.0000, -0.0950,  1.0950 ]
+          ccm: [  1.0000,  0.0000,  0.0000,
+                  0.0000,  1.0000,  0.0000,
+                  0.0000, -0.0400,  1.0400 ]
         - ct: 6000
-          ccm: [  1.0550, -0.0550,  0.0000,
-                 -0.0200,  1.0450, -0.0250,
-                  0.0000, -0.0750,  1.0750 ]
+          ccm: [  1.0100, -0.0100,  0.0000,
+                 -0.0100,  1.0200, -0.0100,
+                  0.0000, -0.0350,  1.0350 ]
   - Adjust:
 ...
