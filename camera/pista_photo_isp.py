@@ -346,8 +346,18 @@ class SmartAEController:
         roi_luma = luma[y0:y1, x0:x1]
         roi_peak = peak[y0:y1, x0:x1]
 
-        # Weighted scene luminance: 65% ROI + 35% global
-        w_luma = 0.65 * float(np.mean(roi_luma)) + 0.35 * float(np.mean(luma))
+        # Weighted scene luminance: balanced for default metering (prevents wide FOV from being
+        # held dark by a small bright center monitor), tighter ROI weight when user tapped a point.
+        global_luma = float(np.mean(luma))
+        roi_mean = float(np.mean(roi_luma))
+        is_default_roi = abs(self.roi[0] - 0.5) < 0.02 and abs(self.roi[1] - 0.5) < 0.02
+        if not is_default_roi:
+            w_luma = 0.75 * roi_mean + 0.25 * global_luma
+        elif self.sensor_key == "rear_uw":
+            w_luma = 0.45 * roi_mean + 0.55 * global_luma
+        else:
+            w_luma = 0.60 * roi_mean + 0.40 * global_luma
+
         roi_p96 = float(np.percentile(roi_peak, 96))
         # Use p94 (6% area) for non-ROI global highlights so a small corner ceiling bulb
         # (2-5% of frame) never drags a selfie/indoor scene dark, while large bright screens
@@ -356,8 +366,9 @@ class SmartAEController:
         clip_frac = float(np.mean(roi_peak >= 246.0))
         global_clip = float(np.mean(peak >= 248.0))
 
-        # Target middle gray in sRGB (~120/255: crisp, bright indoor exposure with highlight guard)
-        target = 120.0 * (2.0 ** (self.ev_bias * 0.45))
+        # Target middle gray in sRGB (~120/255, slightly brighter ~130 for wide-FOV ultrawide)
+        base_target = 130.0 if self.sensor_key == "rear_uw" else 120.0
+        target = base_target * (2.0 ** (self.ev_bias * 0.45))
 
         # 1. Base exposure ratio (convert sRGB luminance ratio to linear light via gamma ~1.85)
         meas = max(4.0, w_luma)
@@ -366,15 +377,24 @@ class SmartAEController:
         # 2. Continuous, Hysteresis-Free Highlight Ceiling (ZERO breathing/pumping!):
         # Always compute a smooth monotonic upper bound from eff_p96 toward 242/255 so AE
         # glides smoothly to the highlight ceiling and stops dead inside the deadband,
-        # while keeping overall indoor brightness >= 88.
+        # while guaranteeing a natural bright indoor floor (especially on 112-deg ultrawide
+        # where a small bright monitor inside ROI would otherwise darken the entire room).
         eff_p96 = max(roi_p96, global_p94 * 0.90)
         if w_luma > 38.0 and eff_p96 > 205.0:
             hl_target = 242.0
             hl_ratio = (hl_target / eff_p96) ** 1.85
             if clip_frac > 0.16 or global_clip > 0.18:
                 hl_ratio = min(hl_ratio, 0.80)
-            # Never drag overall scene below a natural bright floor (~88 luma)
-            min_safe_ratio = max(0.35, (88.0 / max(10.0, w_luma)) ** 1.85)
+            # Smooth continuous floor (never jumps discontinuously with clip_frac)
+            clip_t = max(0.0, min(1.0, (global_clip - 0.05) / 0.14))
+            base_gfloor = 98.0 if self.sensor_key == "rear_uw" else 84.0
+            g_floor = base_gfloor - 14.0 * clip_t
+            w_floor = (96.0 if self.sensor_key == "rear_uw" else 88.0) - 8.0 * clip_t
+            floor_ratio = max(
+                (w_floor / max(10.0, w_luma)) ** 1.85,
+                (g_floor / max(10.0, global_luma)) ** 1.85,
+            )
+            min_safe_ratio = max(0.35, floor_ratio)
             ratio = min(ratio, max(hl_ratio, min_safe_ratio))
 
         # Deadband: lock rock-solid once within ~14% of target/ceiling (eliminates micro-pumping)
@@ -489,14 +509,21 @@ class SmartAWBGuard:
     def _rebuild_luts(self):
         if abs(self.gain_r - self._built_gains[0]) < 0.004 and abs(self.gain_b - self._built_gains[1]) < 0.004:
             return
-        r_lin = np.clip(_SRGB_U8_TO_LIN * self.gain_r, 0.0, 1.0)
-        b_lin = np.clip(_SRGB_U8_TO_LIN * self.gain_b, 0.0, 1.0)
+        v = np.arange(256, dtype=np.float32)
+        # Smooth highlight rolloff for any gain < 1.0 above sRGB 222 so pure white (255,255,255)
+        # clipped highlights never pick up a cyan/magenta tint.
+        hl_t = np.clip((v - 222.0) / 33.0, 0.0, 1.0)
+        hl_t = hl_t * hl_t * (3.0 - 2.0 * hl_t)
+        eff_gr = self.gain_r if self.gain_r >= 1.0 else (self.gain_r + (1.0 - self.gain_r) * hl_t)
+        eff_gb = self.gain_b if self.gain_b >= 1.0 else (self.gain_b + (1.0 - self.gain_b) * hl_t)
+        r_lin = np.clip(_SRGB_U8_TO_LIN * eff_gr, 0.0, 1.0)
+        b_lin = np.clip(_SRGB_U8_TO_LIN * eff_gb, 0.0, 1.0)
         self._lut_r = np.clip(np.round((r_lin ** (1.0 / 2.2)) * 255.0), 0, 255).astype(np.uint8)
         self._lut_b = np.clip(np.round((b_lin ** (1.0 / 2.2)) * 255.0), 0, 255).astype(np.uint8)
         self._built_gains = (self.gain_r, self.gain_b)
 
     def analyze_frame(self, arr_u8: np.ndarray, fmt: str):
-        """Measure unclipped midtones from pre-LUT frame and smoothly update R/B restoration gains."""
+        """Measure pre-LUT frame to fix both highlight-induced green cast and blue-subject yellow cast."""
         sub = arr_u8[::16, ::16, :3]
         if sub.shape[0] < 8 or sub.shape[1] < 8:
             return
@@ -519,13 +546,12 @@ class SmartAWBGuard:
         rb_spread = np.abs(r_lin - b_lin) / (g_lin + 1e-4)
         if clip_frac >= 0.002:
             # Saturated light source present: IPASoftAwb is physically poisoned toward green.
-            # Measure all unclipped, non-black neutral-axis pixels (both R and B depressed together).
             mask = (peak_u8 >= 22) & (peak_u8 <= 238) & (rb_spread < 0.48)
             min_thresh = 1.04
             strength = 0.94
             max_gain = 2.15
         else:
-            # No clipped highlight: only gently correct clear neutral-white green casts (avoid touching plants).
+            # No clipped highlight: only gently correct clear neutral-white green casts.
             mx = np.maximum(np.maximum(r_lin, g_lin), b_lin)
             mn = np.minimum(np.minimum(r_lin, g_lin), b_lin)
             chroma = (mx - mn) / (mx + 1e-4)
@@ -536,6 +562,7 @@ class SmartAWBGuard:
 
         target_r = 1.0
         target_b = 1.0
+        green_triggered = False
         if int(np.count_nonzero(mask)) >= 40:
             rm = float(np.mean(r_lin[mask]))
             gm = float(np.mean(g_lin[mask]))
@@ -545,24 +572,50 @@ class SmartAWBGuard:
                 need_b = gm / bm
                 common = min(need_r, need_b)
                 if common > min_thresh:
-                    # Restore common green-cast depression in full, plus partial R/B balance
                     base = 1.0 + strength * (common - 1.0)
                     tr = base * ((need_r / common) ** 0.65)
                     tb = base * ((need_b / common) ** 0.65)
                     target_r = max(1.0, min(max_gain, tr))
                     target_b = max(1.0, min(max_gain, tb))
+                    green_triggered = True
+
+        # Stage 2: Gray-World Blue-Subject Failure Guard (e.g. 3x tele zoomed onto a blue UI/sky).
+        # When a large blue area fools IPASoftAwb into slashing gainB (CT -> 15000-20000K) and
+        # boosting gainR, bright white areas turn yellow (R >= G >> B) while blue turns muddy.
+        # Detecting BOTH a blue subject (>=4%) AND yellow-shifted bright neutral highlights
+        # cleanly restores true white & vivid blue without affecting warm tungsten/wood scenes.
+        if not green_triggered:
+            blue_mask = (peak_u8 >= 35) & (b_lin > r_lin * 1.18) & (b_lin > g_lin * 1.08)
+            blue_frac = float(np.mean(blue_mask))
+            if blue_frac >= 0.04:
+                rg_max = np.maximum(r_lin, g_lin)
+                rg_diff = np.abs(r_lin - g_lin) / (rg_max + 1e-4)
+                wp_mask = (peak_u8 >= 115) & (peak_u8 <= 242) & (rg_diff < 0.24)
+                if float(np.mean(wp_mask)) >= 0.015 and int(np.count_nonzero(wp_mask)) >= 12:
+                    wrm = float(np.mean(r_lin[wp_mask]))
+                    wgm = float(np.mean(g_lin[wp_mask]))
+                    wbm = float(np.mean(b_lin[wp_mask]))
+                    if wbm > 1e-4 and wgm > 1e-4 and wrm > 1e-4:
+                        rg_over_b = (0.5 * (wrm + wgm)) / wbm
+                        if rg_over_b > 1.12 and (wgm / wbm) > 1.08:
+                            # Restore B toward G and trim excessive R push toward G
+                            tb = 1.0 + 0.90 * ((wgm / wbm) - 1.0)
+                            target_b = max(1.0, min(1.85, tb))
+                            if wrm > wgm * 1.03:
+                                tr = 1.0 - 0.85 * (1.0 - (wgm / wrm))
+                                target_r = max(0.76, min(1.0, tr))
 
         # Smooth exponential moving average (fast initial snap, rock-solid steady state)
         alpha = 0.35 if abs(target_r - self.gain_r) > 0.12 or abs(target_b - self.gain_b) > 0.12 else 0.20
         self.gain_r += alpha * (target_r - self.gain_r)
         self.gain_b += alpha * (target_b - self.gain_b)
-        if self.gain_r < 1.015 and self.gain_b < 1.015:
+        if abs(self.gain_r - 1.0) < 0.015 and abs(self.gain_b - 1.0) < 0.015:
             self.gain_r = 1.0
             self.gain_b = 1.0
         self._rebuild_luts()
 
     def is_active(self) -> bool:
-        return self.gain_r > 1.015 or self.gain_b > 1.015
+        return abs(self.gain_r - 1.0) > 0.015 or abs(self.gain_b - 1.0) > 0.015
 
     def apply_to_arrays(self, src: np.ndarray, dst: np.ndarray, fmt: str):
         """Apply R/B restoration LUT from src to dst in <1ms via C helper (or NumPy fallback)."""
