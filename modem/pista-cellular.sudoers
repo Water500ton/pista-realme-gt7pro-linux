@@ -1,0 +1,3 @@
+# Allow desktop users in sudo/netdev groups (or pista) to toggle 5G/4G cellular
+# without password prompts on touch screen, strictly scoped to cellular control.
+pista ALL=(root) NOPASSWD: /usr/bin/systemctl start pista-cellular.service, /usr/bin/systemctl stop pista-cellular.service, /usr/bin/systemctl restart pista-cellular.service, /usr/local/bin/pista-cellular --write-config *, /usr/local/bin/pista-cellular --ping-test *

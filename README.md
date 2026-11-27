@@ -61,7 +61,11 @@ All features listed below as working have been verified on real Realme GT7 Pro h
 │   └── iio-sensor-proxy-override.conf                         # Systemd drop-in ordering iio-sensor-proxy after hexagonrpcd
 ├── modem/
 │   ├── rmtfs-override.conf                                    # EFS-safe RAM-only sandboxed rmtfs systemd drop-in (never writes UFS EFS)
-│   └── pista-cellular.py                                      # QRTR/QMI DPM+WDA+WDS QMAPv5 cellular data helper for rmnet_ipa0
+│   ├── pista-cellular.py                                      # QRTR/QMI DPM+WDA+WDS QMAPv5 cellular daemon & CLI for rmnet_ipa0
+│   ├── pista-cellular-gui.py                                  # Touch-friendly GTK3 5G/4G cellular control GUI for KDE Plasma 6
+│   ├── pista-cellular.service                                 # Systemd service unit for background cellular session
+│   ├── pista-cellular.desktop                                 # Desktop launcher ("5G 蜂窝网络")
+│   └── pista-cellular.sudoers                                 # Scoped NOPASSWD sudoers rule for touch-friendly GUI toggling
 ├── patches/                                                   # Clean patch series against upstream Linux 7.3.6
 │   ├── 0001-arm64-dts-qcom-sm8750-add-realme-pista-and-adreno830.patch
 │   ├── 0002-drm-msm-sm8750-adreno830-dsc-and-qtb500-fixes.patch

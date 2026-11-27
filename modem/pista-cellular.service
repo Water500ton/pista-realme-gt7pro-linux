@@ -1,0 +1,13 @@
+[Unit]
+Description=Realme GT7 Pro 5G/4G Cellular Data (SM8750 IPA v5.5 QMAPv5)
+After=rmtfs.service qrtr-ns.service tqftpserv.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/pista-cellular --config /etc/pista-cellular.conf
+KillSignal=SIGTERM
+TimeoutStopSec=10
+Restart=no
+
+[Install]
+WantedBy=multi-user.target
