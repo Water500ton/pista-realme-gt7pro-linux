@@ -11,9 +11,11 @@ Handles:
 """
 
 import argparse
+import glob
 import json
 import os
 import re
+import shutil
 import signal
 import socket
 import struct
@@ -100,6 +102,68 @@ def write_status(path: str, data: dict) -> None:
         os.replace(tmp, path)
     except OSError:
         pass
+
+
+RESOLV_BEGIN = "# >>> pista-cellular >>>"
+RESOLV_END = "# <<< pista-cellular <<<"
+
+
+def _strip_resolv_block(text: str) -> str:
+    return re.sub(
+        rf"(?ms)^{re.escape(RESOLV_BEGIN)}\n.*?^{re.escape(RESOLV_END)}\n?",
+        "",
+        text,
+    )
+
+
+def apply_cellular_dns(iface: str, dns_list: list[str]) -> None:
+    eff_dns = [d for d in dns_list if d] or ["223.5.5.5", "114.114.114.114"]
+    resolved_ok = False
+    if shutil.which("resolvectl"):
+        r1 = subprocess.run(["resolvectl", "dns", iface, *eff_dns], stderr=subprocess.DEVNULL)
+        r2 = subprocess.run(["resolvectl", "domain", iface, "~."], stderr=subprocess.DEVNULL)
+        resolved_ok = (r1.returncode == 0)
+
+    resolv_path = "/etc/resolv.conf"
+    if not os.path.islink(resolv_path):
+        existing = ""
+        if os.path.isfile(resolv_path):
+            try:
+                existing = open(resolv_path, encoding="utf-8", errors="ignore").read()
+            except OSError:
+                return
+        cleaned = _strip_resolv_block(existing)
+        has_working_ns = any(
+            re.match(r"^\s*nameserver\s+(?!127\.)\S+", ln)
+            for ln in cleaned.splitlines()
+        )
+        if (not resolved_ok) or (not has_working_ns):
+            block = (
+                f"{RESOLV_BEGIN}\n"
+                + "".join(f"nameserver {d}\n" for d in eff_dns)
+                + f"{RESOLV_END}\n"
+            )
+            prefix = cleaned if (not cleaned or cleaned.endswith("\n")) else cleaned + "\n"
+            try:
+                with open(resolv_path, "w", encoding="utf-8") as f:
+                    f.write(prefix + block)
+            except OSError:
+                pass
+
+
+def revert_cellular_dns(iface: str) -> None:
+    if shutil.which("resolvectl"):
+        subprocess.run(["resolvectl", "revert", iface], stderr=subprocess.DEVNULL)
+    resolv_path = "/etc/resolv.conf"
+    if os.path.isfile(resolv_path) and not os.path.islink(resolv_path):
+        try:
+            existing = open(resolv_path, encoding="utf-8", errors="ignore").read()
+            cleaned = _strip_resolv_block(existing)
+            if cleaned != existing:
+                with open(resolv_path, "w", encoding="utf-8") as f:
+                    f.write(cleaned)
+        except OSError:
+            pass
 
 
 def read_config(path: str) -> dict:
@@ -258,6 +322,8 @@ def get_live_status(iface: str = "rmnet_data0") -> dict:
 
 
 def ensure_modem_registered(enable_5g: bool, status_path: str) -> None:
+    if not shutil.which("qmicli"):
+        raise RuntimeError("缺少 qmicli，请先安装 libqmi-utils (missing qmicli, install libqmi-utils)")
     if os.path.exists(RPROC_STATE):
         state = open(RPROC_STATE).read().strip()
         if state != "running":
@@ -459,6 +525,7 @@ def main() -> int:
                 ["ip", "route", "replace", "default", "dev", iface, "src", ip_str, "metric", "100"],
                 check=True,
             )
+        apply_cellular_dns(iface, dns_list)
 
         write_status(args.status_file, {
             "state": "connected",
@@ -485,6 +552,7 @@ def main() -> int:
     while not stop:
         time.sleep(0.5)
 
+    revert_cellular_dns(iface)
     subprocess.run(["ip", "route", "del", "default", "dev", iface, "metric", "100"], stderr=subprocess.DEVNULL)
     subprocess.run(["ip", "link", "del", iface], stderr=subprocess.DEVNULL)
     try:

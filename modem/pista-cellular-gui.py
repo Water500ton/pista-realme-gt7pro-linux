@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Touch-friendly GTK3 5G/4G Cellular Network GUI for Realme GT7 Pro (SM8750 IPA v5.5)."""
 
+import glob
 import json
 import os
 import subprocess
@@ -109,6 +110,10 @@ window {
 """
 
 
+def has_active_iscsi() -> bool:
+    return bool(glob.glob("/sys/class/iscsi_session/*"))
+
+
 def fmt_bytes(n: int) -> str:
     if n < 1024:
         return f"{n} B"
@@ -169,8 +174,9 @@ class CellularWindow(Gtk.Window):
         hdr.pack_start(s, False, False, 0)
         root.pack_start(hdr, False, False, 0)
 
-        # Wi-Fi iSCSI safety banner
-        self.wifi_lbl = Gtk.Label(label="Wi-Fi / iSCSI 状态检测中...", xalign=0)
+        # Wi-Fi status banner (note iSCSI protection only when an iSCSI session is active)
+        init_wifi_txt = "Wi-Fi / iSCSI 状态检测中..." if has_active_iscsi() else "Wi-Fi 状态检测中..."
+        self.wifi_lbl = Gtk.Label(label=init_wifi_txt, xalign=0)
         self.wifi_lbl.set_line_wrap(True)
         self.wifi_lbl.get_style_context().add_class("wifi-ok")
         root.pack_start(self.wifi_lbl, False, False, 0)
@@ -215,7 +221,8 @@ class CellularWindow(Gtk.Window):
         r1 = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         r1_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
         r1_l1 = Gtk.Label(label="全局上网优先走蜂窝数据", xalign=0)
-        r1_l2 = Gtk.Label(label="自动保留 wlan0 局域网 / iSCSI 根盘不断线", xalign=0)
+        r1_sub = "自动保留 wlan0 局域网 / iSCSI 根盘不断线" if has_active_iscsi() else "自动保留 wlan0 局域网连接不断线"
+        r1_l2 = Gtk.Label(label=r1_sub, xalign=0)
         r1_l2.get_style_context().add_class("sub-lbl")
         r1_box.pack_start(r1_l1, False, False, 0)
         r1_box.pack_start(r1_l2, False, False, 0)
@@ -383,12 +390,13 @@ class CellularWindow(Gtk.Window):
         else:
             self.val_traffic.set_text("--")
 
-        # Wi-Fi iSCSI safety bar
+        # Wi-Fi status bar
         wctx = self.wifi_lbl.get_style_context()
         if st.get("wlan0_up"):
             wctx.remove_class("wifi-warn")
             wctx.add_class("wifi-ok")
-            self.wifi_lbl.set_text(f"● Wi-Fi 7 (wlan0: {st.get('wlan0_ip', '')}) 正常在线 · iSCSI 根盘保护中")
+            suffix = " · iSCSI 根盘保护中" if has_active_iscsi() else ""
+            self.wifi_lbl.set_text(f"● Wi-Fi 7 (wlan0: {st.get('wlan0_ip', '')}) 正常在线{suffix}")
         else:
             wctx.remove_class("wifi-ok")
             wctx.add_class("wifi-warn")
