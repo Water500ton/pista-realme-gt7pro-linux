@@ -1,5 +1,7 @@
 # Mainline Linux 7.3.6 for Realme GT7 Pro (`pista` / RMX5010)
 
+> **Language / 语言**: English | [简体中文](README_zh.md)
+
 Mainline **Linux 7.3.6 (ARM64)** kernel bring-up, device tree, drivers, and boot tooling for the **Realme GT7 Pro (`pista`, RMX5010, Qualcomm Snapdragon 8 Elite / SM8750 / Pakala)**, designed to boot via the companion single-slot VAB-safe UEFI ([pista-realme-gt7pro-uefi](https://github.com/Water500ton/pista-realme-gt7pro-uefi)).
 
 All features listed below as working have been verified on real Realme GT7 Pro hardware running **Debian GNU/Linux (`forky/sid`) + KDE Plasma 6 (Wayland / KWin) + Mesa 26** over Wi-Fi 7 iSCSI.
